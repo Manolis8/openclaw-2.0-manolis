@@ -4,7 +4,6 @@
     "builder": "nixpacks"
   },
   "deploy": {
-    "startCommand": "npx playwright install chromium && npm start",
-    "restartPolicyType": "on-failure"
+    "startCommand": "npx playwright install chromium && npm start"
   }
 }
