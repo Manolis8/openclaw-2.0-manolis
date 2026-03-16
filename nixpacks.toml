@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "chromium", "glib", "nss", "nspr", "atk", "cups", "dbus", "expat", "libdrm", "libxkbcommon", "mesa", "wayland"]
+nixPkgs = ["nodejs_20", "glib", "nss", "nspr", "atk", "cups", "dbus", "expat", "libdrm", "libxkbcommon", "mesa"]
 
 [phases.build]
-cmds = ["npm install"]
+cmds = ["npm install", "npx playwright install chromium --with-deps"]
 
 [phases.deploy]
 cmd = "npm start"
