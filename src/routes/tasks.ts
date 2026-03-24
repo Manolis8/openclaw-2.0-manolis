@@ -4,6 +4,7 @@ import { newPage } from '../lib/browser.js'
 import { runAgent } from '../lib/agent.js'
 import { isExtensionConnected, extensionConnections } from '../index.js'
 import { runAgentWithExtension } from '../lib/agent-extension.js'
+import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
 
 export const tasksRouter = Router()
 
@@ -39,12 +40,17 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
         status: 'done',
         output: (data?.output || '') + `✅ Done: ${result}\n`
       }).eq('id', taskId)
+
+      // Write inbox message
+      await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
     } catch (err) {
       const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
       await supabase.from('tasks').update({
         status: 'error',
         output: (data?.output || '') + `❌ Error: ${String(err)}\n`
       }).eq('id', taskId)
+
+      await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
     }
   } else {
     // Fall back to cloud Playwright browser
@@ -60,12 +66,17 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
         status: 'done',
         output: (data?.output || '') + `✅ Done: ${result}\n`
       }).eq('id', taskId)
+
+      // Write inbox message
+      await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
     } catch (err) {
       const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
       await supabase.from('tasks').update({
         status: 'error',
         output: (data?.output || '') + `❌ Error: ${String(err)}\n`
       }).eq('id', taskId)
+
+      await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
     } finally {
       await page.close()
     }
@@ -112,4 +123,46 @@ tasksRouter.post('/refresh-token', async (req, res) => {
   } catch (err) {
     res.status(401).json({ error: String(err) })
   }
+})
+
+tasksRouter.post('/create-scheduled-task', async (req, res) => {
+  const { prompt, userId, scheduleText } = req.body
+  if (!prompt || !userId || !scheduleText) {
+    return res.status(400).json({ error: 'Missing prompt, userId, or scheduleText' })
+  }
+
+  const parsed = await parseSchedule(scheduleText)
+  if (!parsed) {
+    return res.status(400).json({ error: 'Could not understand that schedule. Try "every day at 9am" or "every monday at 8am".' })
+  }
+
+  const nextRun = computeNextRun(userId, parsed.cron)
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .insert({
+      user_id: userId,
+      prompt,
+      output: '',
+      status: 'idle',
+      schedule: parsed.cron,
+      schedule_human: parsed.human,
+      is_recurring: true,
+      requires_extension: true,
+      next_run: new Date(nextRun).toISOString()
+    })
+    .select()
+    .single()
+
+  if (error || !data) {
+    return res.status(500).json({ error: 'Failed to create scheduled task' })
+  }
+
+  // Register with in-memory scheduler
+  scheduleTask(data.id, userId, prompt, parsed.cron)
+
+  // Send confirmation to inbox
+  await createMessage(userId, data.id, `📅 Scheduled: "${prompt}" — ${parsed.human}`)
+
+  res.json({ taskId: data.id, schedule: parsed.human, nextRun: new Date(nextRun).toISOString() })
 })
