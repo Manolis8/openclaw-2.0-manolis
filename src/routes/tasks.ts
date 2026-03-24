@@ -20,7 +20,7 @@ async function appendOutput(taskId: string, line: string) {
     .eq('id', taskId)
 }
 
-async function runTaskInBackground(taskId: string, prompt: string, userId: string) {
+export async function runTaskInBackground(taskId: string, prompt: string, userId: string) {
   console.log(`runTaskInBackground: taskId=${taskId} userId=${userId}`)
   console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
   console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)

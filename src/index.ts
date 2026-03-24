@@ -111,6 +111,9 @@ wss.on('connection', async (ws, req) => {
   pendingCdpCommands.set(userId, new Map())
   console.log(`✅ Extension connected: ${userId} (total: ${extensionConnections.size})`)
 
+  // Drain any queued tasks for this user
+  drainQueueForUser(userId)
+
   ws.send(JSON.stringify({ method: 'connected', params: { userId } }))
 
   const pingInterval = setInterval(() => {
@@ -201,7 +204,33 @@ export function isExtensionConnected(userId: string): boolean {
   return connected
 }
 
-server.listen(PORT, () => {
+async function drainQueueForUser(userId: string) {
+  const { data: queuedTasks } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('status', 'queued')
+    .order('created_at', { ascending: true })
+
+  if (!queuedTasks?.length) return
+  console.log(`🔄 Draining ${queuedTasks.length} queued tasks for ${userId}`)
+
+  const { runTaskInBackground } = await import('./routes/tasks.js')
+  for (const task of queuedTasks) {
+    await supabase
+      .from('tasks')
+      .update({ status: 'running' })
+      .eq('id', task.id)
+    runTaskInBackground(task.id, task.prompt, userId)
+  }
+}
+
+server.listen(PORT, async () => {
   console.log(`✅ Felo backend running on port ${PORT}`)
   console.log(`✅ Supabase URL: ${process.env.SUPABASE_URL}`)
+
+  // Load all recurring scheduled tasks on startup
+  const { loadScheduledTasks } = await import('./lib/scheduler.js')
+  const { runTaskInBackground } = await import('./routes/tasks.js')
+  await loadScheduledTasks(runTaskInBackground)
 })
