@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "chromium", "glib", "nss", "nspr", "atk", "cups", "dbus", "expat", "libdrm", "libxkbcommon", "mesa", "wayland"]
+
+[phases.build]
+cmds = ["npm install"]
+
+[phases.deploy]
+cmd = "npm start"
