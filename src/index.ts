@@ -243,18 +243,26 @@ async function drainQueueForUser(userId: string) {
   }
 }
 
-// Proxy Nango Connect UI
-app.use('/nango-connect', createProxyMiddleware({
+// Proxy Nango Connect UI and all its assets
+const nangoProxy = createProxyMiddleware({
   target: 'http://178.104.117.1:3009',
   changeOrigin: true,
-  pathRewrite: (path) => path.replace('/nango-connect', '') || '/'
-}))
+  pathRewrite: (path) => {
+    if (path.startsWith('/nango-connect')) {
+      return path.replace('/nango-connect', '') || '/'
+    }
+    return path
+  },
+  router: (req) => {
+    if (req.url?.startsWith('/nango-connect') || req.url?.startsWith('/assets/index-')) {
+      return 'http://178.104.117.1:3009'
+    }
+    return undefined
+  }
+})
 
-// Also proxy the assets
-app.use('/assets', createProxyMiddleware({
-  target: 'http://178.104.117.1:3009',
-  changeOrigin: true
-}))
+app.use('/nango-connect', nangoProxy)
+app.use('/assets/index-', nangoProxy)
 
 server.listen(PORT, async () => {
   console.log(`✅ Felo backend running on port ${PORT}`)
