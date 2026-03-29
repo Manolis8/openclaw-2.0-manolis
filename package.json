@@ -12,8 +12,10 @@
   "dependencies": {
     "@nangohq/node": "^0.69.46",
     "@supabase/supabase-js": "^2.99.2",
+    "@types/crypto-js": "^4.2.2",
     "cors": "^2.8.6",
     "croner": "^10.0.1",
+    "crypto-js": "^4.2.0",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "http-proxy-middleware": "^3.0.5",

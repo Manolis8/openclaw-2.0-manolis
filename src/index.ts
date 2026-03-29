@@ -6,6 +6,7 @@ import { createClient } from '@supabase/supabase-js'
 import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { connectionsRouter } from './routes/connections.js'
+import { oauthRouter } from './routes/oauth.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -64,6 +65,7 @@ app.get('/api/extension-status/:userId', (req, res) => {
 app.use('/api', tasksRouter)
 app.use('/api', messagesRouter)
 app.use('/api', connectionsRouter)
+app.use('/api', oauthRouter)
 
 const server = createServer(app)
 const wss = new WebSocketServer({ noServer: true })
