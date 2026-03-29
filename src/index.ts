@@ -247,7 +247,13 @@ async function drainQueueForUser(userId: string) {
 app.use('/nango-connect', createProxyMiddleware({
   target: 'http://178.104.117.1:3009',
   changeOrigin: true,
-  pathRewrite: { '^/nango-connect': '' }
+  pathRewrite: (path) => path.replace('/nango-connect', '') || '/'
+}))
+
+// Also proxy the assets
+app.use('/assets', createProxyMiddleware({
+  target: 'http://178.104.117.1:3009',
+  changeOrigin: true
 }))
 
 server.listen(PORT, async () => {
