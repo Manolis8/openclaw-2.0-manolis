@@ -6,6 +6,7 @@ import { createClient } from '@supabase/supabase-js'
 import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { connectionsRouter } from './routes/connections.js'
+import { createProxyMiddleware } from 'http-proxy-middleware'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -241,6 +242,13 @@ async function drainQueueForUser(userId: string) {
     runTaskInBackground(task.id, task.prompt, userId)
   }
 }
+
+// Proxy Nango Connect UI
+app.use('/nango-connect', createProxyMiddleware({
+  target: 'http://178.104.117.1:3009',
+  changeOrigin: true,
+  pathRewrite: { '^/nango-connect': '' }
+}))
 
 server.listen(PORT, async () => {
   console.log(`✅ Felo backend running on port ${PORT}`)
