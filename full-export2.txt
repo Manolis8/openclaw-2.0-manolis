@@ -1,3 +1,5 @@
+FILE: src/index.ts
+==================
 import 'dotenv/config'
 import express from 'express'
 import { createServer } from 'http'
@@ -6,6 +8,7 @@ import { createClient } from '@supabase/supabase-js'
 import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { connectionsRouter } from './routes/connections.js'
+import { createProxyMiddleware } from 'http-proxy-middleware'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -242,6 +245,27 @@ async function drainQueueForUser(userId: string) {
   }
 }
 
+// Proxy Nango Connect UI and all its assets
+const nangoProxy = createProxyMiddleware({
+  target: 'http://178.104.117.1:3009',
+  changeOrigin: true,
+  pathRewrite: (path) => {
+    if (path.startsWith('/nango-connect')) {
+      return path.replace('/nango-connect', '') || '/'
+    }
+    return path
+  },
+  router: (req) => {
+    if (req.url?.startsWith('/nango-connect') || req.url?.startsWith('/assets/index-')) {
+      return 'http://178.104.117.1:3009'
+    }
+    return undefined
+  }
+})
+
+app.use('/nango-connect', nangoProxy)
+app.use('/assets/index-', nangoProxy)
+
 server.listen(PORT, async () => {
   console.log(`✅ Felo backend running on port ${PORT}`)
   console.log(`✅ Supabase URL: ${process.env.SUPABASE_URL}`)
@@ -251,3 +275,120 @@ server.listen(PORT, async () => {
   const { runTaskInBackground } = await import('./routes/tasks.js')
   await loadScheduledTasks(runTaskInBackground)
 })
+
+FILE: src/routes/connections.ts
+==================
+import { Router } from 'express'
+import { nango, INTEGRATIONS } from '../lib/nango.js'
+
+export const connectionsRouter = Router()
+
+// Get all connected integrations for a user
+connectionsRouter.get('/connections/:userId', async (req, res) => {
+  const { userId } = req.params
+  const results: Record<string, boolean> = {}
+
+  for (const [name, integrationId] of Object.entries(INTEGRATIONS)) {
+    try {
+      const connection = await nango.getConnection(integrationId, userId)
+      results[name] = !!connection
+    } catch {
+      results[name] = false
+    }
+  }
+
+  res.json(results)
+})
+
+// Create a Nango connect session for a user
+connectionsRouter.post('/connections/session', async (req, res) => {
+  const { userId, integrationId } = req.body
+  if (!userId || !integrationId) {
+    return res.status(400).json({ error: 'Missing userId or integrationId' })
+  }
+
+  try {
+    const session = await nango.createConnectSession({
+      end_user: { id: userId },
+      allowed_integrations: [integrationId]
+    })
+    res.json({ sessionToken: session.data.token })
+  } catch (err) {
+    console.error('Nango session error:', err)
+    res.status(500).json({ error: 'Failed to create connect session' })
+  }
+})
+
+// Disconnect an integration for a user
+connectionsRouter.delete('/connections/:userId/:integrationId', async (req, res) => {
+  const { userId, integrationId } = req.params
+  try {
+    await nango.deleteConnection(integrationId, userId)
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to disconnect' })
+  }
+})
+
+FILE: src/lib/nango.ts
+==================
+import { Nango } from '@nangohq/node'
+
+export const nango = new Nango({
+  secretKey: process.env.NANGO_SECRET_KEY!,
+  host: process.env.NANGO_HOST!
+})
+
+export const INTEGRATIONS = {
+  github: 'github-app',
+  googleCalendar: 'google-calendar',
+  gmail: 'google-mail',
+  googleSheets: 'google-sheet',
+  notion: 'notion',
+  slack: 'slack'
+} as const
+
+export type IntegrationId = typeof INTEGRATIONS[keyof typeof INTEGRATIONS]
+
+// Get connection token for a user and provider
+export async function getConnection(userId: string, integrationId: IntegrationId) {
+  try {
+    const connection = await nango.getConnection(integrationId, userId)
+    return connection
+  } catch {
+    return null
+  }
+}
+
+// Check if user has connected a specific integration
+export async function isConnected(userId: string, integrationId: IntegrationId): Promise<boolean> {
+  const connection = await getConnection(userId, integrationId)
+  return !!connection
+}
+
+// Make an authenticated API call through Nango proxy
+export async function proxyGet(
+  userId: string,
+  integrationId: IntegrationId,
+  endpoint: string
+) {
+  return await nango.get({
+    providerConfigKey: integrationId,
+    connectionId: userId,
+    endpoint
+  })
+}
+
+export async function proxyPost(
+  userId: string,
+  integrationId: IntegrationId,
+  endpoint: string,
+  data: object
+) {
+  return await nango.post({
+    providerConfigKey: integrationId,
+    connectionId: userId,
+    endpoint,
+    data
+  })
+}
