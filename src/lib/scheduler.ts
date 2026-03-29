@@ -31,6 +31,7 @@ interface ScheduledTask {
 // ─── In-memory store ──────────────────────────────────────────────────────────
 
 const scheduledTasks = new Map<string, ScheduledTask>()
+const runningTasks = new Set<string>()
 let timerHandle: NodeJS.Timeout | null = null
 let timerRunning = false
 
@@ -245,114 +246,125 @@ async function onTimer(): Promise<void> {
 }
 
 async function runScheduledTask(task: ScheduledTask): Promise<void> {
-  const { taskId, userId, prompt, cronExpr } = task
-
-  // Check if extension is connected — import dynamically to avoid circular deps
-  const { isExtensionConnected } = await import('../index.js')
-
-  // Write running_at BEFORE executing — distributed lock
-  const { error: lockError } = await supabase
-    .from('tasks')
-    .update({ running_at: new Date().toISOString() })
-    .eq('id', taskId)
-    .is('running_at', null) // only if not already running
-
-  if (lockError) {
-    console.warn(`Could not lock task ${taskId} — may already be running`)
+  // Skip if already running in memory — prevents duplicate runs
+  if (runningTasks.has(task.taskId)) {
+    console.log(`Task ${task.taskId} already running in memory, skipping`)
     return
   }
-
-  const extensionConnected = isExtensionConnected(userId)
-
-  if (!extensionConnected) {
-    // Queue it — extension not connected
-    await supabase
-      .from('tasks')
-      .update({
-        status: 'queued',
-        running_at: null,
-        last_run: new Date().toISOString()
-      })
-      .eq('id', taskId)
-
-    await createMessage(
-      userId,
-      taskId,
-      `⏳ Task queued — your browser isn't connected. It will run automatically when you open Chrome.`
-    )
-
-    console.log(`Task ${taskId} queued — extension offline`)
-
-    // Compute next run and update
-    const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, task.consecutiveErrors, Date.now())
-    const updated = { ...task, nextRunAt }
-    scheduledTasks.set(taskId, updated)
-    await supabase
-      .from('tasks')
-      .update({ next_run: new Date(nextRunAt).toISOString() })
-      .eq('id', taskId)
-
-    return
-  }
-
-  // Extension is connected — run now
-  await supabase
-    .from('tasks')
-    .update({ status: 'running', output: '' })
-    .eq('id', taskId)
-
-  const startedAt = Date.now()
+  runningTasks.add(task.taskId)
 
   try {
-    if (!_runTaskFn) throw new Error('runTaskFn not set')
-    await _runTaskFn(taskId, prompt, userId)
+    const { taskId, userId, prompt, cronExpr } = task
 
-    // Success
-    const endedAt = Date.now()
-    const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, 0, endedAt)
+    // Check if extension is connected — import dynamically to avoid circular deps
+    const { isExtensionConnected } = await import('../index.js')
 
+    // Write running_at BEFORE executing — distributed lock
+    const { error: lockError } = await supabase
+      .from('tasks')
+      .update({ running_at: new Date().toISOString() })
+      .eq('id', taskId)
+      .is('running_at', null) // only if not already running
+
+    if (lockError) {
+      console.warn(`Could not lock task ${taskId} — may already be running`)
+      return
+    }
+
+    const extensionConnected = isExtensionConnected(userId)
+
+    if (!extensionConnected) {
+      // Queue it — extension not connected
+      await supabase
+        .from('tasks')
+        .update({
+          status: 'queued',
+          running_at: null,
+          last_run: new Date().toISOString()
+        })
+        .eq('id', taskId)
+
+      await createMessage(
+        userId,
+        taskId,
+        `⏳ Task queued — your browser isn't connected. It will run automatically when you open Chrome.`
+      )
+
+      console.log(`Task ${taskId} queued — extension offline`)
+
+      // Compute next run and update
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, task.consecutiveErrors, Date.now())
+      const updated = { ...task, nextRunAt }
+      scheduledTasks.set(taskId, updated)
+      await supabase
+        .from('tasks')
+        .update({ next_run: new Date(nextRunAt).toISOString() })
+        .eq('id', taskId)
+
+      return
+    }
+
+    // Extension is connected — run now
     await supabase
       .from('tasks')
-      .update({
-        last_run: new Date(startedAt).toISOString(),
-        next_run: new Date(nextRunAt).toISOString(),
-        running_at: null,
-        consecutive_errors: 0
-      })
+      .update({ status: 'running', output: '' })
       .eq('id', taskId)
 
-    const updated = { ...task, lastRunAt: startedAt, consecutiveErrors: 0, nextRunAt }
-    scheduledTasks.set(taskId, updated)
+    const startedAt = Date.now()
 
-    console.log(`✅ Scheduled task ${taskId} done. Next run: ${new Date(nextRunAt).toISOString()}`)
+    try {
+      if (!_runTaskFn) throw new Error('runTaskFn not set')
+      await _runTaskFn(taskId, prompt, userId)
 
-  } catch (err) {
-    // Error — apply backoff
-    const endedAt = Date.now()
-    const newErrors = task.consecutiveErrors + 1
-    const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, newErrors, endedAt)
+      // Success
+      const endedAt = Date.now()
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, 0, endedAt)
 
-    await supabase
-      .from('tasks')
-      .update({
-        last_run: new Date(startedAt).toISOString(),
-        next_run: new Date(nextRunAt).toISOString(),
-        running_at: null,
-        consecutive_errors: newErrors,
-        status: 'error'
-      })
-      .eq('id', taskId)
+      await supabase
+        .from('tasks')
+        .update({
+          last_run: new Date(startedAt).toISOString(),
+          next_run: new Date(nextRunAt).toISOString(),
+          running_at: null,
+          consecutive_errors: 0
+        })
+        .eq('id', taskId)
 
-    await createMessage(
-      userId,
-      taskId,
-      `❌ Scheduled task failed (attempt ${newErrors}): ${String(err).slice(0, 200)}`
-    )
+      const updated = { ...task, lastRunAt: startedAt, consecutiveErrors: 0, nextRunAt }
+      scheduledTasks.set(taskId, updated)
 
-    const updated = { ...task, consecutiveErrors: newErrors, nextRunAt }
-    scheduledTasks.set(taskId, updated)
+      console.log(`✅ Scheduled task ${taskId} done. Next run: ${new Date(nextRunAt).toISOString()}`)
 
-    console.error(`Scheduled task ${taskId} failed (errors: ${newErrors}). Next retry: ${new Date(nextRunAt).toISOString()}`)
+    } catch (err) {
+      // Error — apply backoff
+      const endedAt = Date.now()
+      const newErrors = task.consecutiveErrors + 1
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, newErrors, endedAt)
+
+      await supabase
+        .from('tasks')
+        .update({
+          last_run: new Date(startedAt).toISOString(),
+          next_run: new Date(nextRunAt).toISOString(),
+          running_at: null,
+          consecutive_errors: newErrors,
+          status: 'error'
+        })
+        .eq('id', taskId)
+
+      await createMessage(
+        userId,
+        taskId,
+        `❌ Scheduled task failed (attempt ${newErrors}): ${String(err).slice(0, 200)}`
+      )
+
+      const updated = { ...task, consecutiveErrors: newErrors, nextRunAt }
+      scheduledTasks.set(taskId, updated)
+
+      console.error(`Scheduled task ${taskId} failed (errors: ${newErrors}). Next retry: ${new Date(nextRunAt).toISOString()}`)
+    }
+  } finally {
+    runningTasks.delete(task.taskId)
   }
 }
 

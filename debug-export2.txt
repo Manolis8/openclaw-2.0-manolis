@@ -1,0 +1,772 @@
+FILE: src/index.ts
+==================
+import 'dotenv/config'
+import express from 'express'
+import { createServer } from 'http'
+import { WebSocketServer, WebSocket } from 'ws'
+import { createClient } from '@supabase/supabase-js'
+import { tasksRouter } from './routes/tasks.js'
+import { messagesRouter } from './routes/messages.js'
+
+const app = express()
+const PORT = process.env.PORT || 3001
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+)
+
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*')
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  if (req.method === 'OPTIONS') { res.sendStatus(200); return }
+  next()
+})
+
+app.use(express.json())
+
+app.use((req, _res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`)
+  next()
+})
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, timestamp: new Date() })
+})
+
+// Generate a permanent API key for a user
+app.post('/api/generate-key', async (req, res) => {
+  const { userId } = req.body
+  if (!userId) return res.status(400).json({ error: 'Missing userId' })
+  const key = 'felo_' + [...Array(40)].map(() => Math.random().toString(36)[2]).join('')
+  const { error } = await supabase
+    .from('api_keys')
+    .upsert({ user_id: userId, key }, { onConflict: 'user_id' })
+  if (error) return res.status(500).json({ error: 'Failed to generate key' })
+  res.json({ key })
+})
+
+// Get existing API key for a user
+app.get('/api/get-key/:userId', async (req, res) => {
+  const { data } = await supabase
+    .from('api_keys')
+    .select('key')
+    .eq('user_id', req.params.userId)
+    .single()
+  res.json({ key: data?.key || null })
+})
+
+// Extension connection status
+app.get('/api/extension-status/:userId', (req, res) => {
+  res.json({ connected: isExtensionConnected(req.params.userId) })
+})
+
+app.use('/api', tasksRouter)
+app.use('/api', messagesRouter)
+
+const server = createServer(app)
+const wss = new WebSocketServer({ noServer: true })
+
+export const extensionConnections = new Map<string, WebSocket>()
+export const pendingCdpCommands = new Map<string, Map<number, { resolve: (v: any) => void, reject: (e: Error) => void }>>()
+
+server.on('upgrade', (request, socket, head) => {
+  console.log('🔌 WebSocket upgrade:', request.url?.slice(0, 80))
+  const url = new URL(request.url || '', 'http://localhost')
+  if (url.pathname === '/extension') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request)
+    })
+  } else {
+    socket.destroy()
+  }
+})
+
+wss.on('connection', async (ws, req) => {
+  const url = new URL(req.url || '', 'http://localhost')
+  const token = url.searchParams.get('token')
+
+  if (!token) { ws.close(1008, 'Missing token'); return }
+
+  let userId: string
+  try {
+    console.log('Looking up API key:', token.slice(0, 15) + '...')
+    const { data, error } = await supabase
+      .from('api_keys')
+      .select('user_id')
+      .eq('key', token)
+      .single()
+    if (error || !data) throw new Error('Key not found: ' + error?.message)
+    userId = data.user_id
+    console.log(`✅ API key valid for user: ${userId}`)
+  } catch (err) {
+    console.error('Extension auth failed:', String(err))
+    ws.close(1008, 'Invalid token')
+    return
+  }
+
+  const existing = extensionConnections.get(userId)
+  if (existing?.readyState === WebSocket.OPEN) {
+    existing.close(1000, 'Replaced by new connection')
+  }
+
+  extensionConnections.set(userId, ws)
+  pendingCdpCommands.set(userId, new Map())
+  console.log(`✅ Extension connected: ${userId} (total: ${extensionConnections.size})`)
+
+  // Drain any queued tasks for this user
+  drainQueueForUser(userId)
+
+  ws.send(JSON.stringify({ method: 'connected', params: { userId } }))
+
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ method: 'ping' }))
+  }, 25000)
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(String(data))
+      if (msg.method === 'pong') return
+      if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+        const userPending = pendingCdpCommands.get(userId)
+        const pending = userPending?.get(msg.id)
+        if (pending) {
+          userPending!.delete(msg.id)
+          if (msg.error) pending.reject(new Error(String(msg.error)))
+          else pending.resolve(msg.result)
+        }
+        return
+      }
+      if (msg.method === 'forwardCDPEvent') {
+        console.log(`CDP event from ${userId}: ${msg.params?.method}`)
+      }
+    } catch (err) {
+      console.error('Extension message error:', err)
+    }
+  })
+
+  ws.on('close', () => {
+    clearInterval(pingInterval)
+    if (extensionConnections.get(userId) === ws) {
+      extensionConnections.delete(userId)
+      pendingCdpCommands.delete(userId)
+    }
+    console.log(`Extension disconnected: ${userId} (total: ${extensionConnections.size})`)
+  })
+
+  ws.on('error', (err) => console.error(`WS error for ${userId}:`, err))
+})
+
+let cdpCommandId = 1
+export async function sendCdpCommand(
+  userId: string,
+  method: string,
+  params?: object,
+  tabId?: number,
+  timeoutMs = 15000
+): Promise<any> {
+  const ws = extensionConnections.get(userId)
+  if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('Extension not connected for this user')
+  const id = cdpCommandId++
+  const userPending = pendingCdpCommands.get(userId) || new Map()
+  pendingCdpCommands.set(userId, userPending)
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      userPending.delete(id)
+      reject(new Error(`CDP timeout: ${method}`))
+    }, timeoutMs)
+    userPending.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v) },
+      reject: (e) => { clearTimeout(timer); reject(e) }
+    })
+    ws.send(JSON.stringify({
+      id,
+      method: 'forwardCDPCommand',
+      params: { method, params, tabId }
+    }))
+  })
+}
+
+export async function sendExtensionMessage(
+  userId: string,
+  method: string,
+  params?: object,
+  timeoutMs = 10000
+): Promise<any> {
+  const ws = extensionConnections.get(userId)
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    throw new Error('Extension not connected for this user')
+  }
+  const id = cdpCommandId++
+  const userPending = pendingCdpCommands.get(userId) || new Map()
+  pendingCdpCommands.set(userId, userPending)
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      userPending.delete(id)
+      reject(new Error(`Extension message timeout: ${method}`))
+    }, timeoutMs)
+    userPending.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v) },
+      reject: (e) => { clearTimeout(timer); reject(e) }
+    })
+    ws.send(JSON.stringify({ id, method, params }))
+  })
+}
+
+export function isExtensionConnected(userId: string): boolean {
+  const ws = extensionConnections.get(userId)
+  const connected = !!ws && ws.readyState === WebSocket.OPEN
+  console.log(`isExtensionConnected(${userId}): ${connected}, total: ${extensionConnections.size}`)
+  return connected
+}
+
+async function drainQueueForUser(userId: string) {
+  const { data: queuedTasks } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('status', 'queued')
+    .order('created_at', { ascending: true })
+
+  if (!queuedTasks?.length) return
+  console.log(`🔄 Draining ${queuedTasks.length} queued tasks for ${userId}`)
+
+  const { runTaskInBackground } = await import('./routes/tasks.js')
+  for (const task of queuedTasks) {
+    await supabase
+      .from('tasks')
+      .update({ status: 'running' })
+      .eq('id', task.id)
+    runTaskInBackground(task.id, task.prompt, userId)
+  }
+}
+
+server.listen(PORT, async () => {
+  console.log(`✅ Felo backend running on port ${PORT}`)
+  console.log(`✅ Supabase URL: ${process.env.SUPABASE_URL}`)
+
+  // Load all recurring scheduled tasks on startup
+  const { loadScheduledTasks } = await import('./lib/scheduler.js')
+  const { runTaskInBackground } = await import('./routes/tasks.js')
+  await loadScheduledTasks(runTaskInBackground)
+})
+
+FILE: src/lib/agent-extension.ts
+==================
+import OpenAI from 'openai'
+import { sendCdpCommand, sendExtensionMessage } from '../index.js'
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+const SYSTEM_PROMPT = `You are an expert browser automation agent controlling a real Chrome browser.
+Rules:
+- Always navigate first then snapshot to see the page
+- Use refs from snapshot to interact with elements
+- The user is already logged into their accounts — do not try to log in
+- Complete tasks in minimum steps
+- Call done when you have the result`
+
+const tools: OpenAI.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'navigate',
+      description: 'Navigate to a URL in the user real Chrome browser',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string' }
+        },
+        required: ['url']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'snapshot',
+      description: 'Get the current page content and accessibility tree',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'click',
+      description: 'Click an element by CSS selector or text',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string' }
+        },
+        required: ['selector']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'type',
+      description: 'Type text into an input field',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string' },
+          text: { type: 'string' }
+        },
+        required: ['selector', 'text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'extract',
+      description: 'Extract specific data from the current page',
+      parameters: {
+        type: 'object',
+        properties: {
+          instruction: { type: 'string' }
+        },
+        required: ['instruction']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'scroll',
+      description: 'Scroll the page down or up',
+      parameters: {
+        type: 'object',
+        properties: {
+          direction: { type: 'string', enum: ['down', 'up'] }
+        },
+        required: ['direction']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'wait',
+      description: 'Wait for page to load',
+      parameters: {
+        type: 'object',
+        properties: {
+          ms: { type: 'number' }
+        },
+        required: ['ms']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'done',
+      description: 'Task complete — return the final result',
+      parameters: {
+        type: 'object',
+        properties: {
+          result: { type: 'string' }
+        },
+        required: ['result']
+      }
+    }
+  }
+]
+
+async function initializeTab(userId: string): Promise<number | null> {
+  try {
+    const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 10000)
+    await new Promise(r => setTimeout(r, 1000))
+    return result?.tabId || null
+  } catch {
+    return null
+  }
+}
+
+async function executeTool(
+  name: string,
+  args: Record<string, any>,
+  userId: string,
+  tabId: number
+): Promise<string> {
+  switch (name) {
+    case 'navigate': {
+      await sendCdpCommand(userId, 'Page.navigate', { url: args.url }, tabId)
+      await new Promise(r => setTimeout(r, 1500))
+      return `Navigated to ${args.url}`
+    }
+    case 'snapshot': {
+      const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: `document.body.innerText`,
+        returnByValue: true
+      }, tabId)
+      const text = result?.result?.value || ''
+      const url = await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: 'window.location.href',
+        returnByValue: true
+      }, tabId)
+      return `URL: ${url?.result?.value}\n\n${text.slice(0, 4000)}`
+    }
+    case 'click': {
+      await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: `
+          (() => {
+            const el = document.querySelector('${args.selector}')
+              || [...document.querySelectorAll('*')].find(e => e.textContent.trim() === '${args.selector}')
+            if (el) { el.click(); return 'clicked' }
+            return 'not found'
+          })()
+        `,
+        returnByValue: true
+      }, tabId)
+      await new Promise(r => setTimeout(r, 500))
+      return `Clicked ${args.selector}`
+    }
+    case 'type': {
+      await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: `
+          (() => {
+            const el = document.querySelector('${args.selector}')
+            if (el) {
+              el.focus()
+              el.value = '${args.text}'
+              el.dispatchEvent(new Event('input', { bubbles: true }))
+              el.dispatchEvent(new Event('change', { bubbles: true }))
+              return 'typed'
+            }
+            return 'not found'
+          })()
+        `,
+        returnByValue: true
+      }, tabId)
+      return `Typed "${args.text}" into ${args.selector}`
+    }
+    case 'extract': {
+      const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: 'document.body.innerText',
+        returnByValue: true
+      }, tabId)
+      const text = result?.result?.value || ''
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Extract the requested data from the page text. Be specific and structured.' },
+          { role: 'user', content: `${args.instruction}\n\nPage text:\n${text.slice(0, 6000)}` }
+        ],
+        max_tokens: 800
+      })
+      return response.choices[0].message.content || 'Nothing extracted'
+    }
+    case 'scroll': {
+      const y = args.direction === 'down' ? 600 : -600
+      await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: `window.scrollBy(0, ${y})`,
+        returnByValue: false
+      }, tabId)
+      return `Scrolled ${args.direction}`
+    }
+    case 'wait': {
+      const ms = Math.min(Number(args.ms) || 1000, 3000)
+      await new Promise(r => setTimeout(r, ms))
+      return `Waited ${ms}ms`
+    }
+    case 'done': {
+      return `DONE:${args.result}`
+    }
+    default:
+      return `Unknown tool: ${name}`
+  }
+}
+
+export async function runAgentWithExtension(
+  task: string,
+  userId: string,
+  onStep: (step: string) => Promise<void>
+): Promise<string> {
+  await onStep('🔌 Opening browser tab...')
+  const tabId = await initializeTab(userId)
+
+  try {
+    // existing agent loop code stays exactly the same
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: task }
+    ]
+
+    const emojis: Record<string, string> = {
+      navigate: '🌐', snapshot: '👁️', click: '👆',
+      type: '⌨️', extract: '🔍', scroll: '⬇️',
+      wait: '⏳', done: '✅'
+    }
+
+    for (let i = 0; i < 25; i++) {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages,
+        tools,
+        max_tokens: 1000
+      })
+
+      const choice = response.choices[0]
+
+      if (choice.finish_reason === 'stop') {
+        return choice.message.content || 'Task completed'
+      }
+
+      if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls) {
+        messages.push(choice.message)
+
+        for (const toolCall of choice.message.tool_calls) {
+          // Handle both function and custom tool call types
+          if (toolCall.type !== 'function') continue
+          const toolName = toolCall.function.name
+          const args = JSON.parse(toolCall.function.arguments)
+
+          const stepDesc = toolName === 'navigate'
+            ? `🌐 Navigating to ${args.url}`
+            : toolName === 'extract'
+            ? `🔍 Extracting: ${args.instruction}`
+            : toolName === 'done'
+            ? `✅ Done`
+            : `${emojis[toolName] || '⚙️'} ${toolName}`
+
+          await onStep(stepDesc)
+
+          const result = await executeTool(toolName, args, userId, tabId)
+
+          if (result.startsWith('DONE:')) {
+            return result.replace('DONE:', '')
+          }
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: result
+          })
+        }
+      }
+    }
+    return 'Max iterations reached'
+  } finally {
+    // Close the tab when done regardless of success or error
+    if (tabId) {
+      try {
+        await sendExtensionMessage(userId, 'closeTab', { tabId }, 5000)
+        await onStep('🗂️ Browser tab closed')
+      } catch {
+        // ignore close errors
+      }
+    }
+  }
+}
+
+FILE: src/routes/tasks.ts
+==================
+import { Router } from 'express'
+import { supabase } from '../lib/supabase.js'
+import { newPage } from '../lib/browser.js'
+import { runAgent } from '../lib/agent.js'
+import { isExtensionConnected, extensionConnections } from '../index.js'
+import { runAgentWithExtension } from '../lib/agent-extension.js'
+import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
+
+export const tasksRouter = Router()
+
+async function appendOutput(taskId: string, line: string) {
+  const { data } = await supabase
+    .from('tasks')
+    .select('output')
+    .eq('id', taskId)
+    .single()
+  const current = data?.output || ''
+  await supabase
+    .from('tasks')
+    .update({ output: current + line + '\n', status: 'running' })
+    .eq('id', taskId)
+}
+
+export async function runTaskInBackground(taskId: string, prompt: string, userId: string) {
+  console.log(`runTaskInBackground: taskId=${taskId} userId=${userId}`)
+  console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
+  console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)
+  const usingExtension = isExtensionConnected(userId)
+
+  if (usingExtension) {
+    // Use user's real Chrome via extension
+    await appendOutput(taskId, '🔌 Using your real browser via extension\n')
+    try {
+      const result = await runAgentWithExtension(prompt, userId, async (step) => {
+        console.log(`[${taskId}] ${step}`)
+        await appendOutput(taskId, step + '\n')
+      })
+      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+      await supabase.from('tasks').update({
+        status: 'done',
+        output: (data?.output || '') + `✅ Done: ${result}\n`
+      }).eq('id', taskId)
+
+      // Write inbox message
+      await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
+    } catch (err) {
+      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+      await supabase.from('tasks').update({
+        status: 'error',
+        output: (data?.output || '') + `❌ Error: ${String(err)}\n`
+      }).eq('id', taskId)
+
+      await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
+    }
+  } else {
+    // Fall back to cloud Playwright browser
+    await appendOutput(taskId, '☁️ Using cloud browser (connect extension for full access)\n')
+    const page = await newPage()
+    try {
+      const result = await runAgent(prompt, page, async (step) => {
+        console.log(`[${taskId}] ${step}`)
+        await appendOutput(taskId, step + '\n')
+      })
+      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+      await supabase.from('tasks').update({
+        status: 'done',
+        output: (data?.output || '') + `✅ Done: ${result}\n`
+      }).eq('id', taskId)
+
+      // Write inbox message
+      await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
+    } catch (err) {
+      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+      await supabase.from('tasks').update({
+        status: 'error',
+        output: (data?.output || '') + `❌ Error: ${String(err)}\n`
+      }).eq('id', taskId)
+
+      await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
+    } finally {
+      await page.close()
+    }
+  }
+}
+
+tasksRouter.post('/create-task', async (req, res) => {
+  const { prompt, userId } = req.body
+  console.log(`Create task: userId=${userId}, extensionConnected=${isExtensionConnected(userId)}`)
+  console.log(`All connected extensions: ${[...extensionConnections.keys()].join(', ')}`)
+  if (!prompt || !userId) {
+    return res.status(400).json({ error: 'Missing prompt or userId' })
+  }
+  const { data, error } = await supabase
+    .from('tasks')
+    .insert({ user_id: userId, prompt, output: '', status: 'running' })
+    .select()
+    .single()
+  if (error || !data) {
+    console.error('Supabase insert error:', error)
+    return res.status(500).json({ error: 'Failed to create task' })
+  }
+  res.json({ taskId: data.id })
+  runTaskInBackground(data.id, prompt, userId)
+})
+
+tasksRouter.get('/tasks/:userId', async (req, res) => {
+  const { data } = await supabase
+    .from('tasks')
+    .select('id, prompt, status, output, created_at')
+    .eq('user_id', req.params.userId)
+    .order('created_at', { ascending: false })
+    .limit(50)
+  res.json(data || [])
+})
+
+tasksRouter.post('/refresh-token', async (req, res) => {
+  const { refreshToken } = req.body
+  if (!refreshToken) return res.status(400).json({ error: 'Missing refresh token' })
+  try {
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken })
+    if (error || !data.session) throw new Error('Refresh failed')
+    res.json({ accessToken: data.session.access_token, refreshToken: data.session.refresh_token })
+  } catch (err) {
+    res.status(401).json({ error: String(err) })
+  }
+})
+
+tasksRouter.post('/create-scheduled-task', async (req, res) => {
+  const { prompt, userId, scheduleText } = req.body
+  if (!prompt || !userId || !scheduleText) {
+    return res.status(400).json({ error: 'Missing prompt, userId, or scheduleText' })
+  }
+
+  const parsed = await parseSchedule(scheduleText)
+  if (!parsed) {
+    return res.status(400).json({ error: 'Could not understand that schedule. Try "every day at 9am" or "every monday at 8am".' })
+  }
+
+  const nextRun = computeNextRun(userId, parsed.cron)
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .insert({
+      user_id: userId,
+      prompt,
+      output: '',
+      status: 'idle',
+      schedule: parsed.cron,
+      schedule_human: parsed.human,
+      is_recurring: true,
+      requires_extension: true,
+      next_run: new Date(nextRun).toISOString()
+    })
+    .select()
+    .single()
+
+  if (error || !data) {
+    return res.status(500).json({ error: 'Failed to create scheduled task' })
+  }
+
+  // Register with in-memory scheduler
+  scheduleTask(data.id, userId, prompt, parsed.cron)
+
+  // Send confirmation to inbox
+  await createMessage(userId, data.id, `📅 Scheduled: "${prompt}" — ${parsed.human}`)
+
+  res.json({ taskId: data.id, schedule: parsed.human, nextRun: new Date(nextRun).toISOString() })
+})
+
+tasksRouter.delete('/scheduled-tasks/:userId', async (req, res) => {
+  const { userId } = req.params
+
+  // Get all recurring tasks for this user
+  const { data: tasks } = await supabase
+    .from('tasks')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('is_recurring', true)
+
+  if (!tasks?.length) {
+    return res.json({ cancelled: 0 })
+  }
+
+  // Cancel all from in-memory scheduler
+  const { cancelTask } = await import('../lib/scheduler.js')
+  for (const task of tasks) {
+    cancelTask(task.id)
+  }
+
+  // Update all to idle in Supabase
+  await supabase
+    .from('tasks')
+    .update({
+      is_recurring: false,
+      schedule: null,
+      schedule_human: null,
+      next_run: null,
+      status: 'idle'
+    })
+    .eq('user_id', userId)
+    .eq('is_recurring', true)
+
+  res.json({ cancelled: tasks.length })
+})

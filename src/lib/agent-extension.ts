@@ -124,9 +124,13 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
 async function initializeTab(userId: string): Promise<number | null> {
   try {
     const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 10000)
+    console.log('initializeTab result:', JSON.stringify(result))
     await new Promise(r => setTimeout(r, 1000))
-    return result?.tabId || null
-  } catch {
+    const tabId = result?.tabId || null
+    console.log('Using tabId:', tabId)
+    return tabId
+  } catch (err) {
+    console.error('initializeTab failed:', err)
     return null
   }
 }
@@ -134,11 +138,12 @@ async function initializeTab(userId: string): Promise<number | null> {
 async function executeTool(
   name: string,
   args: Record<string, any>,
-  userId: string
+  userId: string,
+  tabId: number
 ): Promise<string> {
   switch (name) {
     case 'navigate': {
-      await sendCdpCommand(userId, 'Page.navigate', { url: args.url })
+      await sendCdpCommand(userId, 'Page.navigate', { url: args.url }, tabId)
       await new Promise(r => setTimeout(r, 1500))
       return `Navigated to ${args.url}`
     }
@@ -146,12 +151,12 @@ async function executeTool(
       const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
         expression: `document.body.innerText`,
         returnByValue: true
-      })
+      }, tabId)
       const text = result?.result?.value || ''
       const url = await sendCdpCommand(userId, 'Runtime.evaluate', {
         expression: 'window.location.href',
         returnByValue: true
-      })
+      }, tabId)
       return `URL: ${url?.result?.value}\n\n${text.slice(0, 4000)}`
     }
     case 'click': {
@@ -165,7 +170,7 @@ async function executeTool(
           })()
         `,
         returnByValue: true
-      })
+      }, tabId)
       await new Promise(r => setTimeout(r, 500))
       return `Clicked ${args.selector}`
     }
@@ -185,14 +190,14 @@ async function executeTool(
           })()
         `,
         returnByValue: true
-      })
+      }, tabId)
       return `Typed "${args.text}" into ${args.selector}`
     }
     case 'extract': {
       const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
         expression: 'document.body.innerText',
         returnByValue: true
-      })
+      }, tabId)
       const text = result?.result?.value || ''
       const response = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -209,7 +214,7 @@ async function executeTool(
       await sendCdpCommand(userId, 'Runtime.evaluate', {
         expression: `window.scrollBy(0, ${y})`,
         returnByValue: false
-      })
+      }, tabId)
       return `Scrolled ${args.direction}`
     }
     case 'wait': {
@@ -279,7 +284,7 @@ export async function runAgentWithExtension(
 
           await onStep(stepDesc)
 
-          const result = await executeTool(toolName, args, userId)
+          const result = await executeTool(toolName, args, userId, tabId)
 
           if (result.startsWith('DONE:')) {
             return result.replace('DONE:', '')

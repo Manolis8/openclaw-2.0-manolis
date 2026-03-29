@@ -106,7 +106,7 @@ tasksRouter.post('/create-task', async (req, res) => {
 tasksRouter.get('/tasks/:userId', async (req, res) => {
   const { data } = await supabase
     .from('tasks')
-    .select('id, prompt, status, output, created_at')
+    .select('id, prompt, status, output, created_at, is_recurring, schedule_human, next_run, last_run')
     .eq('user_id', req.params.userId)
     .order('created_at', { ascending: false })
     .limit(50)
@@ -165,4 +165,40 @@ tasksRouter.post('/create-scheduled-task', async (req, res) => {
   await createMessage(userId, data.id, `📅 Scheduled: "${prompt}" — ${parsed.human}`)
 
   res.json({ taskId: data.id, schedule: parsed.human, nextRun: new Date(nextRun).toISOString() })
+})
+
+tasksRouter.delete('/scheduled-tasks/:userId', async (req, res) => {
+  const { userId } = req.params
+
+  // Get all recurring tasks for this user
+  const { data: tasks } = await supabase
+    .from('tasks')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('is_recurring', true)
+
+  if (!tasks?.length) {
+    return res.json({ cancelled: 0 })
+  }
+
+  // Cancel all from in-memory scheduler
+  const { cancelTask } = await import('../lib/scheduler.js')
+  for (const task of tasks) {
+    cancelTask(task.id)
+  }
+
+  // Update all to idle in Supabase
+  await supabase
+    .from('tasks')
+    .update({
+      is_recurring: false,
+      schedule: null,
+      schedule_human: null,
+      next_run: null,
+      status: 'idle'
+    })
+    .eq('user_id', userId)
+    .eq('is_recurring', true)
+
+  res.json({ cancelled: tasks.length })
 })

@@ -5,6 +5,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { createClient } from '@supabase/supabase-js'
 import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
+import { connectionsRouter } from './routes/connections.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -62,6 +63,7 @@ app.get('/api/extension-status/:userId', (req, res) => {
 
 app.use('/api', tasksRouter)
 app.use('/api', messagesRouter)
+app.use('/api', connectionsRouter)
 
 const server = createServer(app)
 const wss = new WebSocketServer({ noServer: true })
@@ -157,19 +159,32 @@ wss.on('connection', async (ws, req) => {
 })
 
 let cdpCommandId = 1
-export async function sendCdpCommand(userId: string, method: string, params?: object, timeoutMs = 15000): Promise<any> {
+export async function sendCdpCommand(
+  userId: string,
+  method: string,
+  params?: object,
+  tabId?: number,
+  timeoutMs = 15000
+): Promise<any> {
   const ws = extensionConnections.get(userId)
   if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('Extension not connected for this user')
   const id = cdpCommandId++
   const userPending = pendingCdpCommands.get(userId) || new Map()
   pendingCdpCommands.set(userId, userPending)
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { userPending.delete(id); reject(new Error(`CDP timeout: ${method}`)) }, timeoutMs)
+    const timer = setTimeout(() => {
+      userPending.delete(id)
+      reject(new Error(`CDP timeout: ${method}`))
+    }, timeoutMs)
     userPending.set(id, {
       resolve: (v) => { clearTimeout(timer); resolve(v) },
       reject: (e) => { clearTimeout(timer); reject(e) }
     })
-    ws.send(JSON.stringify({ id, method: 'forwardCDPCommand', params: { method, params } }))
+    ws.send(JSON.stringify({
+      id,
+      method: 'forwardCDPCommand',
+      params: { method, params, tabId }
+    }))
   })
 }
 
