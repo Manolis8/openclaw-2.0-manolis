@@ -21,13 +21,15 @@ async function appendOutput(taskId: string, line: string) {
     .eq('id', taskId)
 }
 
-export async function runTaskInBackground(taskId: string, prompt: string, userId: string) {
+export async function runTaskInBackground(taskId: string, prompt: string, userId: string, useApiMode?: boolean) {
   console.log(`runTaskInBackground: taskId=${taskId} userId=${userId}`)
   console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
   console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)
-  const usingExtension = isExtensionConnected(userId)
+  const extensionConnected = isExtensionConnected(userId)
 
-  if (usingExtension) {
+  // If useApiMode is true, prefer cloud agent (which has API tools)
+  // If useApiMode is false, prefer extension (browser)
+  if (!useApiMode && extensionConnected) {
     // Use user's real Chrome via extension
     await appendOutput(taskId, '🔌 Using your real browser via extension\n')
     try {
@@ -53,7 +55,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
     }
   } else {
-    // Fall back to cloud Playwright browser
+    // Use cloud agent with API tools
     await appendOutput(taskId, '☁️ Using cloud browser (connect extension for full access)\n')
     const page = await newPage()
     try {
@@ -84,7 +86,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
 }
 
 tasksRouter.post('/create-task', async (req, res) => {
-  const { prompt, userId } = req.body
+  const { prompt, userId, useApiMode } = req.body
   console.log(`Create task: userId=${userId}, extensionConnected=${isExtensionConnected(userId)}`)
   console.log(`All connected extensions: ${[...extensionConnections.keys()].join(', ')}`)
   if (!prompt || !userId) {
@@ -100,7 +102,7 @@ tasksRouter.post('/create-task', async (req, res) => {
     return res.status(500).json({ error: 'Failed to create task' })
   }
   res.json({ taskId: data.id })
-  runTaskInBackground(data.id, prompt, userId)
+  runTaskInBackground(data.id, prompt, userId, useApiMode)
 })
 
 tasksRouter.get('/tasks/:userId', async (req, res) => {
