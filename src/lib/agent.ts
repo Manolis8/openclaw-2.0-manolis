@@ -8,15 +8,21 @@ import * as github from './integrations/github.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-const SYSTEM_PROMPT = `You are a browser automation agent. Complete the user's task using browser tools and integrations.
+const SYSTEM_PROMPT = `You are a browser automation agent with access to integrations.
+IMPORTANT: For Gmail, Notion, Slack, and GitHub tasks, ALWAYS use the API tools first. Do NOT use the browser.
+API tools available:
+- gmail_list, gmail_send, gmail_read, gmail_summarize
+- notion_create_page, notion_list_databases, notion_query_database
+- slack_send, slack_list_channels, slack_read_messages
+- github_create_issue, github_list_repos, github_list_issues
+
 Rules:
-- Always navigate to the right URL first
-- Use snapshot to read page content before interacting
-- Use extract to pull specific data from pages
-- For Gmail/Slack/Notion/GitHub tasks, use the API tools instead of browser automation
-- Complete tasks in minimum steps
-- When you have the result call done immediately
-- If a step fails try a different approach`
+1. If task mentions Gmail/Notion/Slack/GitHub → use ONLY the API tools, never navigate to their websites
+2. For other websites → use browser automation with navigate, click, type
+3. Always call the appropriate API tool first
+4. Complete tasks in minimum steps
+5. When you have the result call done immediately
+6. If a step fails try a different approach`
 
 const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
