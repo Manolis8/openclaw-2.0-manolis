@@ -60,7 +60,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       const result = await runAgent(prompt, page, async (step) => {
         console.log(`[${taskId}] ${step}`)
         await appendOutput(taskId, step + '\n')
-      })
+      }, userId)
       const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
       await supabase.from('tasks').update({
         status: 'done',

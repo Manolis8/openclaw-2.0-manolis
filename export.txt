@@ -1,0 +1,1187 @@
+FILE: src/routes/oauth.ts
+==================
+import { Router } from 'express'
+import { createClient } from '@supabase/supabase-js'
+import { OAUTH_CONFIG, OAuthProvider } from '../lib/oauth-config.js'
+import { encrypt, decrypt } from '../lib/encryption.js'
+
+export const oauthRouter = Router()
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+)
+
+// Step 1 — redirect user to provider OAuth page
+oauthRouter.get('/oauth/:provider/connect', (req, res) => {
+  const provider = req.params.provider as OAuthProvider
+  const { userId } = req.query
+
+  if (!userId || !OAUTH_CONFIG[provider]) {
+    return res.status(400).json({ error: 'Invalid provider or missing userId' })
+  }
+
+  const config = OAUTH_CONFIG[provider]
+  const state = Buffer.from(JSON.stringify({ userId, provider })).toString('base64')
+
+  const params = new URLSearchParams({
+    client_id: config.clientId,
+    redirect_uri: config.redirectUri,
+    response_type: 'code',
+    state,
+    access_type: 'offline',
+    prompt: 'consent'
+  })
+
+  if (config.scopes.length > 0) {
+    params.set('scope', config.scopes.join(' '))
+  }
+
+  res.redirect(`${config.authUrl}?${params.toString()}`)
+})
+
+// Step 2 — handle callback from provider
+oauthRouter.get('/oauth/:provider/callback', async (req, res) => {
+  const provider = req.params.provider as OAuthProvider
+  const { code, state, error } = req.query
+
+  if (error) {
+    return res.redirect(`${process.env.FRONTEND_URL}?oauth_error=${error}`)
+  }
+
+  if (!code || !state) {
+    return res.status(400).json({ error: 'Missing code or state' })
+  }
+
+  let userId: string
+  try {
+    const decoded = JSON.parse(Buffer.from(state as string, 'base64').toString())
+    userId = decoded.userId
+  } catch {
+    return res.status(400).json({ error: 'Invalid state' })
+  }
+
+  const config = OAUTH_CONFIG[provider]
+
+  try {
+    // Exchange code for tokens
+    const tokenRes = await fetch(config.tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+        ...(provider === 'notion' ? {
+          'Authorization': 'Basic ' + Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64')
+        } : {})
+      },
+      body: new URLSearchParams({
+        code: code as string,
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        redirect_uri: config.redirectUri,
+        grant_type: 'authorization_code'
+      }).toString()
+    })
+
+    const tokens = await tokenRes.json()
+    console.log(`OAuth tokens for ${provider}:`, JSON.stringify(tokens).slice(0, 200))
+
+    if (!tokens.access_token && !tokens.authed_user) {
+      throw new Error('No access token in response: ' + JSON.stringify(tokens))
+    }
+
+    // Handle Slack's different token structure
+    const accessToken = provider === 'slack'
+      ? tokens.authed_user?.access_token || tokens.access_token
+      : tokens.access_token
+
+    const refreshToken = tokens.refresh_token || null
+    const expiresAt = tokens.expires_in
+      ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+      : null
+
+    // Store encrypted tokens in Supabase
+    await supabase
+      .from('oauth_tokens')
+      .upsert({
+        user_id: userId,
+        provider,
+        access_token: encrypt(accessToken),
+        refresh_token: refreshToken ? encrypt(refreshToken) : null,
+        expires_at: expiresAt,
+        scope: tokens.scope || null,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id,provider' })
+
+    // Redirect back to dashboard with success
+    res.redirect(`${process.env.FRONTEND_URL}?oauth_success=${provider}`)
+
+  } catch (err) {
+    console.error(`OAuth callback error for ${provider}:`, err)
+    res.redirect(`${process.env.FRONTEND_URL}?oauth_error=token_exchange_failed`)
+  }
+})
+
+// Get connected providers for a user
+oauthRouter.get('/oauth/status/:userId', async (req, res) => {
+  const { userId } = req.params
+  const { data } = await supabase
+    .from('oauth_tokens')
+    .select('provider')
+    .eq('user_id', userId)
+
+  const connected: Record<string, boolean> = {
+    gmail: false,
+    'google-calendar': false,
+    'google-sheets': false,
+    slack: false,
+    notion: false,
+    github: false
+  }
+
+  data?.forEach(row => {
+    connected[row.provider] = true
+  })
+
+  res.json(connected)
+})
+
+// Disconnect a provider
+oauthRouter.delete('/oauth/:provider/:userId', async (req, res) => {
+  const { provider, userId } = req.params
+  await supabase
+    .from('oauth_tokens')
+    .delete()
+    .eq('user_id', userId)
+    .eq('provider', provider)
+  res.json({ ok: true })
+})
+
+// Get decrypted token for a user+provider (internal use by agent)
+oauthRouter.get('/oauth/token/:provider/:userId', async (req, res) => {
+  const { provider, userId } = req.params
+  const { data } = await supabase
+    .from('oauth_tokens')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('provider', provider)
+    .single()
+
+  if (!data) return res.status(404).json({ error: 'Not connected' })
+
+  // Check if token needs refresh
+  if (data.expires_at && data.refresh_token) {
+    const expiresAt = new Date(data.expires_at)
+    const fiveMinutes = 5 * 60 * 1000
+    if (expiresAt.getTime() - Date.now() < fiveMinutes) {
+      try {
+        const config = OAUTH_CONFIG[provider as OAuthProvider]
+        const refreshRes = await fetch(config.tokenUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            refresh_token: decrypt(data.refresh_token),
+            client_id: config.clientId,
+            client_secret: config.clientSecret
+          }).toString()
+        })
+        const refreshed = await refreshRes.json()
+        if (refreshed.access_token) {
+          const newExpiresAt = new Date(Date.now() + refreshed.expires_in * 1000).toISOString()
+          await supabase
+            .from('oauth_tokens')
+            .update({
+              access_token: encrypt(refreshed.access_token),
+              expires_at: newExpiresAt,
+              updated_at: new Date().toISOString()
+            })
+            .eq('user_id', userId)
+            .eq('provider', provider)
+          return res.json({ accessToken: refreshed.access_token, expiresAt: newExpiresAt })
+        }
+      } catch (err) {
+        console.error('Token refresh error:', err)
+      }
+    }
+  }
+
+  res.json({
+    accessToken: decrypt(data.access_token),
+    expiresAt: data.expires_at
+  })
+})
+
+FILE: src/lib/agent.ts
+==================
+import OpenAI from 'openai'
+import type { Page } from 'playwright'
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+const SYSTEM_PROMPT = `You are a browser automation agent. Complete the user's task using browser tools.
+Rules:
+- Always navigate to the right URL first
+- Use snapshot to read page content before interacting
+- Use extract to pull specific data from pages
+- Complete tasks in minimum steps
+- When you have the result call done immediately
+- If a step fails try a different approach`
+
+const tools: OpenAI.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'navigate',
+      description: 'Navigate to a URL',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string' }
+        },
+        required: ['url']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'snapshot',
+      description: 'Get visible text content of the current page',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'click',
+      description: 'Click an element on the page',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string' }
+        },
+        required: ['selector']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'type',
+      description: 'Type text into an input field',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string' },
+          text: { type: 'string' }
+        },
+        required: ['selector', 'text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'extract',
+      description: 'Extract specific data from the current page',
+      parameters: {
+        type: 'object',
+        properties: {
+          instruction: { type: 'string' }
+        },
+        required: ['instruction']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'done',
+      description: 'Signal task is complete with the final result',
+      parameters: {
+        type: 'object',
+        properties: {
+          result: { type: 'string' }
+        },
+        required: ['result']
+      }
+    }
+  }
+]
+
+async function executeTool(name: string, args: Record<string, string>, page: Page): Promise<string> {
+  switch (name) {
+    case 'navigate': {
+      await page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: 15000 })
+      return `Navigated to ${args.url}`
+    }
+    case 'snapshot': {
+      const text = await page.evaluate(() => document.body.innerText)
+      return text.slice(0, 3000)
+    }
+    case 'click': {
+      try {
+        await page.click(args.selector, { timeout: 5000 })
+      } catch {
+        await page.getByText(args.selector).first().click({ timeout: 5000 })
+      }
+      return `Clicked ${args.selector}`
+    }
+    case 'type': {
+      await page.fill(args.selector, args.text)
+      return `Typed into ${args.selector}`
+    }
+    case 'extract': {
+      const html = await page.evaluate(() => document.body.innerHTML)
+      const r = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Extract the requested data from the HTML. Be concise.' },
+          { role: 'user', content: `${args.instruction}\n\nHTML:\n${html.slice(0, 8000)}` }
+        ],
+        max_tokens: 500
+      })
+      return r.choices[0].message.content || 'Nothing extracted'
+    }
+    case 'done': {
+      return `DONE:${args.result}`
+    }
+    default:
+      return `Unknown tool: ${name}`
+  }
+}
+
+export async function runAgent(
+  task: string,
+  page: Page,
+  onStep: (step: string) => Promise<void>
+): Promise<string> {
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: task }
+  ]
+
+  for (let i = 0; i < 20; i++) {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages,
+      tools,
+      max_tokens: 500
+    })
+
+    const choice = response.choices[0]
+
+    if (choice.finish_reason === 'stop') {
+      return choice.message.content || 'Task completed'
+    }
+
+    if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls && choice.message.tool_calls.length > 0) {
+      messages.push(choice.message)
+
+      for (const toolCall of choice.message.tool_calls!) {
+        const functionCall = toolCall as any
+        const name = functionCall.function.name
+        const args = JSON.parse(functionCall.function.arguments)
+
+        const emojis: Record<string, string> = {
+          navigate: '🌐', snapshot: '👁️', click: '👆',
+          type: '⌨️', extract: '🔍', done: '✅'
+        }
+
+        await onStep(`${emojis[name] || '⚙️'} ${name}: ${JSON.stringify(args)}`)
+
+        const result = await executeTool(name, args, page)
+
+        if (result.startsWith('DONE:')) {
+          return result.replace('DONE:', '')
+        }
+
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: result
+        })
+      }
+    }
+  }
+
+  return 'Max iterations reached'
+}
+
+FILE: src/lib/agent-extension.ts
+==================
+import OpenAI from 'openai'
+import { sendCdpCommand, sendExtensionMessage } from '../index.js'
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+const SYSTEM_PROMPT = `You are an expert browser automation agent controlling a real Chrome browser.
+Rules:
+- Always navigate first then snapshot to see the page
+- Use refs from snapshot to interact with elements
+- The user is already logged into their accounts — do not try to log in
+- Complete tasks in minimum steps
+- Call done when you have the result`
+
+const tools: OpenAI.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'navigate',
+      description: 'Navigate to a URL in the user real Chrome browser',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string' }
+        },
+        required: ['url']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'snapshot',
+      description: 'Get the current page content and accessibility tree',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'click',
+      description: 'Click an element by CSS selector or text',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string' }
+        },
+        required: ['selector']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'type',
+      description: 'Type text into an input field',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string' },
+          text: { type: 'string' }
+        },
+        required: ['selector', 'text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'extract',
+      description: 'Extract specific data from the current page',
+      parameters: {
+        type: 'object',
+        properties: {
+          instruction: { type: 'string' }
+        },
+        required: ['instruction']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'scroll',
+      description: 'Scroll the page down or up',
+      parameters: {
+        type: 'object',
+        properties: {
+          direction: { type: 'string', enum: ['down', 'up'] }
+        },
+        required: ['direction']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'wait',
+      description: 'Wait for page to load',
+      parameters: {
+        type: 'object',
+        properties: {
+          ms: { type: 'number' }
+        },
+        required: ['ms']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'done',
+      description: 'Task complete — return the final result',
+      parameters: {
+        type: 'object',
+        properties: {
+          result: { type: 'string' }
+        },
+        required: ['result']
+      }
+    }
+  }
+]
+
+async function initializeTab(userId: string): Promise<number | null> {
+  try {
+    const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 10000)
+    console.log('initializeTab result:', JSON.stringify(result))
+    await new Promise(r => setTimeout(r, 1000))
+    const tabId = result?.tabId || null
+    console.log('Using tabId:', tabId)
+    return tabId
+  } catch (err) {
+    console.error('initializeTab failed:', err)
+    return null
+  }
+}
+
+async function executeTool(
+  name: string,
+  args: Record<string, any>,
+  userId: string,
+  tabId: number
+): Promise<string> {
+  switch (name) {
+    case 'navigate': {
+      await sendCdpCommand(userId, 'Page.navigate', { url: args.url }, tabId)
+      await new Promise(r => setTimeout(r, 1500))
+      return `Navigated to ${args.url}`
+    }
+    case 'snapshot': {
+      const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: `document.body.innerText`,
+        returnByValue: true
+      }, tabId)
+      const text = result?.result?.value || ''
+      const url = await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: 'window.location.href',
+        returnByValue: true
+      }, tabId)
+      return `URL: ${url?.result?.value}\n\n${text.slice(0, 4000)}`
+    }
+    case 'click': {
+      await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: `
+          (() => {
+            const el = document.querySelector('${args.selector}')
+              || [...document.querySelectorAll('*')].find(e => e.textContent.trim() === '${args.selector}')
+            if (el) { el.click(); return 'clicked' }
+            return 'not found'
+          })()
+        `,
+        returnByValue: true
+      }, tabId)
+      await new Promise(r => setTimeout(r, 500))
+      return `Clicked ${args.selector}`
+    }
+    case 'type': {
+      await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: `
+          (() => {
+            const el = document.querySelector('${args.selector}')
+            if (el) {
+              el.focus()
+              el.value = '${args.text}'
+              el.dispatchEvent(new Event('input', { bubbles: true }))
+              el.dispatchEvent(new Event('change', { bubbles: true }))
+              return 'typed'
+            }
+            return 'not found'
+          })()
+        `,
+        returnByValue: true
+      }, tabId)
+      return `Typed "${args.text}" into ${args.selector}`
+    }
+    case 'extract': {
+      const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: 'document.body.innerText',
+        returnByValue: true
+      }, tabId)
+      const text = result?.result?.value || ''
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Extract the requested data from the page text. Be specific and structured.' },
+          { role: 'user', content: `${args.instruction}\n\nPage text:\n${text.slice(0, 6000)}` }
+        ],
+        max_tokens: 800
+      })
+      return response.choices[0].message.content || 'Nothing extracted'
+    }
+    case 'scroll': {
+      const y = args.direction === 'down' ? 600 : -600
+      await sendCdpCommand(userId, 'Runtime.evaluate', {
+        expression: `window.scrollBy(0, ${y})`,
+        returnByValue: false
+      }, tabId)
+      return `Scrolled ${args.direction}`
+    }
+    case 'wait': {
+      const ms = Math.min(Number(args.ms) || 1000, 3000)
+      await new Promise(r => setTimeout(r, ms))
+      return `Waited ${ms}ms`
+    }
+    case 'done': {
+      return `DONE:${args.result}`
+    }
+    default:
+      return `Unknown tool: ${name}`
+  }
+}
+
+export async function runAgentWithExtension(
+  task: string,
+  userId: string,
+  onStep: (step: string) => Promise<void>
+): Promise<string> {
+  await onStep('🔌 Opening browser tab...')
+  const tabId = await initializeTab(userId)
+
+  try {
+    // existing agent loop code stays exactly the same
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: task }
+    ]
+
+    const emojis: Record<string, string> = {
+      navigate: '🌐', snapshot: '👁️', click: '👆',
+      type: '⌨️', extract: '🔍', scroll: '⬇️',
+      wait: '⏳', done: '✅'
+    }
+
+    for (let i = 0; i < 25; i++) {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages,
+        tools,
+        max_tokens: 1000
+      })
+
+      const choice = response.choices[0]
+
+      if (choice.finish_reason === 'stop') {
+        return choice.message.content || 'Task completed'
+      }
+
+      if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls) {
+        messages.push(choice.message)
+
+        for (const toolCall of choice.message.tool_calls) {
+          // Handle both function and custom tool call types
+          if (toolCall.type !== 'function') continue
+          const toolName = toolCall.function.name
+          const args = JSON.parse(toolCall.function.arguments)
+
+          const stepDesc = toolName === 'navigate'
+            ? `🌐 Navigating to ${args.url}`
+            : toolName === 'extract'
+            ? `🔍 Extracting: ${args.instruction}`
+            : toolName === 'done'
+            ? `✅ Done`
+            : `${emojis[toolName] || '⚙️'} ${toolName}`
+
+          await onStep(stepDesc)
+
+          const result = await executeTool(toolName, args, userId, tabId)
+
+          if (result.startsWith('DONE:')) {
+            return result.replace('DONE:', '')
+          }
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: result
+          })
+        }
+      }
+    }
+    return 'Max iterations reached'
+  } finally {
+    // Close the tab when done regardless of success or error
+    if (tabId) {
+      try {
+        await sendExtensionMessage(userId, 'closeTab', { tabId }, 5000)
+        await onStep('🗂️ Browser tab closed')
+      } catch {
+        // ignore close errors
+      }
+    }
+  }
+}
+
+FILE: src/lib/scheduler.ts
+==================
+import { createHash } from 'crypto'
+import { Cron } from 'croner'
+import OpenAI from 'openai'
+import { createClient } from '@supabase/supabase-js'
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+)
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const MIN_REFIRE_GAP_MS = 2000
+const MAX_TIMER_DELAY_MS = 60_000
+const DEFAULT_TOP_OF_HOUR_STAGGER_MS = 5 * 60 * 1000 // 5 minutes
+const BACKOFF_MS = [30_000, 60_000, 300_000, 900_000, 3_600_000]
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface ScheduledTask {
+  taskId: string
+  userId: string
+  prompt: string
+  cronExpr: string
+  lastRunAt?: number
+  consecutiveErrors: number
+  nextRunAt: number
+}
+
+// ─── In-memory store ──────────────────────────────────────────────────────────
+
+const scheduledTasks = new Map<string, ScheduledTask>()
+const runningTasks = new Set<string>()
+let timerHandle: NodeJS.Timeout | null = null
+let timerRunning = false
+
+// ─── Stagger ──────────────────────────────────────────────────────────────────
+
+function resolveStaggerOffset(taskId: string, windowMs: number): number {
+  if (windowMs <= 0) return 0
+  const hash = createHash('sha256').update(taskId).digest()
+  return hash.readUInt32BE(0) % windowMs
+}
+
+function isTopOfHourCron(expr: string): boolean {
+  const parts = expr.trim().split(/\s+/)
+  if (parts.length < 2) return false
+  return parts[0] === '0'
+}
+
+// ─── Next run computation ─────────────────────────────────────────────────────
+
+export function computeNextRun(
+  taskId: string,
+  cronExpr: string,
+  lastRunAt?: number
+): number {
+  const nowMs = Date.now()
+  const staggerWindowMs = isTopOfHourCron(cronExpr)
+    ? DEFAULT_TOP_OF_HOUR_STAGGER_MS
+    : 0
+  const stagger = resolveStaggerOffset(taskId, staggerWindowMs)
+
+  try {
+    const c = new Cron(cronExpr)
+    let next = c.nextRun(new Date(nowMs))
+
+    // Croner timezone bug workaround — retry from next second
+    if (!next || next.getTime() <= nowMs) {
+      next = c.nextRun(new Date(nowMs + 1000))
+    }
+    // Still stuck — retry from start of tomorrow
+    if (!next || next.getTime() <= nowMs) {
+      const tomorrow = new Date()
+      tomorrow.setDate(tomorrow.getDate() + 1)
+      tomorrow.setHours(0, 0, 1, 0)
+      next = c.nextRun(tomorrow)
+    }
+
+    if (!next) throw new Error(`Cannot compute next run for: ${cronExpr}`)
+    return next.getTime() + stagger
+  } catch (err) {
+    console.error(`computeNextRun error for ${cronExpr}:`, err)
+    // Fallback: 1 hour from now
+    return nowMs + 3_600_000
+  }
+}
+
+function computeNextRunWithBackoff(
+  taskId: string,
+  cronExpr: string,
+  consecutiveErrors: number,
+  endedAtMs: number
+): number {
+  const natural = computeNextRun(taskId, cronExpr, endedAtMs)
+  if (consecutiveErrors === 0) return natural
+  const backoff = BACKOFF_MS[Math.min(consecutiveErrors - 1, BACKOFF_MS.length - 1)]
+  return Math.max(natural, endedAtMs + backoff)
+}
+
+// ─── Natural language parsing ─────────────────────────────────────────────────
+
+export async function parseSchedule(input: string): Promise<{
+  cron: string
+  human: string
+} | null> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `Convert natural language schedule descriptions to cron expressions.
+Return ONLY a valid JSON object with exactly two fields:
+- cron: standard 5-field cron expression (minute hour day month weekday)
+- human: clean human-readable description
+
+Examples:
+"every morning at 9am" -> {"cron":"0 9 * * *","human":"Every day at 9:00 AM"}
+"every monday at 8am" -> {"cron":"0 8 * * 1","human":"Every Monday at 8:00 AM"}
+"every hour" -> {"cron":"0 * * * *","human":"Every hour"}
+"every day at 6pm" -> {"cron":"0 18 * * *","human":"Every day at 6:00 PM"}
+"every 30 minutes" -> {"cron":"*/30 * * * *","human":"Every 30 minutes"}
+"every weekday at 9am" -> {"cron":"0 9 * * 1-5","human":"Every weekday at 9:00 AM"}
+"every sunday at noon" -> {"cron":"0 12 * * 0","human":"Every Sunday at 12:00 PM"}
+
+Return null if input is not a valid schedule description.
+Return ONLY the JSON object, no markdown, no explanation.`
+        },
+        { role: 'user', content: input }
+      ],
+      max_tokens: 100
+    })
+
+    const text = response.choices[0].message.content?.trim() || ''
+    if (text === 'null' || !text) return null
+    const clean = text.replace(/```json|```/g, '').trim()
+    const parsed = JSON.parse(clean)
+    if (!parsed.cron || !parsed.human) return null
+    return parsed
+  } catch (err) {
+    console.error('parseSchedule error:', err)
+    return null
+  }
+}
+
+// ─── Inbox messages ───────────────────────────────────────────────────────────
+
+export async function createMessage(
+  userId: string,
+  taskId: string,
+  content: string
+): Promise<void> {
+  try {
+    await supabase.from('messages').insert({
+      user_id: userId,
+      task_id: taskId,
+      content,
+      read: false
+    })
+  } catch (err) {
+    console.error('createMessage error:', err)
+  }
+}
+
+// ─── Timer loop ───────────────────────────────────────────────────────────────
+
+// Import this from routes/tasks.ts when wiring up
+let _runTaskFn: ((taskId: string, prompt: string, userId: string) => Promise<void>) | null = null
+
+export function setRunTaskFn(
+  fn: (taskId: string, prompt: string, userId: string) => Promise<void>
+) {
+  _runTaskFn = fn
+}
+
+export function armTimer(): void {
+  if (timerHandle) {
+    clearTimeout(timerHandle)
+    timerHandle = null
+  }
+
+  if (scheduledTasks.size === 0) return
+
+  const nowMs = Date.now()
+  let nearestMs = Infinity
+
+  for (const task of scheduledTasks.values()) {
+    if (task.nextRunAt < nearestMs) {
+      nearestMs = task.nextRunAt
+    }
+  }
+
+  if (nearestMs === Infinity) return
+
+  let delayMs = Math.max(nearestMs - nowMs, 0)
+
+  // Enforce minimum gap to prevent tight loops
+  if (delayMs < MIN_REFIRE_GAP_MS) delayMs = MIN_REFIRE_GAP_MS
+
+  // Clamp to max for drift recovery
+  if (delayMs > MAX_TIMER_DELAY_MS) delayMs = MAX_TIMER_DELAY_MS
+
+  console.log(`⏱ Timer armed — next task in ${Math.round(delayMs / 1000)}s`)
+
+  timerHandle = setTimeout(() => onTimer(), delayMs)
+}
+
+async function onTimer(): Promise<void> {
+  if (timerRunning) {
+    armTimer()
+    return
+  }
+
+  timerRunning = true
+
+  try {
+    const nowMs = Date.now()
+
+    // Collect all due tasks
+    const dueTasks: ScheduledTask[] = []
+    for (const task of scheduledTasks.values()) {
+      if (task.nextRunAt <= nowMs) {
+        dueTasks.push(task)
+      }
+    }
+
+    if (dueTasks.length === 0) {
+      armTimer()
+      return
+    }
+
+    console.log(`⏰ ${dueTasks.length} task(s) due`)
+
+    // Run all due tasks
+    for (const task of dueTasks) {
+      runScheduledTask(task).catch(err => {
+        console.error(`Scheduled task ${task.taskId} threw:`, err)
+      })
+    }
+  } finally {
+    timerRunning = false
+    armTimer()
+  }
+}
+
+async function runScheduledTask(task: ScheduledTask): Promise<void> {
+  // Skip if already running in memory — prevents duplicate runs
+  if (runningTasks.has(task.taskId)) {
+    console.log(`Task ${task.taskId} already running in memory, skipping`)
+    return
+  }
+  runningTasks.add(task.taskId)
+
+  try {
+    const { taskId, userId, prompt, cronExpr } = task
+
+    // Check if extension is connected — import dynamically to avoid circular deps
+    const { isExtensionConnected } = await import('../index.js')
+
+    // Write running_at BEFORE executing — distributed lock
+    const { error: lockError } = await supabase
+      .from('tasks')
+      .update({ running_at: new Date().toISOString() })
+      .eq('id', taskId)
+      .is('running_at', null) // only if not already running
+
+    if (lockError) {
+      console.warn(`Could not lock task ${taskId} — may already be running`)
+      return
+    }
+
+    const extensionConnected = isExtensionConnected(userId)
+
+    if (!extensionConnected) {
+      // Queue it — extension not connected
+      await supabase
+        .from('tasks')
+        .update({
+          status: 'queued',
+          running_at: null,
+          last_run: new Date().toISOString()
+        })
+        .eq('id', taskId)
+
+      await createMessage(
+        userId,
+        taskId,
+        `⏳ Task queued — your browser isn't connected. It will run automatically when you open Chrome.`
+      )
+
+      console.log(`Task ${taskId} queued — extension offline`)
+
+      // Compute next run and update
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, task.consecutiveErrors, Date.now())
+      const updated = { ...task, nextRunAt }
+      scheduledTasks.set(taskId, updated)
+      await supabase
+        .from('tasks')
+        .update({ next_run: new Date(nextRunAt).toISOString() })
+        .eq('id', taskId)
+
+      return
+    }
+
+    // Extension is connected — run now
+    await supabase
+      .from('tasks')
+      .update({ status: 'running', output: '' })
+      .eq('id', taskId)
+
+    const startedAt = Date.now()
+
+    try {
+      if (!_runTaskFn) throw new Error('runTaskFn not set')
+      await _runTaskFn(taskId, prompt, userId)
+
+      // Success
+      const endedAt = Date.now()
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, 0, endedAt)
+
+      await supabase
+        .from('tasks')
+        .update({
+          last_run: new Date(startedAt).toISOString(),
+          next_run: new Date(nextRunAt).toISOString(),
+          running_at: null,
+          consecutive_errors: 0
+        })
+        .eq('id', taskId)
+
+      const updated = { ...task, lastRunAt: startedAt, consecutiveErrors: 0, nextRunAt }
+      scheduledTasks.set(taskId, updated)
+
+      console.log(`✅ Scheduled task ${taskId} done. Next run: ${new Date(nextRunAt).toISOString()}`)
+
+    } catch (err) {
+      // Error — apply backoff
+      const endedAt = Date.now()
+      const newErrors = task.consecutiveErrors + 1
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, newErrors, endedAt)
+
+      await supabase
+        .from('tasks')
+        .update({
+          last_run: new Date(startedAt).toISOString(),
+          next_run: new Date(nextRunAt).toISOString(),
+          running_at: null,
+          consecutive_errors: newErrors,
+          status: 'error'
+        })
+        .eq('id', taskId)
+
+      await createMessage(
+        userId,
+        taskId,
+        `❌ Scheduled task failed (attempt ${newErrors}): ${String(err).slice(0, 200)}`
+      )
+
+      const updated = { ...task, consecutiveErrors: newErrors, nextRunAt }
+      scheduledTasks.set(taskId, updated)
+
+      console.error(`Scheduled task ${taskId} failed (errors: ${newErrors}). Next retry: ${new Date(nextRunAt).toISOString()}`)
+    }
+  } finally {
+    runningTasks.delete(task.taskId)
+  }
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+export function scheduleTask(
+  taskId: string,
+  userId: string,
+  prompt: string,
+  cronExpr: string,
+  lastRunAt?: number,
+  consecutiveErrors = 0
+): void {
+  const nextRunAt = computeNextRun(taskId, cronExpr, lastRunAt)
+
+  scheduledTasks.set(taskId, {
+    taskId,
+    userId,
+    prompt,
+    cronExpr,
+    lastRunAt,
+    consecutiveErrors,
+    nextRunAt
+  })
+
+  console.log(`📅 Scheduled task ${taskId} — next run: ${new Date(nextRunAt).toISOString()}`)
+  armTimer()
+}
+
+export function cancelTask(taskId: string): void {
+  if (scheduledTasks.has(taskId)) {
+    scheduledTasks.delete(taskId)
+    console.log(`🗑 Cancelled scheduled task ${taskId}`)
+    armTimer()
+  }
+}
+
+export function getScheduledTask(taskId: string): ScheduledTask | undefined {
+  return scheduledTasks.get(taskId)
+}
+
+export function getAllScheduledTasks(): ScheduledTask[] {
+  return Array.from(scheduledTasks.values())
+}
+
+// ─── Startup — load all recurring tasks from Supabase ─────────────────────────
+
+export async function loadScheduledTasks(
+  runTaskFn: (taskId: string, prompt: string, userId: string) => Promise<void>
+): Promise<void> {
+  setRunTaskFn(runTaskFn)
+
+  // Clear stale running_at markers from crashed previous process
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
+  await supabase
+    .from('tasks')
+    .update({ running_at: null, status: 'idle' })
+    .lt('running_at', twoHoursAgo)
+    .not('running_at', 'is', null)
+
+  // Load all recurring tasks
+  const { data: tasks, error } = await supabase
+    .from('tasks')
+    .select('id, user_id, prompt, schedule, last_run, consecutive_errors, status')
+    .eq('is_recurring', true)
+    .not('schedule', 'is', null)
+
+  if (error) {
+    console.error('loadScheduledTasks error:', error)
+    return
+  }
+
+  if (!tasks?.length) {
+    console.log('📅 No recurring tasks to load')
+    return
+  }
+
+  for (const task of tasks) {
+    scheduleTask(
+      task.id,
+      task.user_id,
+      task.prompt,
+      task.schedule,
+      task.last_run ? new Date(task.last_run).getTime() : undefined,
+      task.consecutive_errors || 0
+    )
+  }
+
+  console.log(`📅 Loaded ${tasks.length} recurring tasks`)
+  armTimer()
+}

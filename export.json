@@ -1,0 +1,20 @@
+{
+  "files": [
+    {
+      "path": "src/routes/oauth.ts",
+      "description": "Custom OAuth connect/callback/disconnect/token refresh"
+    },
+    {
+      "path": "src/lib/agent.ts",
+      "description": "Cloud Playwright agent (how it currently runs tasks)"
+    },
+    {
+      "path": "src/lib/agent-extension.ts",
+      "description": "CDP agent (real Chrome via extension)"
+    },
+    {
+      "path": "src/lib/scheduler.ts",
+      "description": "Smart scheduler with parseSchedule"
+    }
+  ]
+}

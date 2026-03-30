@@ -1,13 +1,19 @@
 import OpenAI from 'openai'
 import { sendCdpCommand, sendExtensionMessage } from '../index.js'
+import { isProviderConnected } from './api-caller.js'
+import * as gmail from './integrations/gmail.js'
+import * as notion from './integrations/notion.js'
+import * as slack from './integrations/slack.js'
+import * as github from './integrations/github.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-const SYSTEM_PROMPT = `You are an expert browser automation agent controlling a real Chrome browser.
+const SYSTEM_PROMPT = `You are an expert browser automation agent controlling a real Chrome browser and integrations.
 Rules:
 - Always navigate first then snapshot to see the page
 - Use refs from snapshot to interact with elements
 - The user is already logged into their accounts — do not try to log in
+- For Gmail/Slack/Notion/GitHub tasks, use the API tools instead of browser automation
 - Complete tasks in minimum steps
 - Call done when you have the result`
 
@@ -102,6 +108,174 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
           ms: { type: 'number' }
         },
         required: ['ms']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gmail_list',
+      description: 'List recent emails from Gmail',
+      parameters: {
+        type: 'object',
+        properties: {
+          maxResults: { type: 'number' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gmail_send',
+      description: 'Send an email via Gmail',
+      parameters: {
+        type: 'object',
+        properties: {
+          to: { type: 'string' },
+          subject: { type: 'string' },
+          body: { type: 'string' }
+        },
+        required: ['to', 'subject', 'body']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gmail_read',
+      description: 'Get content of a specific email',
+      parameters: {
+        type: 'object',
+        properties: {
+          messageId: { type: 'string' }
+        },
+        required: ['messageId']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gmail_summarize',
+      description: 'Get a summary of recent emails',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_create_page',
+      description: 'Create a new page in Notion',
+      parameters: {
+        type: 'object',
+        properties: {
+          parentId: { type: 'string' },
+          title: { type: 'string' },
+          content: { type: 'string' }
+        },
+        required: ['parentId', 'title', 'content']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_list_databases',
+      description: 'List Notion databases',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_query_database',
+      description: 'Query a Notion database',
+      parameters: {
+        type: 'object',
+        properties: {
+          databaseId: { type: 'string' }
+        },
+        required: ['databaseId']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'slack_send',
+      description: 'Send a message to a Slack channel',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel: { type: 'string' },
+          text: { type: 'string' }
+        },
+        required: ['channel', 'text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'slack_list_channels',
+      description: 'List Slack channels',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'slack_read_messages',
+      description: 'Read recent messages from a Slack channel',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel: { type: 'string' },
+          limit: { type: 'number' }
+        },
+        required: ['channel']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_create_issue',
+      description: 'Create a GitHub issue',
+      parameters: {
+        type: 'object',
+        properties: {
+          owner: { type: 'string' },
+          repo: { type: 'string' },
+          title: { type: 'string' },
+          body: { type: 'string' }
+        },
+        required: ['owner', 'repo', 'title', 'body']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_list_repos',
+      description: 'List GitHub repositories',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_list_issues',
+      description: 'List GitHub issues in a repository',
+      parameters: {
+        type: 'object',
+        properties: {
+          owner: { type: 'string' },
+          repo: { type: 'string' },
+          state: { type: 'string' }
+        },
+        required: ['owner', 'repo']
       }
     }
   },
@@ -222,6 +396,135 @@ async function executeTool(
       await new Promise(r => setTimeout(r, ms))
       return `Waited ${ms}ms`
     }
+    case 'gmail_list': {
+      const connected = await isProviderConnected(userId, 'gmail')
+      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
+      try {
+        const result = await gmail.listEmails(userId, { maxResults: args.maxResults || 10 })
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Gmail error: ${String(err)}`
+      }
+    }
+    case 'gmail_send': {
+      const connected = await isProviderConnected(userId, 'gmail')
+      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
+      try {
+        await gmail.sendEmail(userId, args.to, args.subject, args.body)
+        return `Email sent to ${args.to}`
+      } catch (err) {
+        return `Gmail error: ${String(err)}`
+      }
+    }
+    case 'gmail_read': {
+      const connected = await isProviderConnected(userId, 'gmail')
+      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
+      try {
+        const content = await gmail.getEmailContent(userId, args.messageId)
+        return content.slice(0, 2000)
+      } catch (err) {
+        return `Gmail error: ${String(err)}`
+      }
+    }
+    case 'gmail_summarize': {
+      const connected = await isProviderConnected(userId, 'gmail')
+      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
+      try {
+        return await gmail.summarizeEmails(userId)
+      } catch (err) {
+        return `Gmail error: ${String(err)}`
+      }
+    }
+    case 'notion_create_page': {
+      const connected = await isProviderConnected(userId, 'notion')
+      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
+      try {
+        await notion.createPage(userId, args.parentId, args.title, args.content)
+        return `Created Notion page: ${args.title}`
+      } catch (err) {
+        return `Notion error: ${String(err)}`
+      }
+    }
+    case 'notion_list_databases': {
+      const connected = await isProviderConnected(userId, 'notion')
+      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
+      try {
+        const result = await notion.listDatabases(userId)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Notion error: ${String(err)}`
+      }
+    }
+    case 'notion_query_database': {
+      const connected = await isProviderConnected(userId, 'notion')
+      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
+      try {
+        const result = await notion.queryDatabase(userId, args.databaseId)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Notion error: ${String(err)}`
+      }
+    }
+    case 'slack_send': {
+      const connected = await isProviderConnected(userId, 'slack')
+      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
+      try {
+        await slack.sendMessage(userId, args.channel, args.text)
+        return `Sent message to ${args.channel}`
+      } catch (err) {
+        return `Slack error: ${String(err)}`
+      }
+    }
+    case 'slack_list_channels': {
+      const connected = await isProviderConnected(userId, 'slack')
+      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
+      try {
+        const result = await slack.listChannels(userId)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Slack error: ${String(err)}`
+      }
+    }
+    case 'slack_read_messages': {
+      const connected = await isProviderConnected(userId, 'slack')
+      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
+      try {
+        const result = await slack.getMessages(userId, args.channel, args.limit || 10)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Slack error: ${String(err)}`
+      }
+    }
+    case 'github_create_issue': {
+      const connected = await isProviderConnected(userId, 'github')
+      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
+      try {
+        const result = await github.createIssue(userId, args.owner, args.repo, args.title, args.body)
+        return `Created GitHub issue: ${args.title}`
+      } catch (err) {
+        return `GitHub error: ${String(err)}`
+      }
+    }
+    case 'github_list_repos': {
+      const connected = await isProviderConnected(userId, 'github')
+      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
+      try {
+        const result = await github.listRepos(userId)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `GitHub error: ${String(err)}`
+      }
+    }
+    case 'github_list_issues': {
+      const connected = await isProviderConnected(userId, 'github')
+      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
+      try {
+        const result = await github.listIssues(userId, args.owner, args.repo, args.state || 'open')
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `GitHub error: ${String(err)}`
+      }
+    }
     case 'done': {
       return `DONE:${args.result}`
     }
@@ -239,7 +542,6 @@ export async function runAgentWithExtension(
   const tabId = await initializeTab(userId)
 
   try {
-    // existing agent loop code stays exactly the same
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: task }
@@ -248,7 +550,11 @@ export async function runAgentWithExtension(
     const emojis: Record<string, string> = {
       navigate: '🌐', snapshot: '👁️', click: '👆',
       type: '⌨️', extract: '🔍', scroll: '⬇️',
-      wait: '⏳', done: '✅'
+      wait: '⏳', done: '✅',
+      gmail_list: '📧', gmail_send: '✉️', gmail_read: '📬', gmail_summarize: '📨',
+      notion_create_page: '📝', notion_list_databases: '🗄️', notion_query_database: '🔎',
+      slack_send: '💬', slack_list_channels: '📡', slack_read_messages: '💭',
+      github_create_issue: '🐛', github_list_repos: '📦', github_list_issues: '📋'
     }
 
     for (let i = 0; i < 25; i++) {
@@ -269,7 +575,6 @@ export async function runAgentWithExtension(
         messages.push(choice.message)
 
         for (const toolCall of choice.message.tool_calls) {
-          // Handle both function and custom tool call types
           if (toolCall.type !== 'function') continue
           const toolName = toolCall.function.name
           const args = JSON.parse(toolCall.function.arguments)
@@ -300,7 +605,6 @@ export async function runAgentWithExtension(
     }
     return 'Max iterations reached'
   } finally {
-    // Close the tab when done regardless of success or error
     if (tabId) {
       try {
         await sendExtensionMessage(userId, 'closeTab', { tabId }, 5000)
