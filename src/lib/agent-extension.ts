@@ -79,8 +79,35 @@ function formatAriaSnapshot(nodes: RawAXNode[], limit: number): AriaSnapshotNode
 }
 
 const snapshotRefs = new Map<number, AriaSnapshotNode[]>()
+const tabUrls = new Map<number, string>()
 
-const PLANNER_SYSTEM_PROMPT = `You are a browser automation planner. Given a task, write a numbered list of concrete browser actions to complete it. Each step should be one specific action: navigate, click, type, scroll, wait, verify. Be specific about what to look for. Return ONLY the numbered list, nothing else.`
+async function waitForPageStable(userId: string, tabId: number, timeoutMs = 5000): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  let lastUrl = ''
+  let stableCount = 0
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 300))
+    const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+      expression: 'JSON.stringify({ url: window.location.href, ready: document.readyState })',
+      returnByValue: true
+    }, tabId)
+    const parsed = JSON.parse(result?.result?.value ?? '{}')
+    const url: string = parsed.url || ''
+    const ready: string = parsed.ready || ''
+    if (url === lastUrl && ready === 'complete') {
+      stableCount++
+      if (stableCount >= 2) return url
+    } else {
+      stableCount = 0
+      lastUrl = url
+    }
+  }
+  return lastUrl
+}
+
+const PLANNER_SYSTEM_PROMPT = `You are a browser automation planner. Given a task and the current page state, write a numbered list of concrete browser actions to complete it. Each step should be one specific action: navigate, click, type, scroll, wait, verify. Be specific about what to look for. Return ONLY the numbered list, nothing else.
+
+Before writing the plan, you will receive the actual current state of the page. Base your plan ONLY on what is visible in the snapshot. If the user appears to already be logged in or the page is not what you expected, skip those steps.`
 
 const EXECUTOR_SYSTEM_PROMPT = `You are Felo, an AI browser agent. You execute tasks in real Chrome tabs on behalf of the user.
 
@@ -122,6 +149,7 @@ async function snapshotPage(userId: string, tabId: number): Promise<string> {
     returnByValue: true
   }, tabId)
   const url = urlResult?.result?.value || 'unknown'
+  tabUrls.set(tabId, url)
   const lines = nodes.map((n) => {
     let line = `[${n.ref}] ${n.role} "${n.name}"`
     if (n.value) line += ` value:"${n.value}"`
@@ -132,12 +160,15 @@ async function snapshotPage(userId: string, tabId: number): Promise<string> {
   return `URL: ${url}\n\nPage elements (use these refs to interact):\n${lines.join('\n')}`
 }
 
-async function decomposePlan(task: string): Promise<string[]> {
+async function decomposePlan(task: string, pageSnapshot?: string): Promise<string[]> {
+  const userContent = pageSnapshot
+    ? `Task: ${task}\n\nCurrent page state:\n${pageSnapshot}`
+    : task
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       { role: 'system', content: PLANNER_SYSTEM_PROMPT },
-      { role: 'user', content: task }
+      { role: 'user', content: userContent }
     ],
     max_tokens: 500
   })
@@ -146,6 +177,11 @@ async function decomposePlan(task: string): Promise<string[]> {
     .split('\n')
     .map(l => l.replace(/^\d+[\.\)\s]+/, '').trim())
     .filter(l => l.length > 0)
+}
+
+function extractUrl(task: string): string | null {
+  const match = task.match(/https?:\/\/[^\s]+/)
+  return match ? match[0] : null
 }
 
 function filterInteractiveSnapshot(snapshot: string): string {
@@ -274,9 +310,11 @@ async function executeStepAction(
   switch (action.action) {
     case 'navigate': {
       await sendCdpCommand(userId, 'Page.navigate', { url: action.url }, tabId)
-      await new Promise(r => setTimeout(r, 2000))
+      const finalUrl = await waitForPageStable(userId, tabId)
       await snapshotPage(userId, tabId)
-      return `Navigated to ${action.url}`
+      return finalUrl !== action.url
+        ? `Navigated to ${action.url}, redirected to ${finalUrl}`
+        : `Navigated to ${action.url}`
     }
 
     case 'click': {
@@ -780,9 +818,11 @@ async function executeTool(
   switch (name) {
     case 'navigate': {
       await sendCdpCommand(userId, 'Page.navigate', { url: args.url }, tabId)
-      await new Promise(r => setTimeout(r, 2000))
+      const finalUrl = await waitForPageStable(userId, tabId)
       await snapshotPage(userId, tabId)
-      return `Navigated to ${args.url}`
+      return finalUrl !== args.url
+        ? `Navigated to ${args.url}, redirected to ${finalUrl}`
+        : `Navigated to ${args.url}`
     }
     case 'snapshot': {
       return await snapshotPage(userId, tabId)
@@ -1073,19 +1113,30 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('📋 Planning steps...')
-    planSteps = await decomposePlan(task)
-    let currentStep = 0
-
-    for (let i = 0; i < planSteps.length; i++) {
-      await onStep(`  ${i + 1}. ${planSteps[i]}`)
-    }
-
     await onStep('🔌 Opening browser tab...')
     const tabId = await initializeTab(userId)
     if (!tabId) throw new Error('Failed to open browser tab')
 
     try {
+      const url = extractUrl(task)
+      if (url) {
+        await onStep(`🌐 Navigating to ${url}...`)
+        await sendCdpCommand(userId, 'Page.navigate', { url }, tabId)
+        await waitForPageStable(userId, tabId)
+      }
+
+      await onStep('📸 Taking initial snapshot...')
+      const initialSnapshot = await snapshotPage(userId, tabId)
+      let lastKnownUrl = tabUrls.get(tabId) || ''
+
+      await onStep('📋 Planning steps based on page state...')
+      planSteps = await decomposePlan(task, initialSnapshot)
+      let currentStep = 0
+
+      for (let i = 0; i < planSteps.length; i++) {
+        await onStep(`  ${i + 1}. ${planSteps[i]}`)
+      }
+
       while (currentStep < planSteps.length) {
         const stepDesc = planSteps[currentStep]
         await onStep(`📋 Step ${currentStep + 1}/${planSteps.length}: ${stepDesc}`)
@@ -1096,6 +1147,23 @@ export async function runAgentWithExtension(
         while (retries <= 2 && !stepSucceeded) {
           try {
             const snapshot = await snapshotPage(userId, tabId)
+            const currentUrl = tabUrls.get(tabId) || ''
+
+            if (currentUrl !== lastKnownUrl && currentStep > 0) {
+              await onStep(`🔄 URL changed: ${lastKnownUrl} → ${currentUrl}, re-planning...`)
+              const remaining = planSteps.slice(currentStep)
+              planSteps = await decomposePlan(
+                `${task}\n\nNote: URL changed to ${currentUrl}. Remaining steps were: ${remaining.join(', ')}`,
+                snapshot
+              )
+              currentStep = 0
+              lastKnownUrl = currentUrl
+              for (let i = 0; i < planSteps.length; i++) {
+                await onStep(`  ${i + 1}. ${planSteps[i]}`)
+              }
+              break
+            }
+
             const action = await planStep(stepDesc, snapshot, userId, tabId, planSteps, currentStep + 1, planSteps.length)
 
             if (action.action === 'done' || action.action === 'failed') {
@@ -1117,6 +1185,12 @@ export async function runAgentWithExtension(
 
             if (result.startsWith('Error:')) {
               throw new Error(result)
+            }
+
+            const postUrl = tabUrls.get(tabId) || ''
+            if (postUrl !== lastKnownUrl) {
+              await onStep(`  ↗️ Redirected: ${lastKnownUrl} → ${postUrl}`)
+              lastKnownUrl = postUrl
             }
 
             stepsLog.push({
