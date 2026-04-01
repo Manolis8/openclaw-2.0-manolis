@@ -12,6 +12,18 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
 const runningTasks = new Set<string>()
 
+type RoleRef = { role: string; name?: string; nth?: number }
+type RoleRefMap = Record<string, RoleRef>
+
+const INTERACTIVE_ROLES = new Set([
+  'button','link','textbox','checkbox','radio','combobox','listbox',
+  'menuitem','menuitemcheckbox','menuitemradio','option','searchbox',
+  'slider','spinbutton','switch','tab','treeitem'
+])
+
+const tabRoleRefs = new Map<number, { refs: RoleRefMap; lastUrl: string }>()
+const currentSnapshotNodes = new Map<number, AriaSnapshotNode[]>()
+
 type StepLog = {
   step: number
   description: string
@@ -76,6 +88,40 @@ function formatAriaSnapshot(nodes: RawAXNode[], limit: number): AriaSnapshotNode
     }
   }
   return out
+}
+
+function buildRoleRefsFromNodes(nodes: AriaSnapshotNode[]): { snapshot: string; refs: RoleRefMap } {
+  const refs: RoleRefMap = {}
+  const counts = new Map<string, number>()
+  const refsByKey = new Map<string, string[]>()
+  const lines: string[] = []
+
+  const getKey = (role: string, name?: string) => `${role}:${name ?? ''}`
+
+  for (const node of nodes) {
+    if (!INTERACTIVE_ROLES.has(node.role)) continue
+
+    const key = getKey(node.role, node.name)
+    const nth = counts.get(key) ?? 0
+    counts.set(key, nth + 1)
+
+    const existing = refsByKey.get(key) ?? []
+    existing.push(node.ref)
+    refsByKey.set(key, existing)
+
+    refs[node.ref] = { role: node.role, name: node.name || undefined, nth }
+    lines.push(`[${node.ref}] ${node.role}${node.name ? ` "${node.name}"` : ''}${nth > 0 ? ` (${nth})` : ''}`)
+  }
+
+  for (const [ref, data] of Object.entries(refs)) {
+    const key = getKey(data.role, data.name)
+    const list = refsByKey.get(key) ?? []
+    if (list.length <= 1) {
+      delete refs[ref].nth
+    }
+  }
+
+  return { snapshot: lines.join('\n') || '(no interactive elements)', refs }
 }
 
 const snapshotRefs = new Map<number, AriaSnapshotNode[]>()
@@ -144,20 +190,19 @@ async function snapshotPage(userId: string, tabId: number): Promise<string> {
   const rawNodes: RawAXNode[] = axTree?.nodes ?? []
   const nodes = formatAriaSnapshot(rawNodes, 500)
   snapshotRefs.set(tabId, nodes)
+  currentSnapshotNodes.set(tabId, nodes)
+
   const urlResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
     expression: 'window.location.href',
     returnByValue: true
   }, tabId)
   const url = urlResult?.result?.value || 'unknown'
   tabUrls.set(tabId, url)
-  const lines = nodes.map((n) => {
-    let line = `[${n.ref}] ${n.role} "${n.name}"`
-    if (n.value) line += ` value:"${n.value}"`
-    if (n.description) line += ` description:"${n.description}"`
-    line += ` (depth:${n.depth})`
-    return line
-  })
-  return `URL: ${url}\n\nPage elements (use these refs to interact):\n${lines.join('\n')}`
+
+  const built = buildRoleRefsFromNodes(nodes)
+  tabRoleRefs.set(tabId, { refs: built.refs, lastUrl: url })
+
+  return `URL: ${url}\n\nPage elements (use these refs to interact):\n${built.snapshot}`
 }
 
 async function decomposePlan(task: string, pageSnapshot?: string): Promise<string[]> {
@@ -231,73 +276,115 @@ function resolveRefToSelector(ref: string, tabSnapshots: AriaSnapshotNode[] | un
   return null
 }
 
-async function resolveElementBox(
+async function resolveRefToCoordinates(
   userId: string,
   tabId: number,
-  node: AriaSnapshotNode
-): Promise<{ x: number; y: number } | null> {
-  if (node.backendDOMNodeId == null) return null
-  try {
-    await sendCdpCommand(userId, 'DOM.enable', {}, tabId)
-    const resolved = await sendCdpCommand(userId, 'DOM.resolveNode', {
-      backendNodeId: node.backendDOMNodeId
-    }, tabId)
-    const domNodeId = resolved?.node?.nodeId
-    if (!domNodeId) return null
-    const box = await sendCdpCommand(userId, 'DOM.getBoxModel', {
-      nodeId: domNodeId
-    }, tabId)
-    if (box?.model?.content) {
-      const c = box.model.content
-      return { x: (c[0] + c[2] + c[4] + c[6]) / 4, y: (c[1] + c[3] + c[5] + c[7]) / 4 }
-    }
-  } catch { /* fall through */ }
-  try {
-    const rect = await sendCdpCommand(userId, 'Runtime.evaluate', {
-      expression: `(() => {
-        const nodes = document.querySelectorAll('*');
-        for (const el of nodes) {
-          const r = el.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) {
-            const label = el.getAttribute('aria-label') || el.textContent?.trim() || '';
-            if (label === ${JSON.stringify(node.name)}) return { x: r.x + r.width/2, y: r.y + r.height/2 };
-          }
+  ref: string
+): Promise<{ x: number; y: number; backendDOMNodeId?: number }> {
+  const stored = tabRoleRefs.get(tabId)
+  if (!stored) throw new Error(`No snapshot for tab ${tabId}. Take a snapshot first.`)
+
+  const info = stored.refs[ref]
+  if (!info) throw new Error(`Unknown ref "${ref}". Run a new snapshot — refs may be stale.`)
+
+  const axNode = currentSnapshotNodes.get(tabId)?.find(n => n.ref === ref)
+  if (axNode?.backendDOMNodeId) {
+    try {
+      await sendCdpCommand(userId, 'DOM.enable', {}, tabId)
+      const resolved = await sendCdpCommand(userId, 'DOM.resolveNode', {
+        backendNodeId: axNode.backendDOMNodeId
+      }, tabId)
+      const domNodeId = resolved?.node?.nodeId
+      if (domNodeId) {
+        const result = await sendCdpCommand(userId, 'DOM.getBoxModel', {
+          nodeId: domNodeId
+        }, tabId)
+        const quad = result?.model?.border
+        if (quad && quad.length >= 8) {
+          const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
+          const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
+          return { x, y, backendDOMNodeId: axNode.backendDOMNodeId }
         }
-        return null;
-      })()`,
-      returnByValue: true
-    }, tabId)
-    if (rect?.result?.value) return rect.result.value
-  } catch { /* fall through */ }
-  return null
+      }
+    } catch { /* fall through */ }
+  }
+
+  const { role, name, nth = 0 } = info
+  const expr = `
+    (() => {
+      function matchesRole(el, role) {
+        const explicit = el.getAttribute('role');
+        if (explicit) return explicit === role;
+        const tag = el.tagName.toLowerCase();
+        if (role === 'button') return tag === 'button' || (tag === 'input' && el.type === 'button');
+        if (role === 'link') return tag === 'a';
+        if (role === 'textbox') return (tag === 'input' && !['button','checkbox','radio','submit'].includes(el.type)) || tag === 'textarea';
+        if (role === 'checkbox') return tag === 'input' && el.type === 'checkbox';
+        if (role === 'combobox') return tag === 'select' || (tag === 'input' && el.getAttribute('list'));
+        if (role === 'searchbox') return tag === 'input' && el.type === 'search';
+        return false;
+      }
+      function getAccessibleName(el) {
+        return (el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') && document.getElementById(el.getAttribute('aria-labelledby'))?.textContent || el.getAttribute('placeholder') || el.textContent || el.value || el.title || '').trim();
+      }
+      const role = ${JSON.stringify(role)};
+      const name = ${JSON.stringify(name ?? '')};
+      const nth = ${JSON.stringify(nth)};
+      const all = Array.from(document.querySelectorAll('*')).filter(el => {
+        if (!matchesRole(el, role)) return false;
+        if (!name) return true;
+        const n = getAccessibleName(el);
+        return n === name || n.includes(name);
+      });
+      const el = all[nth];
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return null;
+      return { x: r.left + r.width/2, y: r.top + r.height/2, visible: r.top < window.innerHeight && r.bottom > 0 };
+    })()
+  `
+
+  const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: expr, returnByValue: true
+  }, tabId)
+  const pos = result?.result?.value
+  if (!pos) throw new Error(`could not locate element ${ref} (${role} "${name ?? ''}")`)
+  return { x: pos.x, y: pos.y }
 }
 
-type RefActionFn = (box: { x: number; y: number }) => Promise<void>
+async function clickElement(userId: string, tabId: number, ref: string): Promise<void> {
+  const { x, y } = await resolveRefToCoordinates(userId, tabId, ref)
+  await sendCdpCommand(userId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tabId)
+  await new Promise(r => setTimeout(r, 80))
+  await sendCdpCommand(userId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tabId)
+  await new Promise(r => setTimeout(r, 400))
+}
 
-async function doWithRefRetry(
-  userId: string,
-  tabId: number,
-  ref: string,
-  action: RefActionFn,
-  reSnapshot: () => Promise<void>
-): Promise<string> {
-  let node = snapshotRefs.get(tabId)?.find(n => n.ref === ref)
-  if (!node) {
-    await reSnapshot()
-    node = snapshotRefs.get(tabId)?.find(n => n.ref === ref)
+async function typeInElement(userId: string, tabId: number, ref: string, text: string): Promise<void> {
+  const { x, y, backendDOMNodeId } = await resolveRefToCoordinates(userId, tabId, ref)
+  if (backendDOMNodeId) {
+    await sendCdpCommand(userId, 'DOM.focus', { backendNodeId: backendDOMNodeId }, tabId).catch(() => {})
+  } else {
+    await sendCdpCommand(userId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tabId)
+    await new Promise(r => setTimeout(r, 50))
+    await sendCdpCommand(userId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tabId)
+    await new Promise(r => setTimeout(r, 100))
   }
-  if (!node) return `Error: ref ${ref} not found`
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, tabId)
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 2 }, tabId)
+  await sendCdpCommand(userId, 'Input.insertText', { text }, tabId)
+}
 
-  let box = await resolveElementBox(userId, tabId, node)
-  if (!box) {
-    await reSnapshot()
-    node = snapshotRefs.get(tabId)?.find(n => n.ref === ref) || node
-    box = await resolveElementBox(userId, tabId, node)
+async function maybeResnapshotAfterAction(userId: string, tabId: number): Promise<void> {
+  const urlResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: 'window.location.href', returnByValue: true
+  }, tabId)
+  const newUrl = urlResult?.result?.value as string
+  const stored = tabRoleRefs.get(tabId)
+  if (stored && newUrl && newUrl !== stored.lastUrl) {
+    await waitForPageStable(userId, tabId, 3000)
+    await snapshotPage(userId, tabId)
   }
-  if (!box) return `Error: could not locate element ${ref} (${node.name})`
-
-  await action(box)
-  return node.name || ref
 }
 
 async function executeStepAction(
@@ -305,8 +392,6 @@ async function executeStepAction(
   userId: string,
   tabId: number
 ): Promise<string> {
-  const reSnapshot = () => snapshotPage(userId, tabId).then(() => {})
-
   switch (action.action) {
     case 'navigate': {
       await sendCdpCommand(userId, 'Page.navigate', { url: action.url }, tabId)
@@ -319,47 +404,18 @@ async function executeStepAction(
 
     case 'click': {
       if (!action.ref) return 'Error: click requires a ref'
-      const result = await doWithRefRetry(userId, tabId, action.ref, async (box) => {
-        await sendCdpCommand(userId, 'DOM.enable', {}, tabId)
-        const node = snapshotRefs.get(tabId)?.find(n => n.ref === action.ref)
-        if (node?.backendDOMNodeId != null) {
-          try {
-            const resolved = await sendCdpCommand(userId, 'DOM.resolveNode', {
-              backendNodeId: node.backendDOMNodeId
-            }, tabId)
-            if (resolved?.node?.nodeId) {
-              await sendCdpCommand(userId, 'DOM.focus', { nodeId: resolved.node.nodeId }, tabId)
-            }
-          } catch { /* proceed without focus */ }
-        }
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1
-        }, tabId)
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x: box.x, y: box.y, button: 'left', clickCount: 1
-        }, tabId)
-      }, reSnapshot)
-      if (result.startsWith('Error:')) return result
-      await new Promise(r => setTimeout(r, 300))
-      await snapshotPage(userId, tabId)
-      return `Clicked ${result}`
+      await clickElement(userId, tabId, action.ref)
+      await maybeResnapshotAfterAction(userId, tabId)
+      const node = snapshotRefs.get(tabId)?.find(n => n.ref === action.ref)
+      return `Clicked ${node?.name || action.ref}`
     }
 
     case 'type': {
       if (!action.ref || !action.text) return 'Error: type requires ref and text'
-      const result = await doWithRefRetry(userId, tabId, action.ref, async (box) => {
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1
-        }, tabId)
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x: box.x, y: box.y, button: 'left', clickCount: 1
-        }, tabId)
-        await sendCdpCommand(userId, 'Input.insertText', { text: action.text }, tabId)
-      }, reSnapshot)
-      if (result.startsWith('Error:')) return result
-      await new Promise(r => setTimeout(r, 300))
+      await typeInElement(userId, tabId, action.ref, action.text)
       await snapshotPage(userId, tabId)
-      return `Typed "${action.text}" into ${result}`
+      const node = snapshotRefs.get(tabId)?.find(n => n.ref === action.ref)
+      return `Typed "${action.text}" into ${node?.name || action.ref}`
     }
 
     case 'scroll': {
@@ -407,15 +463,12 @@ async function executeStepAction(
 
     case 'hover': {
       if (!action.ref) return 'Error: hover requires a ref'
-      const result = await doWithRefRetry(userId, tabId, action.ref, async (box) => {
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x: box.x, y: box.y
-        }, tabId)
-      }, reSnapshot)
-      if (result.startsWith('Error:')) return result
+      const { x, y } = await resolveRefToCoordinates(userId, tabId, action.ref)
+      await sendCdpCommand(userId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, tabId)
       await new Promise(r => setTimeout(r, 200))
       await snapshotPage(userId, tabId)
-      return `Hovered over ${result}`
+      const node = snapshotRefs.get(tabId)?.find(n => n.ref === action.ref)
+      return `Hovered over ${node?.name || action.ref}`
     }
 
     case 'select': {
@@ -829,36 +882,17 @@ async function executeTool(
     }
     case 'click': {
       if (!args.ref) return 'Error: click requires a ref'
-      const reSnapshot = () => snapshotPage(userId, tabId).then(() => {})
-      const result = await doWithRefRetry(userId, tabId, args.ref, async (box) => {
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1
-        }, tabId)
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x: box.x, y: box.y, button: 'left', clickCount: 1
-        }, tabId)
-      }, reSnapshot)
-      if (result.startsWith('Error:')) return result
-      await new Promise(r => setTimeout(r, 300))
-      await snapshotPage(userId, tabId)
-      return `Clicked ${result}`
+      await clickElement(userId, tabId, args.ref)
+      await maybeResnapshotAfterAction(userId, tabId)
+      const node = snapshotRefs.get(tabId)?.find(n => n.ref === args.ref)
+      return `Clicked ${node?.name || args.ref}`
     }
     case 'type': {
       if (!args.ref || !args.text) return 'Error: type requires ref and text'
-      const reSnapshot = () => snapshotPage(userId, tabId).then(() => {})
-      const result = await doWithRefRetry(userId, tabId, args.ref, async (box) => {
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1
-        }, tabId)
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x: box.x, y: box.y, button: 'left', clickCount: 1
-        }, tabId)
-        await sendCdpCommand(userId, 'Input.insertText', { text: args.text }, tabId)
-      }, reSnapshot)
-      if (result.startsWith('Error:')) return result
-      await new Promise(r => setTimeout(r, 300))
+      await typeInElement(userId, tabId, args.ref, args.text)
       await snapshotPage(userId, tabId)
-      return `Typed "${args.text}" into ${result}`
+      const node = snapshotRefs.get(tabId)?.find(n => n.ref === args.ref)
+      return `Typed "${args.text}" into ${node?.name || args.ref}`
     }
     case 'extract': {
       const snapshot = await snapshotPage(userId, tabId)
@@ -916,16 +950,12 @@ async function executeTool(
     }
     case 'hover': {
       if (!args.ref) return 'Error: hover requires a ref'
-      const reSnapshot = () => snapshotPage(userId, tabId).then(() => {})
-      const hoverResult = await doWithRefRetry(userId, tabId, args.ref, async (box) => {
-        await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x: box.x, y: box.y
-        }, tabId)
-      }, reSnapshot)
-      if (hoverResult.startsWith('Error:')) return hoverResult
+      const { x, y } = await resolveRefToCoordinates(userId, tabId, args.ref)
+      await sendCdpCommand(userId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, tabId)
       await new Promise(r => setTimeout(r, 200))
       await snapshotPage(userId, tabId)
-      return `Hovered over ${hoverResult}`
+      const node = snapshotRefs.get(tabId)?.find(n => n.ref === args.ref)
+      return `Hovered over ${node?.name || args.ref}`
     }
     case 'select': {
       if (!args.ref || !args.value) return 'Error: select requires ref and value'
