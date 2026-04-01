@@ -280,7 +280,7 @@ async function resolveRefToCoordinates(
   userId: string,
   tabId: number,
   ref: string
-): Promise<{ x: number; y: number; backendDOMNodeId?: number }> {
+): Promise<{ x: number; y: number; found?: boolean; tag?: string; actualName?: string; backendDOMNodeId?: number }> {
   const stored = tabRoleRefs.get(tabId)
   if (!stored) throw new Error(`No snapshot for tab ${tabId}. Take a snapshot first.`)
 
@@ -301,9 +301,9 @@ async function resolveRefToCoordinates(
         }, tabId)
         const quad = result?.model?.border
         if (quad && quad.length >= 8) {
-          const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
-          const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
-          return { x, y, backendDOMNodeId: axNode.backendDOMNodeId }
+          const x = Math.round((quad[0] + quad[2] + quad[4] + quad[6]) / 4)
+          const y = Math.round((quad[1] + quad[3] + quad[5] + quad[7]) / 4)
+          return { x, y, found: true, backendDOMNodeId: axNode.backendDOMNodeId }
         }
       }
     } catch { /* fall through */ }
@@ -312,35 +312,60 @@ async function resolveRefToCoordinates(
   const { role, name, nth = 0 } = info
   const expr = `
     (() => {
-      function matchesRole(el, role) {
-        const explicit = el.getAttribute('role');
-        if (explicit) return explicit === role;
-        const tag = el.tagName.toLowerCase();
-        if (role === 'button') return tag === 'button' || (tag === 'input' && el.type === 'button');
-        if (role === 'link') return tag === 'a';
-        if (role === 'textbox') return (tag === 'input' && !['button','checkbox','radio','submit'].includes(el.type)) || tag === 'textarea';
-        if (role === 'checkbox') return tag === 'input' && el.type === 'checkbox';
-        if (role === 'combobox') return tag === 'select' || (tag === 'input' && el.getAttribute('list'));
-        if (role === 'searchbox') return tag === 'input' && el.type === 'search';
-        return false;
-      }
-      function getAccessibleName(el) {
-        return (el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') && document.getElementById(el.getAttribute('aria-labelledby'))?.textContent || el.getAttribute('placeholder') || el.textContent || el.value || el.title || '').trim();
-      }
       const role = ${JSON.stringify(role)};
       const name = ${JSON.stringify(name ?? '')};
       const nth = ${JSON.stringify(nth)};
-      const all = Array.from(document.querySelectorAll('*')).filter(el => {
-        if (!matchesRole(el, role)) return false;
+
+      function matchesRole(el) {
+        const explicit = el.getAttribute('role');
+        if (explicit) return explicit === role;
+        const tag = el.tagName.toLowerCase();
+        const typeAttr = el.getAttribute('type') || '';
+        if (role === 'button') return tag === 'button' || (tag === 'input' && ['button','submit'].includes(typeAttr)) || el.getAttribute('role') === 'button';
+        if (role === 'link') return tag === 'a' && el.href;
+        if (role === 'textbox') return (tag === 'input' && !['button','checkbox','radio','submit','file'].includes(typeAttr)) || tag === 'textarea' || el.getAttribute('contenteditable') === 'true' || el.getAttribute('contenteditable') === '';
+        if (role === 'checkbox') return tag === 'input' && typeAttr === 'checkbox';
+        if (role === 'combobox') return tag === 'select';
+        if (role === 'searchbox') return tag === 'input' && typeAttr === 'search';
+        return el.getAttribute('role') === role;
+      }
+
+      function getAccessibleName(el) {
+        const ariaLabel = el.getAttribute('aria-label') || '';
+        if (ariaLabel) return ariaLabel.trim();
+        const ariaLabelledBy = el.getAttribute('aria-labelledby');
+        if (ariaLabelledBy) {
+          const labelEl = document.getElementById(ariaLabelledBy);
+          if (labelEl) return labelEl.textContent?.trim() || '';
+        }
+        const placeholder = el.getAttribute('placeholder') || '';
+        if (placeholder) return placeholder.trim();
+        const text = el.textContent?.trim() || '';
+        if (text) return text;
+        return (el.getAttribute('title') || el.getAttribute('value') || '').trim();
+      }
+
+      const candidates = Array.from(document.querySelectorAll('*')).filter(el => {
+        if (!matchesRole(el)) return false;
         if (!name) return true;
         const n = getAccessibleName(el);
-        return n === name || n.includes(name);
+        return n === name || n.toLowerCase().includes(name.toLowerCase());
       });
-      const el = all[nth];
+
+      const el = candidates[nth] || candidates[0];
       if (!el) return null;
+
       const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) return null;
-      return { x: r.left + r.width/2, y: r.top + r.height/2, visible: r.top < window.innerHeight && r.bottom > 0 };
+      if (r.width === 0 || r.height === 0) return null;
+      if (r.bottom < 0 || r.top > window.innerHeight) return null;
+
+      return {
+        x: Math.round(r.left + r.width / 2),
+        y: Math.round(r.top + r.height / 2),
+        found: true,
+        tag: el.tagName.toLowerCase(),
+        actualName: getAccessibleName(el)
+      };
     })()
   `
 
@@ -348,8 +373,10 @@ async function resolveRefToCoordinates(
     expression: expr, returnByValue: true
   }, tabId)
   const pos = result?.result?.value
-  if (!pos) throw new Error(`could not locate element ${ref} (${role} "${name ?? ''}")`)
-  return { x: pos.x, y: pos.y }
+  if (!pos?.found) {
+    throw new Error(`could not locate element ${ref} (${role} "${name ?? ''}")`)
+  }
+  return pos
 }
 
 async function clickElement(userId: string, tabId: number, ref: string): Promise<void> {
@@ -387,6 +414,44 @@ async function maybeResnapshotAfterAction(userId: string, tabId: number): Promis
   }
 }
 
+async function resolveTabIdAfterNavigate(opts: {
+  userId: string
+  oldTabId: number
+  navigatedUrl: string
+}): Promise<number> {
+  let currentTabId = opts.oldTabId
+  try {
+    await new Promise(r => setTimeout(r, 500))
+    const result = await sendExtensionMessage(opts.userId, 'listTabs', {}, 5000)
+    const tabs: Array<{ id: number; url: string }> = result?.tabs ?? []
+    if (!tabs.length) return currentTabId
+
+    const oldExists = tabs.some(t => t.id === opts.oldTabId)
+    if (!oldExists) {
+      const byUrl = tabs.filter(t => t.url === opts.navigatedUrl || t.url.startsWith(opts.navigatedUrl))
+      const replacement = byUrl.find(t => t.id !== opts.oldTabId) ?? byUrl[0]
+      if (replacement) {
+        currentTabId = replacement.id
+        for (const [map] of [
+          [snapshotRefs],
+          [currentSnapshotNodes],
+          [tabUrls],
+          [tabRoleRefs]
+        ] as const) {
+          const old = (map as Map<number, unknown>).get(opts.oldTabId)
+          if (old !== undefined) {
+            (map as Map<number, unknown>).set(currentTabId, old)
+            ;(map as Map<number, unknown>).delete(opts.oldTabId)
+          }
+        }
+      }
+    }
+  } catch {
+    // best effort — fall back to original tabId
+  }
+  return currentTabId
+}
+
 async function executeStepAction(
   action: StepAction,
   userId: string,
@@ -396,7 +461,11 @@ async function executeStepAction(
     case 'navigate': {
       await sendCdpCommand(userId, 'Page.navigate', { url: action.url }, tabId)
       const finalUrl = await waitForPageStable(userId, tabId)
-      await snapshotPage(userId, tabId)
+      const resolvedTabId = await resolveTabIdAfterNavigate({ userId, oldTabId: tabId, navigatedUrl: finalUrl })
+      if (resolvedTabId !== tabId) {
+        console.log(`↗️ Tab ID updated: ${tabId} → ${resolvedTabId}`)
+      }
+      await snapshotPage(userId, resolvedTabId)
       return finalUrl !== action.url
         ? `Navigated to ${action.url}, redirected to ${finalUrl}`
         : `Navigated to ${action.url}`
@@ -872,7 +941,11 @@ async function executeTool(
     case 'navigate': {
       await sendCdpCommand(userId, 'Page.navigate', { url: args.url }, tabId)
       const finalUrl = await waitForPageStable(userId, tabId)
-      await snapshotPage(userId, tabId)
+      const resolvedTabId = await resolveTabIdAfterNavigate({ userId, oldTabId: tabId, navigatedUrl: finalUrl })
+      if (resolvedTabId !== tabId) {
+        console.log(`↗️ Tab ID updated: ${tabId} → ${resolvedTabId}`)
+      }
+      await snapshotPage(userId, resolvedTabId)
       return finalUrl !== args.url
         ? `Navigated to ${args.url}, redirected to ${finalUrl}`
         : `Navigated to ${args.url}`
@@ -1148,16 +1221,22 @@ export async function runAgentWithExtension(
     if (!tabId) throw new Error('Failed to open browser tab')
 
     try {
+      let activeTabId = tabId
       const url = extractUrl(task)
       if (url) {
         await onStep(`🌐 Navigating to ${url}...`)
-        await sendCdpCommand(userId, 'Page.navigate', { url }, tabId)
-        await waitForPageStable(userId, tabId)
+        await sendCdpCommand(userId, 'Page.navigate', { url }, activeTabId)
+        const finalUrl = await waitForPageStable(userId, activeTabId)
+        const resolvedTabId = await resolveTabIdAfterNavigate({ userId, oldTabId: activeTabId, navigatedUrl: finalUrl })
+        if (resolvedTabId !== activeTabId) {
+          await onStep(`  ↗️ Tab ID updated: ${activeTabId} → ${resolvedTabId}`)
+          activeTabId = resolvedTabId
+        }
       }
 
       await onStep('📸 Taking initial snapshot...')
-      const initialSnapshot = await snapshotPage(userId, tabId)
-      let lastKnownUrl = tabUrls.get(tabId) || ''
+      const initialSnapshot = await snapshotPage(userId, activeTabId)
+      let lastKnownUrl = tabUrls.get(activeTabId) || ''
 
       await onStep('📋 Planning steps based on page state...')
       planSteps = await decomposePlan(task, initialSnapshot)
@@ -1176,8 +1255,8 @@ export async function runAgentWithExtension(
 
         while (retries <= 2 && !stepSucceeded) {
           try {
-            const snapshot = await snapshotPage(userId, tabId)
-            const currentUrl = tabUrls.get(tabId) || ''
+            const snapshot = await snapshotPage(userId, activeTabId)
+            const currentUrl = tabUrls.get(activeTabId) || ''
 
             if (currentUrl !== lastKnownUrl && currentStep > 0) {
               await onStep(`🔄 URL changed: ${lastKnownUrl} → ${currentUrl}, re-planning...`)
@@ -1194,7 +1273,7 @@ export async function runAgentWithExtension(
               break
             }
 
-            const action = await planStep(stepDesc, snapshot, userId, tabId, planSteps, currentStep + 1, planSteps.length)
+            const action = await planStep(stepDesc, snapshot, userId, activeTabId, planSteps, currentStep + 1, planSteps.length)
 
             if (action.action === 'done' || action.action === 'failed') {
               resultSummary = action.summary || (action.action === 'done' ? 'Task completed' : 'Task failed')
@@ -1211,13 +1290,13 @@ export async function runAgentWithExtension(
               break
             }
 
-            const result = await executeStepAction(action, userId, tabId)
+            const result = await executeStepAction(action, userId, activeTabId)
 
             if (result.startsWith('Error:')) {
               throw new Error(result)
             }
 
-            const postUrl = tabUrls.get(tabId) || ''
+            const postUrl = tabUrls.get(activeTabId) || ''
             if (postUrl !== lastKnownUrl) {
               await onStep(`  ↗️ Redirected: ${lastKnownUrl} → ${postUrl}`)
               lastKnownUrl = postUrl
