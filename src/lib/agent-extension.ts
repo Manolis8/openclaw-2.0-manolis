@@ -151,9 +151,16 @@ async function waitForPageStable(userId: string, tabId: number, timeoutMs = 5000
   return lastUrl
 }
 
-const PLANNER_SYSTEM_PROMPT = `You are a browser automation planner. Given a task and the current page state, write a numbered list of concrete browser actions to complete it. Each step should be one specific action: navigate, click, type, scroll, wait, verify. Be specific about what to look for. Return ONLY the numbered list, nothing else.
+const PLANNER_SYSTEM_PROMPT = `You are a browser automation planner. Your job is to write a plan based ONLY on what you can see RIGHT NOW on the page.
 
-Before writing the plan, you will receive the actual current state of the page. Base your plan ONLY on what is visible in the snapshot. If the user appears to already be logged in or the page is not what you expected, skip those steps.`
+RULES — you must follow all of these:
+1. Look at the Current URL first. If it contains "home", "feed", "dashboard" or any path that is NOT a login page, the user is already logged in. Never include login steps.
+2. Look at the snapshot elements. If you see a compose box, tweet button, or home feed elements, the user is already logged in and on the app. Start your plan from there.
+3. Never assume the user needs to log in. Never write steps for logging in unless the snapshot explicitly shows a login form with username/password fields.
+4. Write the minimum steps needed. If the user is already on the right page, start from step 1 as the actual task action.
+5. Each step must reference a specific element visible in the snapshot by its exact label. Never write generic steps like "click the tweet button" — write "click the button labeled 'Post'".
+
+Write numbered steps only. No explanations. No preamble.`
 
 const EXECUTOR_SYSTEM_PROMPT = `You are Felo, an AI browser agent. You execute tasks in real Chrome tabs on behalf of the user.
 
@@ -205,10 +212,18 @@ async function snapshotPage(userId: string, tabId: number): Promise<string> {
   return `URL: ${url}\n\nPage elements (use these refs to interact):\n${built.snapshot}`
 }
 
-async function decomposePlan(task: string, pageSnapshot?: string): Promise<string[]> {
-  const userContent = pageSnapshot
-    ? `Task: ${task}\n\nCurrent page state:\n${pageSnapshot}`
-    : task
+function buildPlannerUserMessage(task: string, currentUrl: string, snapshot: string): string {
+  return `Current URL: ${currentUrl}
+Current page elements:
+${snapshot}
+
+Task: ${task}
+
+Write numbered steps only. No explanations. No preamble.`
+}
+
+async function decomposePlan(task: string, currentUrl: string, pageSnapshot: string): Promise<string[]> {
+  const userContent = buildPlannerUserMessage(task, currentUrl, pageSnapshot)
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
@@ -217,11 +232,36 @@ async function decomposePlan(task: string, pageSnapshot?: string): Promise<strin
     ],
     max_tokens: 500
   })
-  const text = response.choices[0].message.content || ''
-  return text
+  let text = response.choices[0].message.content || ''
+  let steps = text
     .split('\n')
     .map(l => l.replace(/^\d+[\.\)\s]+/, '').trim())
     .filter(l => l.length > 0)
+
+  const isLoginPage = /login|signin|sign.in/.test(currentUrl.toLowerCase())
+  const hasLoginKeywords = steps.some(s => /login|username|password|log.in|sign.in/i.test(s))
+  if (!isLoginPage && hasLoginKeywords && /home|feed|dashboard/i.test(currentUrl)) {
+    const warningContent = buildPlannerUserMessage(
+      `${task}\n\nWARNING: You included login steps but the user is clearly already logged in at ${currentUrl}. Rewrite the plan without any login steps, starting directly with the task action.`,
+      currentUrl,
+      pageSnapshot
+    )
+    const retry = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: PLANNER_SYSTEM_PROMPT },
+        { role: 'user', content: warningContent }
+      ],
+      max_tokens: 500
+    })
+    text = retry.choices[0].message.content || ''
+    steps = text
+      .split('\n')
+      .map(l => l.replace(/^\d+[\.\)\s]+/, '').trim())
+      .filter(l => l.length > 0)
+  }
+
+  return steps
 }
 
 function extractUrl(task: string): string | null {
@@ -1239,7 +1279,7 @@ export async function runAgentWithExtension(
       let lastKnownUrl = tabUrls.get(activeTabId) || ''
 
       await onStep('📋 Planning steps based on page state...')
-      planSteps = await decomposePlan(task, initialSnapshot)
+      planSteps = await decomposePlan(task, lastKnownUrl, initialSnapshot)
       let currentStep = 0
 
       for (let i = 0; i < planSteps.length; i++) {
@@ -1263,6 +1303,7 @@ export async function runAgentWithExtension(
               const remaining = planSteps.slice(currentStep)
               planSteps = await decomposePlan(
                 `${task}\n\nNote: URL changed to ${currentUrl}. Remaining steps were: ${remaining.join(', ')}`,
+                currentUrl,
                 snapshot
               )
               currentStep = 0
