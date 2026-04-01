@@ -690,18 +690,14 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
 
 const AGENT_SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control a real Chrome browser tab to complete tasks.
 
-You have browser tools available. Use them to complete the task:
-1. Start with browser_snapshot to see the current page
-2. Based on what you see, decide your next action
-3. After every click or type, call browser_snapshot again to see what changed
-4. Keep acting until the task is done, then call task_complete
+After every action you will automatically receive the current page state. Use it to decide your next action.
 
 Rules:
-- Never assume what's on the page — always snapshot first
-- Use exact refs from the most recent snapshot (refs change after navigation)
-- If you see a login form but the task doesn't require login, the user may already be logged in on another tab — navigate directly to the relevant page
-- If an action fails, snapshot again to see the current state and try a different approach
-- When the task is done, call task_complete with a one-sentence summary`
+- Use the page state after each action to verify it worked — look for the UI changing, a form closing, a success indicator, or the item appearing
+- If an action did not work (page looks the same, element still there, nothing changed), try a different approach — do not repeat the same action more than twice
+- Only call task_complete when the page state CONFIRMS success. Examples of confirmation: composer closed after posting, form disappeared after submitting, item now visible in a list
+- If after 3 attempts you cannot confirm success, call task_failed honestly — do not guess or lie
+- Never call task_complete just because you clicked something — wait for visual confirmation in the page state`
 
 // ─── Agent execution loop ───
 
@@ -847,23 +843,24 @@ async function executeBrowserTool(
   }
 }
 
-async function runAgentLoop(opts: {
+async function runSingleAttempt(opts: {
   userId: string
-  taskPrompt: string
+  messages: OpenAI.Chat.ChatCompletionMessageParam[]
   tabId: number
   onProgress: (msg: string) => void
+  deadline: number
 }): Promise<{ success: boolean; summary: string; tabId: number }> {
-  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: 'system', content: AGENT_SYSTEM_PROMPT },
-    { role: 'user', content: opts.taskPrompt }
-  ]
-
-  const MAX_ITERATIONS = 30
+  const MAX_ITERATIONS = 20
   let iterations = 0
   let activeTabId = opts.tabId
+  const messages = [...opts.messages]
 
   while (iterations < MAX_ITERATIONS) {
     iterations++
+
+    if (Date.now() > opts.deadline) {
+      return { success: false, summary: 'Task timed out after 90 seconds', tabId: activeTabId }
+    }
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -920,6 +917,52 @@ async function runAgentLoop(opts: {
   }
 
   return { success: false, summary: 'Task exceeded maximum iterations', tabId: activeTabId }
+}
+
+async function runAgentLoop(opts: {
+  userId: string
+  taskPrompt: string
+  tabId: number
+  onProgress: (msg: string) => void
+}): Promise<{ success: boolean; summary: string; tabId: number }> {
+  const TOTAL_TIMEOUT_MS = 90_000
+  const deadline = Date.now() + TOTAL_TIMEOUT_MS
+  const MAX_TASK_ATTEMPTS = 2
+  let lastSummary = 'Task did not complete'
+
+  for (let attempt = 0; attempt < MAX_TASK_ATTEMPTS; attempt++) {
+    const userContent = attempt === 0
+      ? opts.taskPrompt
+      : `${opts.taskPrompt}\n\nPrevious attempt failed: ${lastSummary}. Try again with a different approach.`
+
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      { role: 'system', content: AGENT_SYSTEM_PROMPT },
+      { role: 'user', content: userContent }
+    ]
+
+    const result = await runSingleAttempt({
+      userId: opts.userId,
+      messages,
+      tabId: opts.tabId,
+      onProgress: opts.onProgress,
+      deadline
+    })
+
+    if (result.success) {
+      return result
+    }
+
+    lastSummary = result.summary
+    opts.onProgress(`⚠️ Attempt ${attempt + 1} failed: ${lastSummary}. Retrying...`)
+
+    if (Date.now() > deadline) {
+      return { success: false, summary: 'Task timed out after 90 seconds', tabId: opts.tabId }
+    }
+
+    await waitForPageStable(opts.userId, opts.tabId, 1000)
+  }
+
+  return { success: false, summary: lastSummary, tabId: opts.tabId }
 }
 
 // ─── Entry point ───
