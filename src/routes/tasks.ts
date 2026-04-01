@@ -36,7 +36,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       const result = await runAgentWithExtension(prompt, userId, async (step) => {
         console.log(`[${taskId}] ${step}`)
         await appendOutput(taskId, step + '\n')
-      })
+      }, taskId)
       const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
       await supabase.from('tasks').update({
         status: 'done',
@@ -203,4 +203,15 @@ tasksRouter.delete('/scheduled-tasks/:userId', async (req, res) => {
     .eq('is_recurring', true)
 
   res.json({ cancelled: tasks.length })
+})
+
+tasksRouter.get('/executions/:userId', async (req, res) => {
+  const { data, error } = await supabase
+    .from('task_executions')
+    .select('id, task_id, task_prompt, plan, status, result_summary, steps_log, started_at, completed_at, duration_ms, created_at')
+    .eq('user_id', req.params.userId)
+    .order('created_at', { ascending: false })
+    .limit(50)
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data || [])
 })
