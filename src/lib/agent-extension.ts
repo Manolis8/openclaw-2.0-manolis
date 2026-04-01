@@ -151,44 +151,17 @@ async function waitForPageStable(userId: string, tabId: number, timeoutMs = 5000
   return lastUrl
 }
 
-const PLANNER_SYSTEM_PROMPT = `You are a browser automation planner. Your job is to write a plan based ONLY on what you can see RIGHT NOW on the page.
-
-RULES — you must follow all of these:
-1. Look at the Current URL first. If it contains "home", "feed", "dashboard" or any path that is NOT a login page, the user is already logged in. Never include login steps.
-2. Look at the snapshot elements. If you see a compose box, tweet button, or home feed elements, the user is already logged in and on the app. Start your plan from there.
-3. Never assume the user needs to log in. Never write steps for logging in unless the snapshot explicitly shows a login form with username/password fields.
-4. Write the minimum steps needed. If the user is already on the right page, start from step 1 as the actual task action.
-5. Each step must reference a specific element visible in the snapshot by its exact label. Never write generic steps like "click the tweet button" — write "click the button labeled 'Post'".
-
-Write numbered steps only. No explanations. No preamble.`
-
-const EXECUTOR_SYSTEM_PROMPT = `You are Felo, an AI browser agent. You execute tasks in real Chrome tabs on behalf of the user.
-
-Personality:
-- Confident and direct. Never say "I'll try" — say what you're doing.
-- Never say "I can't do that". If something fails, say what failed and what you'll try instead.
-- After completing a task, give ONE sentence summarizing exactly what you did.
-- If you notice something interesting while doing a task, mention it briefly at the end.
-
-You have access to a live browser. You can see the page as an accessibility tree — a list of elements with stable refs like [e1], [e2]. Use these refs to interact with elements.
-
-Each action you take will be re-verified before the next one. If a ref disappears after an action, you will re-snapshot and get new refs automatically.
-
-Return ONLY a JSON object with your next action:
-{ "action": "click"|"type"|"navigate"|"scroll"|"wait"|"pressKey"|"done"|"failed", "ref": "e1", "text": "...", "url": "...", "key": "Enter", "summary": "..." }
-Use "summary" only with "done" or "failed" actions.`
-
-type StepAction = {
-  action: 'click' | 'type' | 'navigate' | 'scroll' | 'wait' | 'pressKey' | 'hover' | 'select' | 'done' | 'failed'
-  ref?: string
-  text?: string
-  url?: string
-  direction?: 'down' | 'up'
-  amount?: number
-  ms?: number
-  key?: string
-  value?: string
-  summary?: string
+async function waitForText(userId: string, tabId: number, text: string, timeoutMs = 5000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+      expression: `document.body.innerText.includes(${JSON.stringify(text)})`,
+      returnByValue: true
+    }, tabId)
+    if (result?.result?.value) return true
+    await new Promise(r => setTimeout(r, 500))
+  }
+  return false
 }
 
 async function snapshotPage(userId: string, tabId: number): Promise<string> {
@@ -210,110 +183,6 @@ async function snapshotPage(userId: string, tabId: number): Promise<string> {
   tabRoleRefs.set(tabId, { refs: built.refs, lastUrl: url })
 
   return `URL: ${url}\n\nPage elements (use these refs to interact):\n${built.snapshot}`
-}
-
-function buildPlannerUserMessage(task: string, currentUrl: string, snapshot: string): string {
-  return `Current URL: ${currentUrl}
-Current page elements:
-${snapshot}
-
-Task: ${task}
-
-Write numbered steps only. No explanations. No preamble.`
-}
-
-async function decomposePlan(task: string, currentUrl: string, pageSnapshot: string): Promise<string[]> {
-  const userContent = buildPlannerUserMessage(task, currentUrl, pageSnapshot)
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: PLANNER_SYSTEM_PROMPT },
-      { role: 'user', content: userContent }
-    ],
-    max_tokens: 500
-  })
-  let text = response.choices[0].message.content || ''
-  let steps = text
-    .split('\n')
-    .map(l => l.replace(/^\d+[\.\)\s]+/, '').trim())
-    .filter(l => l.length > 0)
-
-  const isLoginPage = /login|signin|sign.in/.test(currentUrl.toLowerCase())
-  const hasLoginKeywords = steps.some(s => /login|username|password|log.in|sign.in/i.test(s))
-  if (!isLoginPage && hasLoginKeywords && /home|feed|dashboard/i.test(currentUrl)) {
-    const warningContent = buildPlannerUserMessage(
-      `${task}\n\nWARNING: You included login steps but the user is clearly already logged in at ${currentUrl}. Rewrite the plan without any login steps, starting directly with the task action.`,
-      currentUrl,
-      pageSnapshot
-    )
-    const retry = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: PLANNER_SYSTEM_PROMPT },
-        { role: 'user', content: warningContent }
-      ],
-      max_tokens: 500
-    })
-    text = retry.choices[0].message.content || ''
-    steps = text
-      .split('\n')
-      .map(l => l.replace(/^\d+[\.\)\s]+/, '').trim())
-      .filter(l => l.length > 0)
-  }
-
-  return steps
-}
-
-function extractUrl(task: string): string | null {
-  const match = task.match(/https?:\/\/[^\s]+/)
-  return match ? match[0] : null
-}
-
-function filterInteractiveSnapshot(snapshot: string): string {
-  const lines = snapshot.split('\n')
-  const header = []
-  const interactive: string[] = []
-  for (const line of lines) {
-    if (line.startsWith('URL:')) { header.push(line); continue }
-    if (!line.startsWith('[')) { header.push(line); continue }
-    if (/\b(button|textbox|combobox|link|tab|menuitem|checkbox|radio|slider|switch|searchbox|spinbutton|listbox|option)\b/.test(line)) {
-      interactive.push(line)
-    }
-  }
-  return [...header, ...interactive].join('\n')
-}
-
-async function planStep(
-  stepDesc: string,
-  snapshot: string,
-  userId: string,
-  tabId: number,
-  plan: string[],
-  stepNumber: number,
-  totalSteps: number
-): Promise<StepAction> {
-  const filtered = filterInteractiveSnapshot(snapshot)
-  const planText = plan.map((s, i) => `${i + 1}. ${s}`).join('\n')
-  const userMessage = `Current task plan:\n${planText}\n\nCurrent step: ${stepNumber} of ${totalSteps}\nCurrent step description: ${stepDesc}\n\nCurrent page snapshot:\n${filtered}`
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: EXECUTOR_SYSTEM_PROMPT },
-      { role: 'user', content: userMessage }
-    ],
-    max_tokens: 300
-  })
-  const raw = response.choices[0].message.content || '{}'
-  const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
-  return JSON.parse(cleaned) as StepAction
-}
-
-function resolveRefToSelector(ref: string, tabSnapshots: AriaSnapshotNode[] | undefined): string | null {
-  const node = tabSnapshots?.find(n => n.ref === ref)
-  if (!node) return null
-  const name = node.name
-  if (name) return `[data-ax-name="${name}"]`
-  return null
 }
 
 async function resolveRefToCoordinates(
@@ -442,16 +311,36 @@ async function typeInElement(userId: string, tabId: number, ref: string, text: s
   await sendCdpCommand(userId, 'Input.insertText', { text }, tabId)
 }
 
-async function maybeResnapshotAfterAction(userId: string, tabId: number): Promise<void> {
-  const urlResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: 'window.location.href', returnByValue: true
-  }, tabId)
-  const newUrl = urlResult?.result?.value as string
-  const stored = tabRoleRefs.get(tabId)
-  if (stored && newUrl && newUrl !== stored.lastUrl) {
-    await waitForPageStable(userId, tabId, 3000)
-    await snapshotPage(userId, tabId)
+const KEY_DEFS: Record<string, { key: string; code: string; windowsVirtualKeyCode: number }> = {
+  'Enter': { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 },
+  'Tab': { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
+  'Escape': { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
+  'Backspace': { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 },
+  'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 },
+  'ArrowUp': { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38 },
+  'ArrowLeft': { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 },
+  'ArrowRight': { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 },
+  'Delete': { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 },
+  'Space': { key: ' ', code: 'Space', windowsVirtualKeyCode: 32 },
+  'Return': { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 },
+}
+
+async function pressKey(userId: string, tabId: number, key: string): Promise<void> {
+  const def = KEY_DEFS[key] || { key, code: key, windowsVirtualKeyCode: 0 }
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...def }, tabId)
+  await new Promise(r => setTimeout(r, 50))
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...def }, tabId)
+  await new Promise(r => setTimeout(r, 200))
+}
+
+async function navigateTab(userId: string, tabId: number, url: string): Promise<number> {
+  await sendCdpCommand(userId, 'Page.navigate', { url }, tabId)
+  const finalUrl = await waitForPageStable(userId, tabId)
+  const resolvedTabId = await resolveTabIdAfterNavigate({ userId, oldTabId: tabId, navigatedUrl: finalUrl })
+  if (resolvedTabId !== tabId) {
+    console.log(`↗️ Tab ID updated: ${tabId} → ${resolvedTabId}`)
   }
+  return resolvedTabId
 }
 
 async function resolveTabIdAfterNavigate(opts: {
@@ -492,160 +381,39 @@ async function resolveTabIdAfterNavigate(opts: {
   return currentTabId
 }
 
-async function executeStepAction(
-  action: StepAction,
-  userId: string,
-  tabId: number
-): Promise<string> {
-  switch (action.action) {
-    case 'navigate': {
-      await sendCdpCommand(userId, 'Page.navigate', { url: action.url }, tabId)
-      const finalUrl = await waitForPageStable(userId, tabId)
-      const resolvedTabId = await resolveTabIdAfterNavigate({ userId, oldTabId: tabId, navigatedUrl: finalUrl })
-      if (resolvedTabId !== tabId) {
-        console.log(`↗️ Tab ID updated: ${tabId} → ${resolvedTabId}`)
-      }
-      await snapshotPage(userId, resolvedTabId)
-      return finalUrl !== action.url
-        ? `Navigated to ${action.url}, redirected to ${finalUrl}`
-        : `Navigated to ${action.url}`
-    }
-
-    case 'click': {
-      if (!action.ref) return 'Error: click requires a ref'
-      await clickElement(userId, tabId, action.ref)
-      await maybeResnapshotAfterAction(userId, tabId)
-      const node = snapshotRefs.get(tabId)?.find(n => n.ref === action.ref)
-      return `Clicked ${node?.name || action.ref}`
-    }
-
-    case 'type': {
-      if (!action.ref || !action.text) return 'Error: type requires ref and text'
-      await typeInElement(userId, tabId, action.ref, action.text)
-      await snapshotPage(userId, tabId)
-      const node = snapshotRefs.get(tabId)?.find(n => n.ref === action.ref)
-      return `Typed "${action.text}" into ${node?.name || action.ref}`
-    }
-
-    case 'scroll': {
-      const dir = action.direction || 'down'
-      const amount = action.amount || 300
-      const deltaY = dir === 'down' ? amount : -amount
-      const vp = await sendCdpCommand(userId, 'Runtime.evaluate', {
-        expression: 'JSON.stringify({x: window.innerWidth/2, y: window.innerHeight/2})',
-        returnByValue: true
-      }, tabId)
-      const center = vp?.result?.value ? JSON.parse(vp.result.value) : { x: 400, y: 300 }
-      await sendCdpCommand(userId, 'Input.dispatchMouseEvent', {
-        type: 'mouseWheel', x: center.x, y: center.y, deltaX: 0, deltaY
-      }, tabId)
-      await new Promise(r => setTimeout(r, 300))
-      await snapshotPage(userId, tabId)
-      return `Scrolled ${dir} ${amount}px`
-    }
-
-    case 'pressKey': {
-      if (!action.key) return 'Error: pressKey requires a key'
-      const keyDef: Record<string, { key: string; code: string; windowsVirtualKeyCode: number }> = {
-        'Enter': { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 },
-        'Tab': { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
-        'Escape': { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
-        'Backspace': { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 },
-        'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 },
-        'ArrowUp': { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38 },
-        'ArrowLeft': { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 },
-        'ArrowRight': { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 },
-        'Delete': { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 },
-        'Space': { key: ' ', code: 'Space', windowsVirtualKeyCode: 32 }
-      }
-      const def = keyDef[action.key] || { key: action.key, code: action.key, windowsVirtualKeyCode: 0 }
-      await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
-        type: 'keyDown', ...def
-      }, tabId)
-      await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
-        type: 'keyUp', ...def
-      }, tabId)
-      await new Promise(r => setTimeout(r, 200))
-      await snapshotPage(userId, tabId)
-      return `Pressed ${action.key}`
-    }
-
-    case 'hover': {
-      if (!action.ref) return 'Error: hover requires a ref'
-      const { x, y } = await resolveRefToCoordinates(userId, tabId, action.ref)
-      await sendCdpCommand(userId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, tabId)
-      await new Promise(r => setTimeout(r, 200))
-      await snapshotPage(userId, tabId)
-      const node = snapshotRefs.get(tabId)?.find(n => n.ref === action.ref)
-      return `Hovered over ${node?.name || action.ref}`
-    }
-
-    case 'select': {
-      if (!action.ref || !action.value) return 'Error: select requires ref and value'
-      const node = snapshotRefs.get(tabId)?.find(n => n.ref === action.ref)
-      const name = node?.name || ''
-      const escapedVal = action.value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
-      const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
-        expression: `
-          (() => {
-            const name = ${JSON.stringify(name)};
-            const val = '${escapedVal}';
-            const el = [...document.querySelectorAll('select')]
-              .find(e => e.getAttribute('aria-label') === name || e.options[0]?.textContent?.includes(name));
-            if (!el) {
-              const selects = document.querySelectorAll('select');
-              if (selects.length === 1) { selects[0].value = val; selects[0].dispatchEvent(new Event('change', {bubbles:true})); return 'selected'; }
-              return 'not found';
-            }
-            el.value = val;
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            return 'selected';
-          })()
-        `,
-        returnByValue: true
-      }, tabId)
-      await new Promise(r => setTimeout(r, 300))
-      await snapshotPage(userId, tabId)
-      return result?.result?.value === 'selected'
-        ? `Selected "${action.value}" in ${name || action.ref}`
-        : `Error: select element not found for ${action.ref}`
-    }
-
-    case 'wait': {
-      const ms = Math.min(Number(action.ms) || 1000, 3000)
-      await new Promise(r => setTimeout(r, ms))
-      return `Waited ${ms}ms`
-    }
-
-    case 'done':
-      return 'DONE'
-
-    default:
-      return `Unknown action: ${action.action}`
+async function initializeTab(userId: string): Promise<number | null> {
+  try {
+    const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 10000)
+    console.log('initializeTab result:', JSON.stringify(result))
+    await new Promise(r => setTimeout(r, 1000))
+    const tabId = result?.tabId || null
+    console.log('Using tabId:', tabId)
+    return tabId
+  } catch (err) {
+    console.error('initializeTab failed:', err)
+    return null
   }
 }
 
-const SYSTEM_PROMPT = `You are an expert browser automation agent controlling a real Chrome browser and integrations.
-Rules:
-- Always navigate first then snapshot to see the page
-- The snapshot shows page elements with refs like [e1], [e2] — use the role and name to identify elements
-- Use CSS selectors or text content derived from snapshot refs to interact with elements
-- The user is already logged into their accounts — do not try to log in
-- For Gmail/Slack/Notion/GitHub tasks, use the API tools instead of browser automation
-- Complete tasks in minimum steps
-- Call done when you have the result`
+// ─── Browser tools for the LLM agent loop ───
 
-const tools: OpenAI.Chat.ChatCompletionTool[] = [
+const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
-      name: 'navigate',
-      description: 'Navigate to a URL in the user real Chrome browser',
+      name: 'browser_snapshot',
+      description: 'Read the current page as an accessibility tree. Returns interactive elements with stable refs like e1, e2, e3. Always call this first to see what\'s on the page. Call again after any action to see what changed.',
+      parameters: { type: 'object', properties: {}, required: [] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_navigate',
+      description: 'Navigate to a URL. Wait for page to stabilize before snapshotting.',
       parameters: {
         type: 'object',
-        properties: {
-          url: { type: 'string' }
-        },
+        properties: { url: { type: 'string', description: 'Full URL to navigate to' } },
         required: ['url']
       }
     }
@@ -653,21 +421,11 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
-      name: 'snapshot',
-      description: 'Get the current page content and accessibility tree',
-      parameters: { type: 'object', properties: {} }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'click',
-      description: 'Click an element by snapshot ref (e.g. e3)',
+      name: 'browser_click',
+      description: 'Click an element by its ref from the last snapshot.',
       parameters: {
         type: 'object',
-        properties: {
-          ref: { type: 'string', description: 'Element ref from snapshot like e3' }
-        },
+        properties: { ref: { type: 'string', description: 'Element ref from snapshot e.g. e3' } },
         required: ['ref']
       }
     }
@@ -675,13 +433,14 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
-      name: 'type',
-      description: 'Type text into an input field by snapshot ref',
+      name: 'browser_type',
+      description: 'Type text into a textbox or input element.',
       parameters: {
         type: 'object',
         properties: {
-          ref: { type: 'string', description: 'Element ref from snapshot like e5' },
-          text: { type: 'string' }
+          ref: { type: 'string', description: 'Element ref from snapshot' },
+          text: { type: 'string', description: 'Text to type' },
+          submit: { type: 'boolean', description: 'Press Enter after typing' }
         },
         required: ['ref', 'text']
       }
@@ -690,27 +449,25 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
-      name: 'extract',
-      description: 'Extract specific data from the current page',
+      name: 'browser_key',
+      description: 'Press a keyboard key. Use for Enter, Tab, Escape, ArrowDown etc.',
       parameters: {
         type: 'object',
-        properties: {
-          instruction: { type: 'string' }
-        },
-        required: ['instruction']
+        properties: { key: { type: 'string', description: 'Key name e.g. Enter, Tab, Escape' } },
+        required: ['key']
       }
     }
   },
   {
     type: 'function',
     function: {
-      name: 'scroll',
-      description: 'Scroll the page down or up',
+      name: 'browser_scroll',
+      description: 'Scroll the page up or down.',
       parameters: {
         type: 'object',
         properties: {
-          direction: { type: 'string', enum: ['down', 'up'] },
-          amount: { type: 'number', description: 'Pixels to scroll (default 300)' }
+          direction: { type: 'string', enum: ['up', 'down'] },
+          amount: { type: 'number', description: 'Pixels to scroll, default 300' }
         },
         required: ['direction']
       }
@@ -719,41 +476,26 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
-      name: 'wait',
-      description: 'Wait for page to load',
+      name: 'browser_wait',
+      description: 'Wait for a condition before continuing. Use after navigation or actions that trigger loading.',
       parameters: {
         type: 'object',
         properties: {
-          ms: { type: 'number' }
+          ms: { type: 'number', description: 'Milliseconds to wait' },
+          text: { type: 'string', description: 'Wait until this text appears on page' }
         },
-        required: ['ms']
+        required: []
       }
     }
   },
   {
     type: 'function',
     function: {
-      name: 'pressKey',
-      description: 'Press a keyboard key (Enter, Tab, Escape, Backspace, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Delete, Space)',
+      name: 'browser_hover',
+      description: 'Hover the mouse over an element by its ref from the last snapshot.',
       parameters: {
         type: 'object',
-        properties: {
-          key: { type: 'string', description: 'Key name to press' }
-        },
-        required: ['key']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'hover',
-      description: 'Hover the mouse over an element by snapshot ref',
-      parameters: {
-        type: 'object',
-        properties: {
-          ref: { type: 'string', description: 'Element ref from snapshot like e3' }
-        },
+        properties: { ref: { type: 'string', description: 'Element ref from snapshot e.g. e3' } },
         required: ['ref']
       }
     }
@@ -761,15 +503,24 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
-      name: 'select',
-      description: 'Select an option in a dropdown by snapshot ref and value',
+      name: 'task_complete',
+      description: 'Call this when the task is fully done. Provide a one-sentence summary.',
       parameters: {
         type: 'object',
-        properties: {
-          ref: { type: 'string', description: 'Select element ref from snapshot' },
-          value: { type: 'string', description: 'Option value to select' }
-        },
-        required: ['ref', 'value']
+        properties: { summary: { type: 'string', description: 'What was accomplished' } },
+        required: ['summary']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'task_failed',
+      description: 'Call this if the task cannot be completed. Explain what failed and why.',
+      parameters: {
+        type: 'object',
+        properties: { reason: { type: 'string', description: 'Why the task failed' } },
+        required: ['reason']
       }
     }
   },
@@ -780,9 +531,7 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
       description: 'List recent emails from Gmail',
       parameters: {
         type: 'object',
-        properties: {
-          maxResults: { type: 'number' }
-        }
+        properties: { maxResults: { type: 'number' } }
       }
     }
   },
@@ -809,9 +558,7 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
       description: 'Get content of a specific email',
       parameters: {
         type: 'object',
-        properties: {
-          messageId: { type: 'string' }
-        },
+        properties: { messageId: { type: 'string' } },
         required: ['messageId']
       }
     }
@@ -855,9 +602,7 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
       description: 'Query a Notion database',
       parameters: {
         type: 'object',
-        properties: {
-          databaseId: { type: 'string' }
-        },
+        properties: { databaseId: { type: 'string' } },
         required: ['databaseId']
       }
     }
@@ -940,89 +685,65 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
         required: ['owner', 'repo']
       }
     }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'done',
-      description: 'Task complete — return the final result',
-      parameters: {
-        type: 'object',
-        properties: {
-          result: { type: 'string' }
-        },
-        required: ['result']
-      }
-    }
   }
 ]
 
-async function initializeTab(userId: string): Promise<number | null> {
-  try {
-    const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 10000)
-    console.log('initializeTab result:', JSON.stringify(result))
-    await new Promise(r => setTimeout(r, 1000))
-    const tabId = result?.tabId || null
-    console.log('Using tabId:', tabId)
-    return tabId
-  } catch (err) {
-    console.error('initializeTab failed:', err)
-    return null
-  }
-}
+const AGENT_SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control a real Chrome browser tab to complete tasks.
 
-async function executeTool(
-  name: string,
+You have browser tools available. Use them to complete the task:
+1. Start with browser_snapshot to see the current page
+2. Based on what you see, decide your next action
+3. After every click or type, call browser_snapshot again to see what changed
+4. Keep acting until the task is done, then call task_complete
+
+Rules:
+- Never assume what's on the page — always snapshot first
+- Use exact refs from the most recent snapshot (refs change after navigation)
+- If you see a login form but the task doesn't require login, the user may already be logged in on another tab — navigate directly to the relevant page
+- If an action fails, snapshot again to see the current state and try a different approach
+- When the task is done, call task_complete with a one-sentence summary`
+
+// ─── Agent execution loop ───
+
+async function executeBrowserTool(
+  toolName: string,
   args: Record<string, any>,
   userId: string,
-  tabId: number
-): Promise<string> {
-  switch (name) {
-    case 'navigate': {
-      await sendCdpCommand(userId, 'Page.navigate', { url: args.url }, tabId)
-      const finalUrl = await waitForPageStable(userId, tabId)
-      const resolvedTabId = await resolveTabIdAfterNavigate({ userId, oldTabId: tabId, navigatedUrl: finalUrl })
-      if (resolvedTabId !== tabId) {
-        console.log(`↗️ Tab ID updated: ${tabId} → ${resolvedTabId}`)
-      }
-      await snapshotPage(userId, resolvedTabId)
-      return finalUrl !== args.url
-        ? `Navigated to ${args.url}, redirected to ${finalUrl}`
-        : `Navigated to ${args.url}`
+  tabId: number,
+  onProgress: (msg: string) => void
+): Promise<{ result: string; newTabId?: number }> {
+  switch (toolName) {
+    case 'browser_snapshot': {
+      onProgress('📸 Reading page...')
+      return { result: await snapshotPage(userId, tabId) }
     }
-    case 'snapshot': {
-      return await snapshotPage(userId, tabId)
+    case 'browser_navigate': {
+      onProgress(`🌐 Navigating to ${args.url}...`)
+      const newTabId = await navigateTab(userId, tabId, args.url)
+      return { result: `Navigated to ${args.url}`, newTabId }
     }
-    case 'click': {
-      if (!args.ref) return 'Error: click requires a ref'
+    case 'browser_click': {
+      onProgress(`🖱️ Clicking ${args.ref}...`)
       await clickElement(userId, tabId, args.ref)
-      await maybeResnapshotAfterAction(userId, tabId)
-      const node = snapshotRefs.get(tabId)?.find(n => n.ref === args.ref)
-      return `Clicked ${node?.name || args.ref}`
+      await waitForPageStable(userId, tabId, 1000).catch(() => {})
+      return { result: `Clicked ${args.ref}` }
     }
-    case 'type': {
-      if (!args.ref || !args.text) return 'Error: type requires ref and text'
+    case 'browser_type': {
+      onProgress(`⌨️ Typing into ${args.ref}...`)
       await typeInElement(userId, tabId, args.ref, args.text)
-      await snapshotPage(userId, tabId)
-      const node = snapshotRefs.get(tabId)?.find(n => n.ref === args.ref)
-      return `Typed "${args.text}" into ${node?.name || args.ref}`
+      if (args.submit) {
+        await pressKey(userId, tabId, 'Enter')
+      }
+      return { result: `Typed "${args.text}" into ${args.ref}` }
     }
-    case 'extract': {
-      const snapshot = await snapshotPage(userId, tabId)
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'Extract the requested data from the page accessibility snapshot. Be specific and structured.' },
-          { role: 'user', content: `${args.instruction}\n\n${snapshot.slice(0, 6000)}` }
-        ],
-        max_tokens: 800
-      })
-      return response.choices[0].message.content || 'Nothing extracted'
+    case 'browser_key': {
+      onProgress(`⌨️ Pressing ${args.key}...`)
+      await pressKey(userId, tabId, args.key)
+      return { result: `Pressed ${args.key}` }
     }
-    case 'scroll': {
-      const dir = args.direction || 'down'
-      const amount = args.amount || 300
-      const deltaY = dir === 'down' ? amount : -amount
+    case 'browser_scroll': {
+      const amount = args.amount ?? 300
+      const deltaY = args.direction === 'down' ? amount : -amount
       const vp = await sendCdpCommand(userId, 'Runtime.evaluate', {
         expression: 'JSON.stringify({x: window.innerWidth/2, y: window.innerHeight/2})',
         returnByValue: true
@@ -1032,210 +753,176 @@ async function executeTool(
         type: 'mouseWheel', x: center.x, y: center.y, deltaX: 0, deltaY
       }, tabId)
       await new Promise(r => setTimeout(r, 300))
-      await snapshotPage(userId, tabId)
-      return `Scrolled ${dir} ${amount}px`
+      return { result: `Scrolled ${args.direction} ${amount}px` }
     }
-    case 'wait': {
-      const ms = Math.min(Number(args.ms) || 1000, 3000)
-      await new Promise(r => setTimeout(r, ms))
-      return `Waited ${ms}ms`
-    }
-    case 'pressKey': {
-      if (!args.key) return 'Error: pressKey requires a key'
-      const keyDef: Record<string, { key: string; code: string; windowsVirtualKeyCode: number }> = {
-        'Enter': { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 },
-        'Tab': { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
-        'Escape': { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
-        'Backspace': { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 },
-        'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 },
-        'ArrowUp': { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38 },
-        'ArrowLeft': { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 },
-        'ArrowRight': { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 },
-        'Delete': { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 },
-        'Space': { key: ' ', code: 'Space', windowsVirtualKeyCode: 32 }
+    case 'browser_wait': {
+      if (args.ms) {
+        onProgress(`⏳ Waiting ${args.ms}ms...`)
+        await new Promise(r => setTimeout(r, Math.min(args.ms, 10000)))
       }
-      const def = keyDef[args.key] || { key: args.key, code: args.key, windowsVirtualKeyCode: 0 }
-      await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...def }, tabId)
-      await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...def }, tabId)
-      await new Promise(r => setTimeout(r, 200))
-      await snapshotPage(userId, tabId)
-      return `Pressed ${args.key}`
+      if (args.text) {
+        onProgress(`⏳ Waiting for "${args.text}"...`)
+        const found = await waitForText(userId, tabId, args.text, 5000)
+        return { result: found ? `Text "${args.text}" appeared` : `Text "${args.text}" not found after 5s` }
+      }
+      return { result: 'Done waiting' }
     }
-    case 'hover': {
-      if (!args.ref) return 'Error: hover requires a ref'
+    case 'browser_hover': {
+      onProgress(`🖱️ Hovering over ${args.ref}...`)
       const { x, y } = await resolveRefToCoordinates(userId, tabId, args.ref)
       await sendCdpCommand(userId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, tabId)
       await new Promise(r => setTimeout(r, 200))
-      await snapshotPage(userId, tabId)
-      const node = snapshotRefs.get(tabId)?.find(n => n.ref === args.ref)
-      return `Hovered over ${node?.name || args.ref}`
-    }
-    case 'select': {
-      if (!args.ref || !args.value) return 'Error: select requires ref and value'
-      const node = snapshotRefs.get(tabId)?.find(n => n.ref === args.ref)
-      const name = node?.name || ''
-      const escapedVal = args.value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
-      const selectResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
-        expression: `
-          (() => {
-            const name = ${JSON.stringify(name)};
-            const val = '${escapedVal}';
-            const el = [...document.querySelectorAll('select')]
-              .find(e => e.getAttribute('aria-label') === name || e.options[0]?.textContent?.includes(name));
-            if (!el) {
-              const selects = document.querySelectorAll('select');
-              if (selects.length === 1) { selects[0].value = val; selects[0].dispatchEvent(new Event('change', {bubbles:true})); return 'selected'; }
-              return 'not found';
-            }
-            el.value = val;
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            return 'selected';
-          })()
-        `,
-        returnByValue: true
-      }, tabId)
-      await new Promise(r => setTimeout(r, 300))
-      await snapshotPage(userId, tabId)
-      return selectResult?.result?.value === 'selected'
-        ? `Selected "${args.value}" in ${name || args.ref}`
-        : `Error: select element not found for ${args.ref}`
+      return { result: `Hovered over ${args.ref}` }
     }
     case 'gmail_list': {
       const connected = await isProviderConnected(userId, 'gmail')
-      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
-      try {
-        const result = await gmail.listEmails(userId, { maxResults: args.maxResults || 10 })
-        return JSON.stringify(result, null, 2)
-      } catch (err) {
-        return `Gmail error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Gmail not connected. Ask user to connect Gmail.' }
+      return { result: JSON.stringify(await gmail.listEmails(userId, { maxResults: args.maxResults || 10 }), null, 2) }
     }
     case 'gmail_send': {
       const connected = await isProviderConnected(userId, 'gmail')
-      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
-      try {
-        await gmail.sendEmail(userId, args.to, args.subject, args.body)
-        return `Email sent to ${args.to}`
-      } catch (err) {
-        return `Gmail error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Gmail not connected. Ask user to connect Gmail.' }
+      await gmail.sendEmail(userId, args.to, args.subject, args.body)
+      return { result: `Email sent to ${args.to}` }
     }
     case 'gmail_read': {
       const connected = await isProviderConnected(userId, 'gmail')
-      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
-      try {
-        const content = await gmail.getEmailContent(userId, args.messageId)
-        return content.slice(0, 2000)
-      } catch (err) {
-        return `Gmail error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Gmail not connected. Ask user to connect Gmail.' }
+      return { result: (await gmail.getEmailContent(userId, args.messageId)).slice(0, 2000) }
     }
     case 'gmail_summarize': {
       const connected = await isProviderConnected(userId, 'gmail')
-      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
-      try {
-        return await gmail.summarizeEmails(userId)
-      } catch (err) {
-        return `Gmail error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Gmail not connected. Ask user to connect Gmail.' }
+      return { result: await gmail.summarizeEmails(userId) }
     }
     case 'notion_create_page': {
       const connected = await isProviderConnected(userId, 'notion')
-      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
-      try {
-        await notion.createPage(userId, args.parentId, args.title, args.content)
-        return `Created Notion page: ${args.title}`
-      } catch (err) {
-        return `Notion error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Notion not connected. Ask user to connect Notion.' }
+      await notion.createPage(userId, args.parentId, args.title, args.content)
+      return { result: `Created Notion page: ${args.title}` }
     }
     case 'notion_list_databases': {
       const connected = await isProviderConnected(userId, 'notion')
-      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
-      try {
-        const result = await notion.listDatabases(userId)
-        return JSON.stringify(result, null, 2)
-      } catch (err) {
-        return `Notion error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Notion not connected. Ask user to connect Notion.' }
+      return { result: JSON.stringify(await notion.listDatabases(userId), null, 2) }
     }
     case 'notion_query_database': {
       const connected = await isProviderConnected(userId, 'notion')
-      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
-      try {
-        const result = await notion.queryDatabase(userId, args.databaseId)
-        return JSON.stringify(result, null, 2)
-      } catch (err) {
-        return `Notion error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Notion not connected. Ask user to connect Notion.' }
+      return { result: JSON.stringify(await notion.queryDatabase(userId, args.databaseId), null, 2) }
     }
     case 'slack_send': {
       const connected = await isProviderConnected(userId, 'slack')
-      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
-      try {
-        await slack.sendMessage(userId, args.channel, args.text)
-        return `Sent message to ${args.channel}`
-      } catch (err) {
-        return `Slack error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Slack not connected. Ask user to connect Slack.' }
+      await slack.sendMessage(userId, args.channel, args.text)
+      return { result: `Sent message to ${args.channel}` }
     }
     case 'slack_list_channels': {
       const connected = await isProviderConnected(userId, 'slack')
-      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
-      try {
-        const result = await slack.listChannels(userId)
-        return JSON.stringify(result, null, 2)
-      } catch (err) {
-        return `Slack error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Slack not connected. Ask user to connect Slack.' }
+      return { result: JSON.stringify(await slack.listChannels(userId), null, 2) }
     }
     case 'slack_read_messages': {
       const connected = await isProviderConnected(userId, 'slack')
-      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
-      try {
-        const result = await slack.getMessages(userId, args.channel, args.limit || 10)
-        return JSON.stringify(result, null, 2)
-      } catch (err) {
-        return `Slack error: ${String(err)}`
-      }
+      if (!connected) return { result: 'Slack not connected. Ask user to connect Slack.' }
+      return { result: JSON.stringify(await slack.getMessages(userId, args.channel, args.limit || 10), null, 2) }
     }
     case 'github_create_issue': {
       const connected = await isProviderConnected(userId, 'github')
-      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
-      try {
-        const result = await github.createIssue(userId, args.owner, args.repo, args.title, args.body)
-        return `Created GitHub issue: ${args.title}`
-      } catch (err) {
-        return `GitHub error: ${String(err)}`
-      }
+      if (!connected) return { result: 'GitHub not connected. Ask user to connect GitHub.' }
+      return { result: `Created GitHub issue: ${args.title}` }
     }
     case 'github_list_repos': {
       const connected = await isProviderConnected(userId, 'github')
-      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
-      try {
-        const result = await github.listRepos(userId)
-        return JSON.stringify(result, null, 2)
-      } catch (err) {
-        return `GitHub error: ${String(err)}`
-      }
+      if (!connected) return { result: 'GitHub not connected. Ask user to connect GitHub.' }
+      return { result: JSON.stringify(await github.listRepos(userId), null, 2) }
     }
     case 'github_list_issues': {
       const connected = await isProviderConnected(userId, 'github')
-      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
-      try {
-        const result = await github.listIssues(userId, args.owner, args.repo, args.state || 'open')
-        return JSON.stringify(result, null, 2)
-      } catch (err) {
-        return `GitHub error: ${String(err)}`
-      }
-    }
-    case 'done': {
-      return `DONE:${args.result}`
+      if (!connected) return { result: 'GitHub not connected. Ask user to connect GitHub.' }
+      return { result: JSON.stringify(await github.listIssues(userId, args.owner, args.repo, args.state || 'open'), null, 2) }
     }
     default:
-      return `Unknown tool: ${name}`
+      return { result: `Unknown tool: ${toolName}` }
   }
 }
+
+async function runAgentLoop(opts: {
+  userId: string
+  taskPrompt: string
+  tabId: number
+  onProgress: (msg: string) => void
+}): Promise<{ success: boolean; summary: string; tabId: number }> {
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: AGENT_SYSTEM_PROMPT },
+    { role: 'user', content: opts.taskPrompt }
+  ]
+
+  const MAX_ITERATIONS = 30
+  let iterations = 0
+  let activeTabId = opts.tabId
+
+  while (iterations < MAX_ITERATIONS) {
+    iterations++
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages,
+      tools: browserTools,
+      tool_choice: 'required',
+      max_tokens: 1000
+    })
+
+    const assistantMessage = response.choices[0].message
+    messages.push(assistantMessage)
+
+    if (!assistantMessage.tool_calls?.length) {
+      return { success: false, summary: 'Agent stopped without completing task', tabId: activeTabId }
+    }
+
+    const toolResults: OpenAI.ChatCompletionToolMessageParam[] = []
+
+    for (const toolCall of assistantMessage.tool_calls) {
+      if (toolCall.type !== 'function') continue
+
+      const args = JSON.parse(toolCall.function.arguments || '{}')
+      let resultStr: string
+
+      if (toolCall.function.name === 'task_complete') {
+        opts.onProgress(`✅ Done: ${args.summary}`)
+        return { success: true, summary: args.summary, tabId: activeTabId }
+      }
+
+      if (toolCall.function.name === 'task_failed') {
+        opts.onProgress(`❌ Failed: ${args.reason}`)
+        return { success: false, summary: args.reason, tabId: activeTabId }
+      }
+
+      try {
+        const exec = await executeBrowserTool(toolCall.function.name, args, opts.userId, activeTabId, opts.onProgress)
+        resultStr = exec.result
+        if (exec.newTabId !== undefined) {
+          activeTabId = exec.newTabId
+        }
+      } catch (err) {
+        resultStr = `Error: ${err instanceof Error ? err.message : String(err)}`
+        opts.onProgress(`⚠️ ${resultStr}`)
+      }
+
+      toolResults.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: resultStr
+      })
+    }
+
+    messages.push(...toolResults)
+  }
+
+  return { success: false, summary: 'Task exceeded maximum iterations', tabId: activeTabId }
+}
+
+// ─── Entry point ───
 
 export async function runAgentWithExtension(
   task: string,
@@ -1251,7 +938,6 @@ export async function runAgentWithExtension(
 
   const startTime = Date.now()
   const stepsLog: StepLog[] = []
-  let planSteps: string[] = []
   let status: 'success' | 'error' = 'success'
   let resultSummary = ''
 
@@ -1261,121 +947,26 @@ export async function runAgentWithExtension(
     if (!tabId) throw new Error('Failed to open browser tab')
 
     try {
-      let activeTabId = tabId
-      const url = extractUrl(task)
-      if (url) {
-        await onStep(`🌐 Navigating to ${url}...`)
-        await sendCdpCommand(userId, 'Page.navigate', { url }, activeTabId)
-        const finalUrl = await waitForPageStable(userId, activeTabId)
-        const resolvedTabId = await resolveTabIdAfterNavigate({ userId, oldTabId: activeTabId, navigatedUrl: finalUrl })
-        if (resolvedTabId !== activeTabId) {
-          await onStep(`  ↗️ Tab ID updated: ${activeTabId} → ${resolvedTabId}`)
-          activeTabId = resolvedTabId
+      const result = await runAgentLoop({
+        userId,
+        taskPrompt: task,
+        tabId,
+        onProgress: async (msg) => {
+          stepsLog.push({
+            step: stepsLog.length + 1,
+            description: msg,
+            action: msg,
+            success: !msg.startsWith('⚠️')
+          })
+          await onStep(msg)
         }
-      }
+      })
 
-      await onStep('📸 Taking initial snapshot...')
-      const initialSnapshot = await snapshotPage(userId, activeTabId)
-      let lastKnownUrl = tabUrls.get(activeTabId) || ''
+      status = result.success ? 'success' : 'error'
+      resultSummary = result.summary
 
-      await onStep('📋 Planning steps based on page state...')
-      planSteps = await decomposePlan(task, lastKnownUrl, initialSnapshot)
-      let currentStep = 0
-
-      for (let i = 0; i < planSteps.length; i++) {
-        await onStep(`  ${i + 1}. ${planSteps[i]}`)
-      }
-
-      while (currentStep < planSteps.length) {
-        const stepDesc = planSteps[currentStep]
-        await onStep(`📋 Step ${currentStep + 1}/${planSteps.length}: ${stepDesc}`)
-
-        let retries = 0
-        let stepSucceeded = false
-
-        while (retries <= 2 && !stepSucceeded) {
-          try {
-            const snapshot = await snapshotPage(userId, activeTabId)
-            const currentUrl = tabUrls.get(activeTabId) || ''
-
-            if (currentUrl !== lastKnownUrl && currentStep > 0) {
-              await onStep(`🔄 URL changed: ${lastKnownUrl} → ${currentUrl}, re-planning...`)
-              const remaining = planSteps.slice(currentStep)
-              planSteps = await decomposePlan(
-                `${task}\n\nNote: URL changed to ${currentUrl}. Remaining steps were: ${remaining.join(', ')}`,
-                currentUrl,
-                snapshot
-              )
-              currentStep = 0
-              lastKnownUrl = currentUrl
-              for (let i = 0; i < planSteps.length; i++) {
-                await onStep(`  ${i + 1}. ${planSteps[i]}`)
-              }
-              break
-            }
-
-            const action = await planStep(stepDesc, snapshot, userId, activeTabId, planSteps, currentStep + 1, planSteps.length)
-
-            if (action.action === 'done' || action.action === 'failed') {
-              resultSummary = action.summary || (action.action === 'done' ? 'Task completed' : 'Task failed')
-              stepsLog.push({
-                step: currentStep + 1,
-                description: stepDesc,
-                action: action.action,
-                success: action.action === 'done'
-              })
-              stepSucceeded = true
-              if (action.action === 'failed') {
-                throw new Error(resultSummary)
-              }
-              break
-            }
-
-            const result = await executeStepAction(action, userId, activeTabId)
-
-            if (result.startsWith('Error:')) {
-              throw new Error(result)
-            }
-
-            const postUrl = tabUrls.get(activeTabId) || ''
-            if (postUrl !== lastKnownUrl) {
-              await onStep(`  ↗️ Redirected: ${lastKnownUrl} → ${postUrl}`)
-              lastKnownUrl = postUrl
-            }
-
-            stepsLog.push({
-              step: currentStep + 1,
-              description: stepDesc,
-              action: `${action.action}${action.ref ? ` ref=${action.ref}` : ''}${action.text ? ` text="${action.text}"` : ''}${action.url ? ` url=${action.url}` : ''}${action.key ? ` key=${action.key}` : ''}`,
-              success: true
-            })
-
-            await onStep(`  ✓ ${result}`)
-            stepSucceeded = true
-            currentStep++
-          } catch (err) {
-            retries++
-            const errorMsg = String(err)
-            stepsLog.push({
-              step: currentStep + 1,
-              description: stepDesc,
-              action: `retry ${retries}`,
-              success: false,
-              errorMsg: errorMsg.slice(0, 500)
-            })
-
-            if (retries > 2) {
-              throw new Error(`Step ${currentStep + 1} failed after 2 retries: ${stepDesc} — ${errorMsg}`)
-            }
-            await onStep(`  ⚠️ Retry ${retries}/2 for step ${currentStep + 1}...`)
-            await new Promise(r => setTimeout(r, 1000))
-          }
-        }
-      }
-
-      resultSummary = resultSummary || 'Task completed'
       if (taskId) {
-        await createMessage(userId, taskId, `✅ ${resultSummary}`)
+        await createMessage(userId, taskId, result.success ? `✅ ${resultSummary}` : resultSummary.slice(0, 300))
       }
     } finally {
       try {
@@ -1405,7 +996,7 @@ export async function runAgentWithExtension(
         user_id: userId,
         task_id: taskId || null,
         task_prompt: task,
-        plan: planSteps,
+        plan: [],
         status,
         result_summary: resultSummary.slice(0, 1000),
         steps_log: stepsLog,
