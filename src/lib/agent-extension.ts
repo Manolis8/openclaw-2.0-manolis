@@ -1,7 +1,6 @@
 import OpenAI from 'openai'
 import { chromium } from 'playwright'
-import type { Browser, BrowserContext, Page } from 'playwright'
-import { sendExtensionMessage } from '../index.js'
+import type { Browser, Page } from 'playwright'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
 import { supabase } from './supabase.js'
@@ -16,28 +15,32 @@ const runningTasks = new Set<string>()
 
 // ─── Per-user Playwright browser connection, reused across tasks ───
 
-const userBrowsers = new Map<string, { browser: Browser; context: BrowserContext }>()
+const userBrowserConnections = new Map<string, Browser>()
 
-async function getCdpUrl(userId: string): Promise<string> {
-  const result = await sendExtensionMessage(userId, 'getCdpUrl', {}, 10000)
-  if (!result?.cdpUrl) throw new Error('Extension did not return a CDP URL. Ensure Chrome has remote debugging enabled.')
-  return result.cdpUrl
-}
+const CDP_URL = process.env.CDP_URL || 'http://127.0.0.1:9222'
 
-async function getPageForUser(userId: string): Promise<Page> {
-  const cdpUrl = await getCdpUrl(userId)
-
-  let cached = userBrowsers.get(userId)
-  if (!cached) {
-    const browser = await chromium.connectOverCDP(cdpUrl)
-    const context = browser.contexts()[0] ?? (await browser.newContext())
-    cached = { browser, context }
-    userBrowsers.set(userId, cached)
-    browser.on('disconnected', () => userBrowsers.delete(userId))
+async function getPlaywrightPage(userId: string): Promise<{ page: Page; browser: Browser }> {
+  let browser = userBrowserConnections.get(userId)
+  if (!browser || !browser.isConnected()) {
+    browser = await chromium.connectOverCDP(CDP_URL, { timeout: 10_000 })
+    userBrowserConnections.set(userId, browser)
+    browser.on('disconnected', () => {
+      userBrowserConnections.delete(userId)
+    })
   }
 
-  const pages = cached.context.pages()
-  return pages[0] ?? (await cached.context.newPage())
+  const context = browser.contexts()[0]
+  if (!context) {
+    throw new Error('No browser context available. Is the extension relay running?')
+  }
+
+  const pages = context.pages()
+  const page = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
+  if (!page) {
+    throw new Error('No open tabs found. Open a tab in Chrome first.')
+  }
+
+  return { page, browser }
 }
 
 // ─── Snapshot / role-ref system ───
@@ -662,7 +665,7 @@ export async function runAgentWithExtension(
 
   try {
     await onStep('🔌 Connecting to your browser via Playwright...')
-    const page = await getPageForUser(userId)
+    const { page } = await getPlaywrightPage(userId)
     const tabKey = `${userId}:${Date.now()}`
 
     const result = await runAgentLoop({
