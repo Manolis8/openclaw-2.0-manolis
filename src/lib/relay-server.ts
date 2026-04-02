@@ -90,7 +90,7 @@ export async function startRelayServer(userId: string): Promise<RelayInfo> {
   if (existing) return existing
 
   const server = createServer((req, res) => {
-    if (req.url === '/json/version') {
+    if (req.url === '/json/version' || req.url === '/json/version/') {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
       res.end(JSON.stringify({
         'Browser': 'Chrome/Extension-Relay',
