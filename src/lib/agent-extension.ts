@@ -3,7 +3,6 @@ import { chromium } from 'playwright'
 import type { Browser, Page } from 'playwright'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
-import { getRelayServerInfo } from './relay-server.js'
 import { supabase } from './supabase.js'
 import * as gmail from './integrations/gmail.js'
 import * as notion from './integrations/notion.js'
@@ -12,64 +11,33 @@ import * as github from './integrations/github.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
-const userBrowserConnections = new Map<string, Browser>()
 
-// ─── Browser connection ───
+// ─── Headless Playwright browser (no CDP, no extension) ───
 
-async function getPlaywrightPage(userId: string): Promise<{ page: Page }> {
-  const relayServer = getRelayServerInfo(userId)
-  if (!relayServer) {
-    throw new Error('Extension not connected. Click the Felo extension badge ON on a Chrome tab first.')
-  }
+let browser: Browser | null = null
 
-  // ws://127.0.0.1:{port}/cdp → http://127.0.0.1:{port}
-  const cdpUrl = relayServer.cdpWsUrl
-    .replace('ws://', 'http://')
-    .replace('/cdp', '')
-
-  // Always get a fresh connection — don't reuse across tasks
-  // because the relay session state resets between connections
-  let browser = userBrowserConnections.get(userId)
-  if (browser) {
-    try { await browser.close() } catch {}
-    userBrowserConnections.delete(userId)
-  }
-
-  console.log(`[playwright] connecting to relay at ${cdpUrl}`)
-  browser = await chromium.connectOverCDP(cdpUrl, { timeout: 15_000 })
-  userBrowserConnections.set(userId, browser)
-  browser.on('disconnected', () => userBrowserConnections.delete(userId))
-  console.log(`[playwright] connected`)
-
-  // Wait up to 5s for a context and page to appear
-  let context = browser.contexts()[0]
-  if (!context) {
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('No browser context after 5s. Is a tab attached?')), 5000)
-      const check = () => {
-        const ctx = browser.contexts()[0]
-        if (ctx) { clearTimeout(timeout); resolve() }
-      }
-      // Poll every 500ms
-      const interval = setInterval(() => {
-        if (browser.contexts()[0]) { clearInterval(interval); check() }
-      }, 500)
-      check()
+async function getBrowser(): Promise<Browser> {
+  if (!browser || !browser.isConnected()) {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
     })
+    console.log('[playwright] browser launched')
   }
+  return browser
+}
 
-  const pages = context.pages()
-  if (!pages.length) {
-    throw new Error('No tabs found. Click the Felo extension badge ON on a Chrome tab first.')
-  }
-
-  const page = pages.find(p => {
-    const url = p.url()
-    return url && url !== 'about:blank' && !url.startsWith('chrome://')
-  }) ?? pages[0]
-
-  console.log(`[playwright] using page: ${page.url()}`)
-  return { page }
+async function newPage(): Promise<Page> {
+  const b = await getBrowser()
+  const context = await b.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  })
+  return context.newPage()
 }
 
 // ─── Snapshot / role-ref system (OpenClaw-style) ───
@@ -520,8 +488,8 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('🔌 Connecting to your browser...')
-    const { page } = await getPlaywrightPage(userId)
+    await onStep('☁️ Starting cloud browser...')
+    const page = await newPage()
     const tabKey = `${userId}:${Date.now()}`
 
     const result = await runAgentLoop({
