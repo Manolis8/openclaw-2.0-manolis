@@ -1,8 +1,10 @@
 import OpenAI from 'openai'
 import { chromium } from 'playwright'
 import type { Browser, Page } from 'playwright'
+import { sendExtensionMessage } from '../index.js'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
+import { getRelayServerInfo } from './relay-server.js'
 import { supabase } from './supabase.js'
 import * as gmail from './integrations/gmail.js'
 import * as notion from './integrations/notion.js'
@@ -17,30 +19,33 @@ const runningTasks = new Set<string>()
 
 const userBrowserConnections = new Map<string, Browser>()
 
-const CDP_URL = process.env.CDP_URL || 'http://127.0.0.1:9222'
+async function getPlaywrightPage(userId: string): Promise<{ page: Page }> {
+  const relayServer = getRelayServerInfo(userId)
+  if (!relayServer) {
+    throw new Error('Extension not connected. Make sure the Felo extension is installed and the badge is ON.')
+  }
 
-async function getPlaywrightPage(userId: string): Promise<{ page: Page; browser: Browser }> {
+  // cdpWsUrl is like ws://127.0.0.1:{port}/cdp
+  // chromium.connectOverCDP takes the HTTP base URL, not the WebSocket URL
+  const cdpUrl = relayServer.cdpWsUrl
+    .replace('ws://', 'http://')
+    .replace('/cdp', '')
+
   let browser = userBrowserConnections.get(userId)
   if (!browser || !browser.isConnected()) {
-    browser = await chromium.connectOverCDP(CDP_URL, { timeout: 10_000 })
+    browser = await chromium.connectOverCDP(cdpUrl, { timeout: 10_000 })
     userBrowserConnections.set(userId, browser)
-    browser.on('disconnected', () => {
-      userBrowserConnections.delete(userId)
-    })
+    browser.on('disconnected', () => userBrowserConnections.delete(userId))
   }
 
   const context = browser.contexts()[0]
-  if (!context) {
-    throw new Error('No browser context available. Is the extension relay running?')
-  }
+  if (!context) throw new Error('No browser context. Is a tab attached in Chrome?')
 
   const pages = context.pages()
-  const page = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
-  if (!page) {
-    throw new Error('No open tabs found. Open a tab in Chrome first.')
-  }
+  if (!pages.length) throw new Error('No tabs found. Click the extension badge ON on a Chrome tab first.')
 
-  return { page, browser }
+  const page = pages.find(p => p.url() !== 'about:blank' && p.url() !== '') ?? pages[0]
+  return { page }
 }
 
 // ─── Snapshot / role-ref system ───
@@ -469,8 +474,12 @@ async function runAgentLoop(opts: {
             }
             case 'browser_navigate': {
               opts.onProgress(`🌐 Navigating to ${args.url}...`)
-              await opts.page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: 20_000 })
-              await opts.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+              // Use the relay's openTab so the extension creates a new tab properly
+              await sendExtensionMessage(opts.userId, 'openTab', { url: args.url }, 15000)
+              // Reconnect Playwright to pick up the new tab
+              const { page: newPage } = await getPlaywrightPage(opts.userId)
+              await newPage.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {})
+              opts.page = newPage
               result = await snapshotPage(opts.page, opts.tabKey)
               result = `Navigated to ${args.url}. Page is now:\n${result}`
               break
