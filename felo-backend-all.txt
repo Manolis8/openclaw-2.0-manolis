@@ -1,0 +1,3344 @@
+=== src\index.ts ===
+import 'dotenv/config'
+import express from 'express'
+import { createServer } from 'http'
+import { WebSocketServer, WebSocket } from 'ws'
+import { createClient } from '@supabase/supabase-js'
+import { tasksRouter } from './routes/tasks.js'
+import { messagesRouter } from './routes/messages.js'
+import { connectionsRouter } from './routes/connections.js'
+import { oauthRouter } from './routes/oauth.js'
+import { setExtensionBridge, startRelayServer, stopRelayServer, handleExtensionEvent } from './lib/relay-server.js'
+
+const app = express()
+const PORT = process.env.PORT || 3001
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+)
+
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*')
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  if (req.method === 'OPTIONS') { res.sendStatus(200); return }
+  next()
+})
+
+app.use(express.json())
+
+app.use((req, _res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`)
+  next()
+})
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, timestamp: new Date() })
+})
+
+// Generate a permanent API key for a user
+app.post('/api/generate-key', async (req, res) => {
+  const { userId } = req.body
+  if (!userId) return res.status(400).json({ error: 'Missing userId' })
+  const key = 'felo_' + [...Array(40)].map(() => Math.random().toString(36)[2]).join('')
+  const { error } = await supabase
+    .from('api_keys')
+    .upsert({ user_id: userId, key }, { onConflict: 'user_id' })
+  if (error) return res.status(500).json({ error: 'Failed to generate key' })
+  res.json({ key })
+})
+
+// Get existing API key for a user
+app.get('/api/get-key/:userId', async (req, res) => {
+  const { data } = await supabase
+    .from('api_keys')
+    .select('key')
+    .eq('user_id', req.params.userId)
+    .single()
+  res.json({ key: data?.key || null })
+})
+
+// Extension connection status
+app.get('/api/extension-status/:userId', (req, res) => {
+  res.json({ connected: isExtensionConnected(req.params.userId) })
+})
+
+app.use('/api', tasksRouter)
+app.use('/api', messagesRouter)
+app.use('/api', connectionsRouter)
+app.use('/api', oauthRouter)
+
+const server = createServer(app)
+const wss = new WebSocketServer({ noServer: true })
+
+export const extensionConnections = new Map<string, WebSocket>()
+export const pendingCdpCommands = new Map<string, Map<number, { resolve: (v: any) => void, reject: (e: Error) => void }>>()
+
+server.on('upgrade', (request, socket, head) => {
+  console.log('🔌 WebSocket upgrade:', request.url?.slice(0, 80))
+  const url = new URL(request.url || '', 'http://localhost')
+  if (url.pathname === '/extension') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request)
+    })
+  } else {
+    socket.destroy()
+  }
+})
+
+wss.on('connection', async (ws, req) => {
+  const url = new URL(req.url || '', 'http://localhost')
+  const token = url.searchParams.get('token')
+
+  if (!token) { ws.close(1008, 'Missing token'); return }
+
+  let userId: string
+  try {
+    console.log('Looking up API key:', token.slice(0, 15) + '...')
+    const { data, error } = await supabase
+      .from('api_keys')
+      .select('user_id')
+      .eq('key', token)
+      .single()
+    if (error || !data) throw new Error('Key not found: ' + error?.message)
+    userId = data.user_id
+    console.log(`✅ API key valid for user: ${userId}`)
+  } catch (err) {
+    console.error('Extension auth failed:', String(err))
+    ws.close(1008, 'Invalid token')
+    return
+  }
+
+  const existing = extensionConnections.get(userId)
+  if (existing?.readyState === WebSocket.OPEN) {
+    existing.close(1000, 'Replaced by new connection')
+  }
+
+  extensionConnections.set(userId, ws)
+  pendingCdpCommands.set(userId, new Map())
+  console.log(`✅ Extension connected: ${userId} (total: ${extensionConnections.size})`)
+
+  // Start per-user CDP relay server for Playwright connections
+  startRelayServer(userId).then((info) => {
+    console.log(`📡 CDP relay ready for ${userId}: ${info.cdpWsUrl}`)
+  }).catch((err) => {
+    console.error(`Failed to start CDP relay for ${userId}:`, err)
+  })
+
+  // Drain any queued tasks for this user
+  drainQueueForUser(userId)
+
+  ws.send(JSON.stringify({ method: 'connected', params: { userId } }))
+
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ method: 'ping' }))
+  }, 25000)
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(String(data))
+      if (msg.method === 'pong') return
+      if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+        const userPending = pendingCdpCommands.get(userId)
+        const pending = userPending?.get(msg.id)
+        if (pending) {
+          userPending!.delete(msg.id)
+          if (msg.error) pending.reject(new Error(String(msg.error)))
+          else pending.resolve(msg.result)
+        }
+        return
+      }
+      if (msg.method === 'forwardCDPEvent') {
+        console.log(`CDP event from ${userId}: ${msg.params?.method}`)
+        handleExtensionEvent(userId, msg.params?.method, msg.params?.params)
+      }
+    } catch (err) {
+      console.error('Extension message error:', err)
+    }
+  })
+
+  ws.on('close', () => {
+    clearInterval(pingInterval)
+    if (extensionConnections.get(userId) === ws) {
+      extensionConnections.delete(userId)
+      pendingCdpCommands.delete(userId)
+    }
+    stopRelayServer(userId)
+    console.log(`Extension disconnected: ${userId} (total: ${extensionConnections.size})`)
+  })
+
+  ws.on('error', (err) => console.error(`WS error for ${userId}:`, err))
+})
+
+let cdpCommandId = 1
+setExtensionBridge({
+  getConnection: (userId) => extensionConnections.get(userId),
+  getPending: (userId) => pendingCdpCommands.get(userId),
+  getNextId: () => cdpCommandId++
+})
+export async function sendCdpCommand(
+  userId: string,
+  method: string,
+  params?: object,
+  tabId?: number,
+  timeoutMs = 15000
+): Promise<any> {
+  const ws = extensionConnections.get(userId)
+  if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('Extension not connected for this user')
+  const id = cdpCommandId++
+  const userPending = pendingCdpCommands.get(userId) || new Map()
+  pendingCdpCommands.set(userId, userPending)
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      userPending.delete(id)
+      reject(new Error(`CDP timeout: ${method}`))
+    }, timeoutMs)
+    userPending.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v) },
+      reject: (e) => { clearTimeout(timer); reject(e) }
+    })
+    ws.send(JSON.stringify({
+      id,
+      method: 'forwardCDPCommand',
+      params: { method, params, tabId }
+    }))
+  })
+}
+
+export async function sendExtensionMessage(
+  userId: string,
+  method: string,
+  params?: object,
+  timeoutMs = 10000
+): Promise<any> {
+  const ws = extensionConnections.get(userId)
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    throw new Error('Extension not connected for this user')
+  }
+  const id = cdpCommandId++
+  const userPending = pendingCdpCommands.get(userId) || new Map()
+  pendingCdpCommands.set(userId, userPending)
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      userPending.delete(id)
+      reject(new Error(`Extension message timeout: ${method}`))
+    }, timeoutMs)
+    userPending.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v) },
+      reject: (e) => { clearTimeout(timer); reject(e) }
+    })
+    ws.send(JSON.stringify({ id, method, params }))
+  })
+}
+
+export function isExtensionConnected(userId: string): boolean {
+  const ws = extensionConnections.get(userId)
+  const connected = !!ws && ws.readyState === WebSocket.OPEN
+  console.log(`isExtensionConnected(${userId}): ${connected}, total: ${extensionConnections.size}`)
+  return connected
+}
+
+async function drainQueueForUser(userId: string) {
+  const { data: queuedTasks } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('status', 'queued')
+    .order('created_at', { ascending: true })
+
+  if (!queuedTasks?.length) return
+  console.log(`🔄 Draining ${queuedTasks.length} queued tasks for ${userId}`)
+
+  const { runTaskInBackground } = await import('./routes/tasks.js')
+  for (const task of queuedTasks) {
+    await supabase
+      .from('tasks')
+      .update({ status: 'running' })
+      .eq('id', task.id)
+    runTaskInBackground(task.id, task.prompt, userId)
+  }
+}
+
+server.listen(PORT, async () => {
+  console.log(`✅ Felo backend running on port ${PORT}`)
+  console.log(`✅ Supabase URL: ${process.env.SUPABASE_URL}`)
+
+  // Load all recurring scheduled tasks on startup
+  const { loadScheduledTasks } = await import('./lib/scheduler.js')
+  const { runTaskInBackground } = await import('./routes/tasks.js')
+  await loadScheduledTasks(runTaskInBackground)
+})
+
+
+=== src\lib\agent-extension.ts ===
+import OpenAI from 'openai'
+import { chromium } from 'playwright'
+import type { Browser, Page } from 'playwright'
+import { isProviderConnected } from './api-caller.js'
+import { createMessage } from './scheduler.js'
+import { supabase } from './supabase.js'
+import * as gmail from './integrations/gmail.js'
+import * as notion from './integrations/notion.js'
+import * as slack from './integrations/slack.js'
+import * as github from './integrations/github.js'
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const runningTasks = new Set<string>()
+
+// ─── Playwright browser (headed, visible window) ───
+
+let browser: Browser | null = null
+
+async function getBrowser(): Promise<Browser> {
+  if (!browser || !browser.isConnected()) {
+    browser = await chromium.launch({
+      headless: true, // Railway has no X server, use headless
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
+    })
+    console.log('[playwright] browser launched')
+  }
+  return browser
+}
+
+async function newPage(): Promise<Page> {
+  const b = await getBrowser()
+  const context = await b.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  })
+  return context.newPage()
+}
+
+async function closeBrowser(): Promise<void> {
+  if (browser && browser.isConnected()) {
+    await browser.close()
+    browser = null
+    console.log('[playwright] browser closed')
+  }
+}
+
+// ─── Snapshot / role-ref system ───
+
+type RoleRef = { role: string; name?: string; nth?: number }
+type RoleRefMap = Record<string, RoleRef>
+
+const INTERACTIVE_ROLES = new Set([
+  'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox', 'listbox',
+  'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'searchbox',
+  'slider', 'spinbutton', 'switch', 'tab', 'treeitem'
+])
+
+const tabRoleRefs = new Map<string, { refs: RoleRefMap; url: string }>()
+
+function buildRoleRefsFromSnapshot(ariaSnapshot: string): { snapshot: string; refs: RoleRefMap } {
+  const lines = ariaSnapshot.split('\n')
+  const refs: RoleRefMap = {}
+  const counts = new Map<string, number>()
+  const refsByKey = new Map<string, string[]>()
+  const out: string[] = []
+  let counter = 0
+
+  for (const line of lines) {
+    const match = line.match(/^(\s*-\s*)(\w+)(?:\s+"([^"]*)")?(.*)$/)
+    if (!match) { out.push(line); continue }
+    const [, prefix, roleRaw, name, suffix] = match
+    const role = roleRaw.toLowerCase()
+    if (!INTERACTIVE_ROLES.has(role)) { out.push(line); continue }
+
+    counter++
+    const ref = `e${counter}`
+    const key = `${role}:${name ?? ''}`
+    const nth = counts.get(key) ?? 0
+    counts.set(key, nth + 1)
+    const existing = refsByKey.get(key) ?? []
+    existing.push(ref)
+    refsByKey.set(key, existing)
+
+    refs[ref] = { role, name: name || undefined, nth }
+    let enhanced = `${prefix}${roleRaw}`
+    if (name) enhanced += ` "${name}"`
+    enhanced += ` [ref=${ref}]`
+    if (nth > 0) enhanced += ` [nth=${nth}]`
+    if (suffix) enhanced += suffix
+    out.push(enhanced)
+  }
+
+  for (const [, refList] of refsByKey) {
+    if (refList.length <= 1) {
+      for (const r of refList) { if (refs[r]) delete refs[r].nth }
+    }
+  }
+
+  return { snapshot: out.join('\n') || '(no interactive elements)', refs }
+}
+
+async function snapshotPage(page: Page, tabKey: string): Promise<string> {
+  const ariaSnapshot = await page.locator(':root').ariaSnapshot({ timeout: 10_000 })
+  const url = page.url()
+  const { snapshot, refs } = buildRoleRefsFromSnapshot(ariaSnapshot)
+  tabRoleRefs.set(tabKey, { refs, url })
+  return `URL: ${url}\n${snapshot}`
+}
+
+function refLocator(page: Page, ref: string, tabKey: string) {
+  const stored = tabRoleRefs.get(tabKey)
+  if (!stored?.refs[ref]) {
+    throw new Error(`Unknown ref "${ref}". Call browser_snapshot first to get current refs.`)
+  }
+  const { role, name, nth } = stored.refs[ref]
+  const locator = name
+    ? page.getByRole(role as any, { name, exact: true })
+    : page.getByRole(role as any)
+  return (nth !== undefined && nth > 0) ? locator.nth(nth) : locator
+}
+
+// ─── Tools ───
+
+const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'browser_snapshot',
+      description: 'Read the current page state. Returns all interactive elements with ref IDs like e1, e2. ALWAYS call this first before any action, and after every action to confirm what changed.',
+      parameters: { type: 'object', properties: {}, required: [] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_navigate',
+      description: 'Navigate the current tab to a URL.',
+      parameters: {
+        type: 'object',
+        properties: { url: { type: 'string', description: 'Full URL including https://' } },
+        required: ['url']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_click',
+      description: 'Click an element by its ref from the last snapshot.',
+      parameters: {
+        type: 'object',
+        properties: { ref: { type: 'string', description: 'Ref like e1, e2 from snapshot' } },
+        required: ['ref']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_type',
+      description: 'Type text into a textbox or input field.',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref: { type: 'string' },
+          text: { type: 'string' },
+          submit: { type: 'boolean', description: 'Press Enter after typing' }
+        },
+        required: ['ref', 'text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_key',
+      description: 'Press a keyboard key. Examples: Enter, Tab, Escape, ArrowDown.',
+      parameters: {
+        type: 'object',
+        properties: { key: { type: 'string' } },
+        required: ['key']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_scroll',
+      description: 'Scroll the page up or down.',
+      parameters: {
+        type: 'object',
+        properties: {
+          direction: { type: 'string', enum: ['up', 'down'] },
+          amount: { type: 'number', description: 'Pixels to scroll, default 300' }
+        },
+        required: ['direction']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_wait',
+      description: 'Wait for milliseconds or for text to appear on page.',
+      parameters: {
+        type: 'object',
+        properties: {
+          ms: { type: 'number' },
+          text: { type: 'string' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'task_complete',
+      description: 'Mark task as done. Only call after visual confirmation the action succeeded — post appeared, form submitted, item created.',
+      parameters: {
+        type: 'object',
+        properties: { summary: { type: 'string', description: 'What was accomplished' } },
+        required: ['summary']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'task_failed',
+      description: 'Mark task as failed after exhausting all approaches.',
+      parameters: {
+        type: 'object',
+        properties: { reason: { type: 'string' } },
+        required: ['reason']
+      }
+    }
+  },
+  // ── Integrations ──
+  { type: 'function', function: { name: 'gmail_list', description: 'List recent Gmail emails', parameters: { type: 'object', properties: { maxResults: { type: 'number' } } } } },
+  { type: 'function', function: { name: 'gmail_send', description: 'Send email via Gmail', parameters: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'subject', 'body'] } } },
+  { type: 'function', function: { name: 'gmail_read', description: 'Read a Gmail email by ID', parameters: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'] } } },
+  { type: 'function', function: { name: 'gmail_summarize', description: 'Summarize recent emails', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'notion_create_page', description: 'Create Notion page', parameters: { type: 'object', properties: { parentId: { type: 'string' }, title: { type: 'string' }, content: { type: 'string' } }, required: ['parentId', 'title', 'content'] } } },
+  { type: 'function', function: { name: 'notion_list_databases', description: 'List Notion databases', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'notion_query_database', description: 'Query Notion database', parameters: { type: 'object', properties: { databaseId: { type: 'string' } }, required: ['databaseId'] } } },
+  { type: 'function', function: { name: 'slack_send', description: 'Send Slack message', parameters: { type: 'object', properties: { channel: { type: 'string' }, text: { type: 'string' } }, required: ['channel', 'text'] } } },
+  { type: 'function', function: { name: 'slack_list_channels', description: 'List Slack channels', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'slack_read_messages', description: 'Read Slack messages', parameters: { type: 'object', properties: { channel: { type: 'string' }, limit: { type: 'number' } }, required: ['channel'] } } },
+  { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
+  { type: 'function', function: { name: 'github_list_repos', description: 'List GitHub repos', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'github_list_issues', description: 'List GitHub issues', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' } }, required: ['owner', 'repo'] } } },
+]
+
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a Chrome browser.
+
+IMPORTANT RULES:
+- ALWAYS call browser_snapshot before any action and after every action to see what changed
+- NEVER try to log in or create accounts — assume you are already logged in. If a page asks for login, check the current state first by taking a snapshot.
+- NEVER call task_complete just because you clicked something — wait for visual confirmation
+- If an element ref is stale, call browser_snapshot again to get fresh refs
+- If something fails twice, try a completely different approach
+- Do NOT attempt to login to any site — if login is required, report that login is needed and stop
+- For typing in contenteditable areas (like Twitter/X post box), click first then type`
+
+// ─── Agent loop ───
+
+async function runAgentLoop(opts: {
+  userId: string
+  taskId: string
+  taskPrompt: string
+  page: Page
+  tabKey: string
+  onProgress: (msg: string) => Promise<void>
+}): Promise<{ success: boolean; summary: string }> {
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: opts.taskPrompt }
+  ]
+
+  const MAX_ITERATIONS = 20
+  const deadline = Date.now() + 90_000
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let iterations = 0
+    while (iterations < MAX_ITERATIONS && Date.now() < deadline) {
+      iterations++
+
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages,
+        tools: browserTools,
+        tool_choice: 'required',
+        max_tokens: 1000,
+      })
+
+      const msg = response.choices[0].message
+      messages.push(msg)
+
+      if (!msg.tool_calls?.length) {
+        return { success: false, summary: 'Agent stopped unexpectedly' }
+      }
+
+      const toolResults: OpenAI.ChatCompletionToolMessageParam[] = []
+
+      // Only process if there are tool calls
+      if (!msg.tool_calls?.length) {
+        return { success: false, summary: 'Agent stopped unexpectedly' }
+      }
+
+      for (const toolCall of msg.tool_calls as any[]) {
+        const args = JSON.parse(toolCall.function.arguments || '{}')
+        let result: string
+
+        try {
+          switch (toolCall.function.name) {
+
+            case 'browser_snapshot': {
+              await opts.onProgress('📸 Reading page...')
+              result = await snapshotPage(opts.page, opts.tabKey)
+              break
+            }
+
+            case 'browser_navigate': {
+              await opts.onProgress(`🌐 Navigating to ${args.url}...`)
+              await opts.page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: 20_000 })
+              await opts.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+              result = await snapshotPage(opts.page, opts.tabKey)
+              result = `Navigated. Page is now:\n${result}`
+              break
+            }
+
+            case 'browser_click': {
+              await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
+              const locator = refLocator(opts.page, args.ref, opts.tabKey)
+              await locator.click({ timeout: 8000 })
+              await opts.page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {})
+              result = await snapshotPage(opts.page, opts.tabKey)
+              result = `Clicked. Page is now:\n${result}`
+              break
+            }
+
+            case 'browser_type': {
+              await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
+              const locator = refLocator(opts.page, args.ref, opts.tabKey)
+              await locator.fill(args.text, { timeout: 8000 })
+              if (args.submit) await locator.press('Enter')
+              result = await snapshotPage(opts.page, opts.tabKey)
+              result = `Typed. Page is now:\n${result}`
+              break
+            }
+
+            case 'browser_key': {
+              await opts.onProgress(`⌨️ Pressing ${args.key}...`)
+              await opts.page.keyboard.press(args.key)
+              result = `Pressed ${args.key}`
+              break
+            }
+
+            case 'browser_scroll': {
+              await opts.page.mouse.wheel(0, args.direction === 'down' ? (args.amount ?? 300) : -(args.amount ?? 300))
+              result = `Scrolled ${args.direction}`
+              break
+            }
+
+            case 'browser_wait': {
+              if (args.ms) await opts.page.waitForTimeout(args.ms)
+              if (args.text) await opts.page.getByText(args.text).first().waitFor({ state: 'visible', timeout: 5000 })
+              result = 'Done waiting'
+              break
+            }
+
+            case 'task_complete': {
+              await opts.onProgress(`✅ ${args.summary}`)
+              return { success: true, summary: args.summary }
+            }
+
+            case 'task_failed': {
+              if (attempt === 0) {
+                await opts.onProgress(`⚠️ Retrying: ${args.reason}`)
+                messages.length = 2
+                messages[1] = { role: 'user', content: `${opts.taskPrompt}\n\nFirst attempt failed: ${args.reason}. Try a different approach.` }
+              } else {
+                await opts.onProgress(`❌ ${args.reason}`)
+                return { success: false, summary: args.reason }
+              }
+              result = 'Retrying with different approach'
+              break
+            }
+
+            // ── Integrations ──
+            case 'gmail_list': {
+              if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
+              result = JSON.stringify(await gmail.listEmails(opts.userId, { maxResults: args.maxResults || 10 }), null, 2)
+              break
+            }
+            case 'gmail_send': {
+              if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
+              await gmail.sendEmail(opts.userId, args.to, args.subject, args.body)
+              result = `Email sent to ${args.to}`
+              break
+            }
+            case 'gmail_read': {
+              if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
+              result = (await gmail.getEmailContent(opts.userId, args.messageId)).slice(0, 2000)
+              break
+            }
+            case 'gmail_summarize': {
+              if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
+              result = await gmail.summarizeEmails(opts.userId)
+              break
+            }
+            case 'notion_create_page': {
+              if (!await isProviderConnected(opts.userId, 'notion')) { result = 'Notion not connected'; break }
+              await notion.createPage(opts.userId, args.parentId, args.title, args.content)
+              result = `Created page: ${args.title}`
+              break
+            }
+            case 'notion_list_databases': {
+              if (!await isProviderConnected(opts.userId, 'notion')) { result = 'Notion not connected'; break }
+              result = JSON.stringify(await notion.listDatabases(opts.userId), null, 2)
+              break
+            }
+            case 'notion_query_database': {
+              if (!await isProviderConnected(opts.userId, 'notion')) { result = 'Notion not connected'; break }
+              result = JSON.stringify(await notion.queryDatabase(opts.userId, args.databaseId), null, 2)
+              break
+            }
+            case 'slack_send': {
+              if (!await isProviderConnected(opts.userId, 'slack')) { result = 'Slack not connected'; break }
+              await slack.sendMessage(opts.userId, args.channel, args.text)
+              result = `Sent to ${args.channel}`
+              break
+            }
+            case 'slack_list_channels': {
+              if (!await isProviderConnected(opts.userId, 'slack')) { result = 'Slack not connected'; break }
+              result = JSON.stringify(await slack.listChannels(opts.userId), null, 2)
+              break
+            }
+            case 'slack_read_messages': {
+              if (!await isProviderConnected(opts.userId, 'slack')) { result = 'Slack not connected'; break }
+              result = JSON.stringify(await slack.getMessages(opts.userId, args.channel, args.limit || 10), null, 2)
+              break
+            }
+            case 'github_create_issue': {
+              if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
+              result = `Created issue: ${args.title}`
+              break
+            }
+            case 'github_list_repos': {
+              if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
+              result = JSON.stringify(await github.listRepos(opts.userId), null, 2)
+              break
+            }
+            case 'github_list_issues': {
+              if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
+              result = JSON.stringify(await github.listIssues(opts.userId, args.owner, args.repo, args.state || 'open'), null, 2)
+              break
+            }
+
+            default:
+              result = `Unknown tool: ${toolCall.function.name}`
+          }
+        } catch (err) {
+          result = `Error: ${err instanceof Error ? err.message : String(err)}`
+          await opts.onProgress(`⚠️ ${result}`)
+        }
+
+        // FIX: Each tool result must directly follow its tool_call in the messages array
+        // We already pushed the assistant message with tool_calls above, now push tool result
+        toolResults.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: result,
+        })
+      }
+
+      messages.push(...toolResults)
+    }
+  }
+
+  return { success: false, summary: 'Exceeded max iterations' }
+}
+
+// ─── Entry point ───
+
+type StepLog = { step: number; description: string; action: string; success: boolean; errorMsg?: string }
+
+export async function runAgentWithExtension(
+  task: string,
+  userId: string,
+  onStep: (step: string) => Promise<void>,
+  taskId?: string
+): Promise<string> {
+  const taskKey = taskId || `${userId}:${task.slice(0, 50)}`
+  if (runningTasks.has(taskKey)) throw new Error(`Task already running`)
+  runningTasks.add(taskKey)
+
+  const startTime = Date.now()
+  const stepsLog: StepLog[] = []
+  let status: 'success' | 'error' = 'success'
+  let resultSummary = ''
+
+  try {
+    await onStep('☁️ Starting cloud browser...')
+    const page = await newPage()
+    const tabKey = `${userId}:${Date.now()}`
+
+    const result = await runAgentLoop({
+      userId,
+      taskId: taskId || taskKey,
+      taskPrompt: task,
+      page,
+      tabKey,
+      onProgress: async (msg) => {
+        stepsLog.push({ step: stepsLog.length + 1, description: msg, action: msg, success: !msg.startsWith('⚠️') && !msg.startsWith('❌') })
+        await onStep(msg)
+      }
+    })
+
+    status = result.success ? 'success' : 'error'
+    resultSummary = result.summary
+    if (taskId) await createMessage(userId, taskId, result.success ? `✅ ${resultSummary}` : resultSummary.slice(0, 300))
+    return resultSummary
+
+  } catch (err) {
+    status = 'error'
+    resultSummary = err instanceof Error ? err.message : String(err)
+    if (taskId) await createMessage(userId, taskId, resultSummary.slice(0, 300))
+    return resultSummary
+
+  } finally {
+    runningTasks.delete(taskKey)
+    
+    // Close browser after task completes
+    await closeBrowser()
+    
+    try {
+      await supabase.from('task_executions').insert({
+        user_id: userId, task_id: taskId || null, task_prompt: task, plan: [],
+        status, result_summary: resultSummary.slice(0, 1000), steps_log: stepsLog,
+        started_at: new Date(startTime).toISOString(),
+        completed_at: new Date().toISOString(),
+        duration_ms: Date.now() - startTime
+      })
+    } catch (e) { console.error('task_executions insert failed:', e) }
+  }
+}
+
+=== src\lib\agent.ts ===
+import OpenAI from 'openai'
+import type { Page } from 'playwright'
+import { isProviderConnected } from './api-caller.js'
+import * as gmail from './integrations/gmail.js'
+import * as notion from './integrations/notion.js'
+import * as slack from './integrations/slack.js'
+import * as github from './integrations/github.js'
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+const SYSTEM_PROMPT = `You are a browser automation agent. Complete the user's task using browser tools.
+Rules:
+- Always navigate to the right URL first
+- Use snapshot to read page content before interacting
+- Use extract to pull specific data from pages
+- Complete tasks in minimum steps
+- When you have the result call done immediately
+- If a step fails try a different approach`
+
+const tools: OpenAI.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'navigate',
+      description: 'Navigate to a URL',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string' }
+        },
+        required: ['url']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'snapshot',
+      description: 'Get visible text content of the current page',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'click',
+      description: 'Click an element on the page',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string' }
+        },
+        required: ['selector']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'type',
+      description: 'Type text into an input field',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string' },
+          text: { type: 'string' }
+        },
+        required: ['selector', 'text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'extract',
+      description: 'Extract specific data from the current page',
+      parameters: {
+        type: 'object',
+        properties: {
+          instruction: { type: 'string' }
+        },
+        required: ['instruction']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gmail_list',
+      description: 'List recent emails from Gmail',
+      parameters: {
+        type: 'object',
+        properties: {
+          maxResults: { type: 'number' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gmail_send',
+      description: 'Send an email via Gmail',
+      parameters: {
+        type: 'object',
+        properties: {
+          to: { type: 'string' },
+          subject: { type: 'string' },
+          body: { type: 'string' }
+        },
+        required: ['to', 'subject', 'body']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gmail_read',
+      description: 'Get content of a specific email',
+      parameters: {
+        type: 'object',
+        properties: {
+          messageId: { type: 'string' }
+        },
+        required: ['messageId']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gmail_summarize',
+      description: 'Get a summary of recent emails',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_create_page',
+      description: 'Create a new page in Notion',
+      parameters: {
+        type: 'object',
+        properties: {
+          parentId: { type: 'string' },
+          title: { type: 'string' },
+          content: { type: 'string' }
+        },
+        required: ['parentId', 'title', 'content']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_list_databases',
+      description: 'List Notion databases',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_query_database',
+      description: 'Query a Notion database',
+      parameters: {
+        type: 'object',
+        properties: {
+          databaseId: { type: 'string' }
+        },
+        required: ['databaseId']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'slack_send',
+      description: 'Send a message to a Slack channel',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel: { type: 'string' },
+          text: { type: 'string' }
+        },
+        required: ['channel', 'text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'slack_list_channels',
+      description: 'List Slack channels',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'slack_read_messages',
+      description: 'Read recent messages from a Slack channel',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel: { type: 'string' },
+          limit: { type: 'number' }
+        },
+        required: ['channel']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_create_issue',
+      description: 'Create a GitHub issue',
+      parameters: {
+        type: 'object',
+        properties: {
+          owner: { type: 'string' },
+          repo: { type: 'string' },
+          title: { type: 'string' },
+          body: { type: 'string' }
+        },
+        required: ['owner', 'repo', 'title', 'body']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_list_repos',
+      description: 'List GitHub repositories',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_list_issues',
+      description: 'List GitHub issues in a repository',
+      parameters: {
+        type: 'object',
+        properties: {
+          owner: { type: 'string' },
+          repo: { type: 'string' },
+          state: { type: 'string' }
+        },
+        required: ['owner', 'repo']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'done',
+      description: 'Signal task is complete with the final result',
+      parameters: {
+        type: 'object',
+        properties: {
+          result: { type: 'string' }
+        },
+        required: ['result']
+      }
+    }
+  }
+]
+
+async function executeTool(name: string, args: Record<string, string>, page: Page, userId: string): Promise<string> {
+  switch (name) {
+    case 'navigate': {
+      await page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: 15000 })
+      return `Navigated to ${args.url}`
+    }
+    case 'snapshot': {
+      const text = await page.evaluate(() => document.body.innerText)
+      return text.slice(0, 3000)
+    }
+    case 'click': {
+      try {
+        await page.click(args.selector, { timeout: 5000 })
+      } catch {
+        await page.getByText(args.selector).first().click({ timeout: 5000 })
+      }
+      return `Clicked ${args.selector}`
+    }
+    case 'type': {
+      await page.fill(args.selector, args.text)
+      return `Typed into ${args.selector}`
+    }
+    case 'extract': {
+      const html = await page.evaluate(() => document.body.innerHTML)
+      const r = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Extract the requested data from the HTML. Be concise.' },
+          { role: 'user', content: `${args.instruction}\n\nHTML:\n${html.slice(0, 8000)}` }
+        ],
+        max_tokens: 500
+      })
+      return r.choices[0].message.content || 'Nothing extracted'
+    }
+    case 'gmail_list': {
+      const connected = await isProviderConnected(userId, 'gmail')
+      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
+      try {
+        const result = await gmail.listEmails(userId, { maxResults: parseInt(args.maxResults) || 10 })
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Gmail error: ${String(err)}`
+      }
+    }
+    case 'gmail_send': {
+      const connected = await isProviderConnected(userId, 'gmail')
+      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
+      try {
+        await gmail.sendEmail(userId, args.to, args.subject, args.body)
+        return `Email sent to ${args.to}`
+      } catch (err) {
+        return `Gmail error: ${String(err)}`
+      }
+    }
+    case 'gmail_read': {
+      const connected = await isProviderConnected(userId, 'gmail')
+      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
+      try {
+        const content = await gmail.getEmailContent(userId, args.messageId)
+        return content.slice(0, 2000)
+      } catch (err) {
+        return `Gmail error: ${String(err)}`
+      }
+    }
+    case 'gmail_summarize': {
+      const connected = await isProviderConnected(userId, 'gmail')
+      if (!connected) return 'Gmail not connected. Ask user to connect Gmail.'
+      try {
+        return await gmail.summarizeEmails(userId)
+      } catch (err) {
+        return `Gmail error: ${String(err)}`
+      }
+    }
+    case 'notion_create_page': {
+      const connected = await isProviderConnected(userId, 'notion')
+      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
+      try {
+        await notion.createPage(userId, args.parentId as any, args.title, args.content)
+        return `Created Notion page: ${args.title}`
+      } catch (err) {
+        return `Notion error: ${String(err)}`
+      }
+    }
+    case 'notion_list_databases': {
+      const connected = await isProviderConnected(userId, 'notion')
+      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
+      try {
+        const result = await notion.listDatabases(userId)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Notion error: ${String(err)}`
+      }
+    }
+    case 'notion_query_database': {
+      const connected = await isProviderConnected(userId, 'notion')
+      if (!connected) return 'Notion not connected. Ask user to connect Notion.'
+      try {
+        const result = await notion.queryDatabase(userId, args.databaseId)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Notion error: ${String(err)}`
+      }
+    }
+    case 'slack_send': {
+      const connected = await isProviderConnected(userId, 'slack')
+      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
+      try {
+        await slack.sendMessage(userId, args.channel, args.text)
+        return `Sent message to ${args.channel}`
+      } catch (err) {
+        return `Slack error: ${String(err)}`
+      }
+    }
+    case 'slack_list_channels': {
+      const connected = await isProviderConnected(userId, 'slack')
+      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
+      try {
+        const result = await slack.listChannels(userId)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Slack error: ${String(err)}`
+      }
+    }
+    case 'slack_read_messages': {
+      const connected = await isProviderConnected(userId, 'slack')
+      if (!connected) return 'Slack not connected. Ask user to connect Slack.'
+      try {
+        const result = await slack.getMessages(userId, args.channel, parseInt(args.limit) || 10)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `Slack error: ${String(err)}`
+      }
+    }
+    case 'github_create_issue': {
+      const connected = await isProviderConnected(userId, 'github')
+      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
+      try {
+        const result = await github.createIssue(userId, args.owner, args.repo, args.title, args.body)
+        return `Created GitHub issue: ${args.title}`
+      } catch (err) {
+        return `GitHub error: ${String(err)}`
+      }
+    }
+    case 'github_list_repos': {
+      const connected = await isProviderConnected(userId, 'github')
+      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
+      try {
+        const result = await github.listRepos(userId)
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `GitHub error: ${String(err)}`
+      }
+    }
+    case 'github_list_issues': {
+      const connected = await isProviderConnected(userId, 'github')
+      if (!connected) return 'GitHub not connected. Ask user to connect GitHub.'
+      try {
+        const result = await github.listIssues(userId, args.owner, args.repo, args.state || 'open')
+        return JSON.stringify(result, null, 2)
+      } catch (err) {
+        return `GitHub error: ${String(err)}`
+      }
+    }
+    case 'done': {
+      return `DONE:${args.result}`
+    }
+    default:
+      return `Unknown tool: ${name}`
+  }
+}
+
+export async function runAgent(
+  task: string,
+  page: Page,
+  onStep: (step: string) => Promise<void>,
+  userId: string
+): Promise<string> {
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: task }
+  ]
+
+  for (let i = 0; i < 20; i++) {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages,
+      tools,
+      max_tokens: 500
+    })
+
+    const choice = response.choices[0]
+
+    if (choice.finish_reason === 'stop') {
+      return choice.message.content || 'Task completed'
+    }
+
+    if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls && choice.message.tool_calls.length > 0) {
+      messages.push(choice.message)
+
+      for (const toolCall of choice.message.tool_calls!) {
+        const functionCall = toolCall as any
+        const name = functionCall.function.name
+        const args = JSON.parse(functionCall.function.arguments)
+
+        const emojis: Record<string, string> = {
+          navigate: '🌐', snapshot: '👁️', click: '👆',
+          type: '⌨️', extract: '🔍', done: '✅',
+          gmail_list: '📧', gmail_send: '✉️', gmail_read: '📬', gmail_summarize: '📨',
+          notion_create_page: '📝', notion_list_databases: '🗄️', notion_query_database: '🔎',
+          slack_send: '💬', slack_list_channels: '📡', slack_read_messages: '💭',
+          github_create_issue: '🐛', github_list_repos: '📦', github_list_issues: '📋'
+        }
+
+        await onStep(`${emojis[name] || '⚙️'} ${name}: ${JSON.stringify(args)}`)
+
+        const result = await executeTool(name, args, page, userId)
+
+        if (result.startsWith('DONE:')) {
+          return result.replace('DONE:', '')
+        }
+
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: result
+        })
+      }
+    }
+  }
+
+  return 'Max iterations reached'
+}
+
+
+=== src\lib\api-caller.ts ===
+import { createClient } from '@supabase/supabase-js'
+import { OAUTH_CONFIG, OAuthProvider } from './oauth-config.js'
+import { encrypt, decrypt } from './encryption.js'
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+)
+
+export interface TokenData {
+  accessToken: string
+  expiresAt?: string
+}
+
+export async function getAndRefreshToken(
+  userId: string,
+  provider: OAuthProvider
+): Promise<TokenData | null> {
+  try {
+    const { data, error } = await supabase
+      .from('oauth_tokens')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('provider', provider)
+      .single()
+
+    if (error || !data) {
+      console.log(`No token found for ${provider}/${userId}`)
+      return null
+    }
+
+    let accessToken = decrypt(data.access_token)
+    let expiresAt = data.expires_at
+
+    // Check if token needs refresh (within 5 minutes of expiry)
+    if (expiresAt && data.refresh_token) {
+      const expiresTime = new Date(expiresAt).getTime()
+      const fiveMinutes = 5 * 60 * 1000
+      if (expiresTime - Date.now() < fiveMinutes) {
+        try {
+          const config = OAUTH_CONFIG[provider]
+          const refreshRes = await fetch(config.tokenUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              grant_type: 'refresh_token',
+              refresh_token: decrypt(data.refresh_token),
+              client_id: config.clientId,
+              client_secret: config.clientSecret
+            }).toString()
+          })
+
+          const refreshed = await refreshRes.json()
+          if (refreshed.access_token) {
+            accessToken = refreshed.access_token
+            expiresAt = new Date(Date.now() + refreshed.expires_in * 1000).toISOString()
+
+            // Update in database
+            await supabase
+              .from('oauth_tokens')
+              .update({
+                access_token: encrypt(refreshed.access_token),
+                expires_at: expiresAt,
+                updated_at: new Date().toISOString()
+              })
+              .eq('user_id', userId)
+              .eq('provider', provider)
+
+            console.log(`Refreshed ${provider} token for ${userId}`)
+          }
+        } catch (refreshErr) {
+          console.error(`Token refresh failed for ${provider}:`, refreshErr)
+          // Continue with current token
+        }
+      }
+    }
+
+    return { accessToken, expiresAt }
+  } catch (err) {
+    console.error(`getAndRefreshToken error for ${provider}:`, err)
+    return null
+  }
+}
+
+export async function makeApiCall(
+  url: string,
+  options: {
+    method?: string
+    headers?: Record<string, string>
+    body?: any
+    authorization?: string
+  } = {}
+): Promise<any> {
+  const headers = {
+    'Content-Type': 'application/json',
+    ...options.headers
+  }
+
+  if (options.authorization) {
+    headers['Authorization'] = options.authorization
+  }
+
+  const response = await fetch(url, {
+    method: options.method || 'GET',
+    headers,
+    ...(options.body && { body: JSON.stringify(options.body) })
+  })
+
+  const text = await response.text()
+  if (!response.ok) {
+    throw new Error(`API call failed (${response.status}): ${text}`)
+  }
+
+  return text ? JSON.parse(text) : null
+}
+
+export async function isProviderConnected(
+  userId: string,
+  provider: OAuthProvider
+): Promise<boolean> {
+  const token = await getAndRefreshToken(userId, provider)
+  return token !== null
+}
+
+
+=== src\lib\browser.ts ===
+import { chromium } from 'playwright'
+import type { Browser, Page } from 'playwright'
+
+let browser: Browser | null = null
+
+export async function getBrowser(): Promise<Browser> {
+  if (!browser || !browser.isConnected()) {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
+    })
+    console.log('🌐 Browser launched')
+  }
+  return browser
+}
+
+export async function newPage(): Promise<Page> {
+  const b = await getBrowser()
+  const context = await b.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  })
+  return context.newPage()
+}
+
+
+=== src\lib\encryption.ts ===
+import crypto from 'crypto'
+
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY!
+const ALGORITHM = 'aes-256-gcm'
+
+export function encrypt(text: string): string {
+  const iv = crypto.randomBytes(16)
+  const key = Buffer.from(ENCRYPTION_KEY, 'hex')
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv)
+  let encrypted = cipher.update(text, 'utf8', 'hex')
+  encrypted += cipher.final('hex')
+  const authTag = cipher.getAuthTag().toString('hex')
+  return `${iv.toString('hex')}:${authTag}:${encrypted}`
+}
+
+export function decrypt(text: string): string {
+  const [ivHex, authTagHex, encrypted] = text.split(':')
+  const iv = Buffer.from(ivHex, 'hex')
+  const authTag = Buffer.from(authTagHex, 'hex')
+  const key = Buffer.from(ENCRYPTION_KEY, 'hex')
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv)
+  decipher.setAuthTag(authTag)
+  let decrypted = decipher.update(encrypted, 'hex', 'utf8')
+  decrypted += decipher.final('utf8')
+  return decrypted
+}
+
+
+=== src\lib\integrations\github.ts ===
+import { getAndRefreshToken, makeApiCall } from '../api-caller.js'
+
+const GITHUB_API_BASE = 'https://api.github.com'
+
+export async function listRepos(userId: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'github')
+  if (!token) throw new Error('GitHub not connected')
+
+  return makeApiCall(`${GITHUB_API_BASE}/user/repos?per_page=50&sort=updated`, {
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'X-GitHub-Api-Version': '2022-11-28' }
+  })
+}
+
+export async function createIssue(
+  userId: string,
+  owner: string,
+  repo: string,
+  title: string,
+  body: string
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'github')
+  if (!token) throw new Error('GitHub not connected')
+
+  return makeApiCall(`${GITHUB_API_BASE}/repos/${owner}/${repo}/issues`, {
+    method: 'POST',
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'X-GitHub-Api-Version': '2022-11-28' },
+    body: { title, body }
+  })
+}
+
+export async function listIssues(
+  userId: string,
+  owner: string,
+  repo: string,
+  state = 'open'
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'github')
+  if (!token) throw new Error('GitHub not connected')
+
+  return makeApiCall(`${GITHUB_API_BASE}/repos/${owner}/${repo}/issues?state=${state}&per_page=50`, {
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'X-GitHub-Api-Version': '2022-11-28' }
+  })
+}
+
+export async function getIssue(
+  userId: string,
+  owner: string,
+  repo: string,
+  issueNumber: number
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'github')
+  if (!token) throw new Error('GitHub not connected')
+
+  return makeApiCall(`${GITHUB_API_BASE}/repos/${owner}/${repo}/issues/${issueNumber}`, {
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'X-GitHub-Api-Version': '2022-11-28' }
+  })
+}
+
+export async function addCommentToIssue(
+  userId: string,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  body: string
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'github')
+  if (!token) throw new Error('GitHub not connected')
+
+  return makeApiCall(`${GITHUB_API_BASE}/repos/${owner}/${repo}/issues/${issueNumber}/comments`, {
+    method: 'POST',
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'X-GitHub-Api-Version': '2022-11-28' },
+    body: { body }
+  })
+}
+
+export async function getUser(userId: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'github')
+  if (!token) throw new Error('GitHub not connected')
+
+  return makeApiCall(`${GITHUB_API_BASE}/user`, {
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'X-GitHub-Api-Version': '2022-11-28' }
+  })
+}
+
+
+=== src\lib\integrations\gmail.ts ===
+import { getAndRefreshToken, makeApiCall } from '../api-caller.js'
+
+const GMAIL_API_BASE = 'https://www.googleapis.com/gmail/v1/users/me'
+
+export async function listEmails(
+  userId: string,
+  options: { maxResults?: number; q?: string } = {}
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'gmail')
+  if (!token) throw new Error('Gmail not connected')
+
+  const params = new URLSearchParams({
+    maxResults: String(options.maxResults || 10),
+    ...(options.q && { q: options.q })
+  })
+
+  return makeApiCall(`${GMAIL_API_BASE}/messages?${params}`, {
+    authorization: `Bearer ${token.accessToken}`
+  })
+}
+
+export async function getEmail(userId: string, messageId: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'gmail')
+  if (!token) throw new Error('Gmail not connected')
+
+  return makeApiCall(`${GMAIL_API_BASE}/messages/${messageId}`, {
+    authorization: `Bearer ${token.accessToken}`
+  })
+}
+
+export async function sendEmail(
+  userId: string,
+  to: string,
+  subject: string,
+  body: string
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'gmail')
+  if (!token) throw new Error('Gmail not connected')
+
+  // Create RFC 2822 formatted message
+  const message = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    body
+  ].join('\n')
+
+  const encodedMessage = Buffer.from(message).toString('base64').replace(/\+/g, '-').replace(/\//g, '_')
+
+  return makeApiCall(`${GMAIL_API_BASE}/messages/send`, {
+    method: 'POST',
+    authorization: `Bearer ${token.accessToken}`,
+    body: { raw: encodedMessage }
+  })
+}
+
+export async function getEmailContent(userId: string, messageId: string): Promise<string> {
+  const email = await getEmail(userId, messageId)
+  if (!email.payload?.parts) return email.snippet || ''
+
+  // Find text part
+  const textPart = email.payload.parts.find((p: any) => p.mimeType === 'text/plain')
+  if (!textPart) return email.snippet || ''
+
+  const data = textPart.body?.data || ''
+  return Buffer.from(data, 'base64').toString('utf-8')
+}
+
+export async function summarizeEmails(userId: string): Promise<string> {
+  const result = await listEmails(userId, { maxResults: 5 })
+  if (!result.messages || result.messages.length === 0) {
+    return 'No recent emails'
+  }
+
+  const summaries = []
+  for (const msg of result.messages.slice(0, 3)) {
+    const email = await getEmail(userId, msg.id)
+    const headers = email.payload?.headers || []
+    const subject = headers.find((h: any) => h.name === 'Subject')?.value || '(no subject)'
+    const from = headers.find((h: any) => h.name === 'From')?.value || '(unknown)'
+    summaries.push(`From: ${from} - Subject: ${subject}`)
+  }
+
+  return summaries.join('\n')
+}
+
+
+=== src\lib\integrations\notion.ts ===
+import { getAndRefreshToken, makeApiCall } from '../api-caller.js'
+
+const NOTION_API_BASE = 'https://api.notion.com/v1'
+const NOTION_API_VERSION = '2022-06-28'
+
+export async function listDatabases(userId: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'notion')
+  if (!token) throw new Error('Notion not connected')
+
+  return makeApiCall(`${NOTION_API_BASE}/search`, {
+    method: 'POST',
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'Notion-Version': NOTION_API_VERSION },
+    body: { filter: { property: 'object', value: 'database' }, page_size: 10 }
+  })
+}
+
+export async function createPage(
+  userId: string,
+  parentId: string,
+  title: string,
+  content: string
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'notion')
+  if (!token) throw new Error('Notion not connected')
+
+  return makeApiCall(`${NOTION_API_BASE}/pages`, {
+    method: 'POST',
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'Notion-Version': NOTION_API_VERSION },
+    body: {
+      parent: { database_id: parentId },
+      properties: {
+        title: {
+          title: [{ type: 'text', text: { content: title } }]
+        }
+      },
+      children: [
+        {
+          object: 'block',
+          type: 'paragraph',
+          paragraph: {
+            rich_text: [{ type: 'text', text: { content } }]
+          }
+        }
+      ]
+    }
+  })
+}
+
+export async function createPageInParent(
+  userId: string,
+  parentPageId: string,
+  title: string,
+  content: string
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'notion')
+  if (!token) throw new Error('Notion not connected')
+
+  return makeApiCall(`${NOTION_API_BASE}/pages`, {
+    method: 'POST',
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'Notion-Version': NOTION_API_VERSION },
+    body: {
+      parent: { page_id: parentPageId },
+      properties: {
+        title: {
+          title: [{ type: 'text', text: { content: title } }]
+        }
+      },
+      children: [
+        {
+          object: 'block',
+          type: 'paragraph',
+          paragraph: {
+            rich_text: [{ type: 'text', text: { content } }]
+          }
+        }
+      ]
+    }
+  })
+}
+
+export async function getPage(userId: string, pageId: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'notion')
+  if (!token) throw new Error('Notion not connected')
+
+  return makeApiCall(`${NOTION_API_BASE}/pages/${pageId}`, {
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'Notion-Version': NOTION_API_VERSION }
+  })
+}
+
+export async function appendBlocksToPage(
+  userId: string,
+  pageId: string,
+  blocks: any[]
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'notion')
+  if (!token) throw new Error('Notion not connected')
+
+  return makeApiCall(`${NOTION_API_BASE}/blocks/${pageId}/children`, {
+    method: 'PATCH',
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'Notion-Version': NOTION_API_VERSION },
+    body: { children: blocks }
+  })
+}
+
+export async function queryDatabase(userId: string, databaseId: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'notion')
+  if (!token) throw new Error('Notion not connected')
+
+  return makeApiCall(`${NOTION_API_BASE}/databases/${databaseId}/query`, {
+    method: 'POST',
+    authorization: `Bearer ${token.accessToken}`,
+    headers: { 'Notion-Version': NOTION_API_VERSION },
+    body: { page_size: 10 }
+  })
+}
+
+
+=== src\lib\integrations\slack.ts ===
+import { getAndRefreshToken, makeApiCall } from '../api-caller.js'
+
+const SLACK_API_BASE = 'https://slack.com/api'
+
+export async function sendMessage(
+  userId: string,
+  channel: string,
+  text: string
+): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'slack')
+  if (!token) throw new Error('Slack not connected')
+
+  return makeApiCall(`${SLACK_API_BASE}/chat.postMessage`, {
+    method: 'POST',
+    authorization: `Bearer ${token.accessToken}`,
+    body: { channel, text }
+  })
+}
+
+export async function listChannels(userId: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'slack')
+  if (!token) throw new Error('Slack not connected')
+
+  return makeApiCall(`${SLACK_API_BASE}/conversations.list?limit=50`, {
+    authorization: `Bearer ${token.accessToken}`
+  })
+}
+
+export async function getMessages(userId: string, channel: string, limit = 10): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'slack')
+  if (!token) throw new Error('Slack not connected')
+
+  return makeApiCall(`${SLACK_API_BASE}/conversations.history?channel=${channel}&limit=${limit}`, {
+    authorization: `Bearer ${token.accessToken}`
+  })
+}
+
+export async function getChannelInfo(userId: string, channel: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'slack')
+  if (!token) throw new Error('Slack not connected')
+
+  return makeApiCall(`${SLACK_API_BASE}/conversations.info?channel=${channel}`, {
+    authorization: `Bearer ${token.accessToken}`
+  })
+}
+
+export async function getUserInfo(userId: string): Promise<any> {
+  const token = await getAndRefreshToken(userId, 'slack')
+  if (!token) throw new Error('Slack not connected')
+
+  return makeApiCall(`${SLACK_API_BASE}/auth.test`, {
+    authorization: `Bearer ${token.accessToken}`
+  })
+}
+
+
+=== src\lib\nango.ts ===
+import { Nango } from '@nangohq/node'
+
+export const nango = new Nango({
+  secretKey: process.env.NANGO_SECRET_KEY!,
+  host: process.env.NANGO_HOST!
+})
+
+export const INTEGRATIONS = {
+  github: 'github-app',
+  googleCalendar: 'google-calendar',
+  gmail: 'google-mail',
+  googleSheets: 'google-sheet',
+  notion: 'notion',
+  slack: 'slack'
+} as const
+
+export type IntegrationId = typeof INTEGRATIONS[keyof typeof INTEGRATIONS]
+
+// Get connection token for a user and provider
+export async function getConnection(userId: string, integrationId: IntegrationId) {
+  try {
+    const connection = await nango.getConnection(integrationId, userId)
+    return connection
+  } catch {
+    return null
+  }
+}
+
+// Check if user has connected a specific integration
+export async function isConnected(userId: string, integrationId: IntegrationId): Promise<boolean> {
+  const connection = await getConnection(userId, integrationId)
+  return !!connection
+}
+
+// Make an authenticated API call through Nango proxy
+export async function proxyGet(
+  userId: string,
+  integrationId: IntegrationId,
+  endpoint: string
+) {
+  return await nango.get({
+    providerConfigKey: integrationId,
+    connectionId: userId,
+    endpoint
+  })
+}
+
+export async function proxyPost(
+  userId: string,
+  integrationId: IntegrationId,
+  endpoint: string,
+  data: object
+) {
+  return await nango.post({
+    providerConfigKey: integrationId,
+    connectionId: userId,
+    endpoint,
+    data
+  })
+}
+
+
+=== src\lib\oauth-config.ts ===
+export const OAUTH_CONFIG = {
+  gmail: {
+    clientId: process.env.GOOGLE_CLIENT_ID!,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    scopes: [
+      'https://www.googleapis.com/auth/gmail.readonly',
+      'https://www.googleapis.com/auth/gmail.send',
+      'openid',
+      'email'
+    ],
+    redirectUri: process.env.OAUTH_REDIRECT_BASE + '/gmail/callback'
+  },
+  'google-calendar': {
+    clientId: process.env.GOOGLE_CLIENT_ID!,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    scopes: [
+      'https://www.googleapis.com/auth/calendar.readonly',
+      'https://www.googleapis.com/auth/calendar.events',
+      'openid',
+      'email'
+    ],
+    redirectUri: process.env.OAUTH_REDIRECT_BASE + '/google-calendar/callback'
+  },
+  'google-sheets': {
+    clientId: process.env.GOOGLE_CLIENT_ID!,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    scopes: [
+      'https://www.googleapis.com/auth/spreadsheets',
+      'openid',
+      'email'
+    ],
+    redirectUri: process.env.OAUTH_REDIRECT_BASE + '/google-sheets/callback'
+  },
+  slack: {
+    clientId: process.env.SLACK_CLIENT_ID!,
+    clientSecret: process.env.SLACK_CLIENT_SECRET!,
+    authUrl: 'https://slack.com/oauth/v2/authorize',
+    tokenUrl: 'https://slack.com/api/oauth.v2.access',
+    scopes: ['channels:read', 'chat:write', 'users:read', 'im:read', 'im:history', 'channels:history'],
+    redirectUri: process.env.OAUTH_REDIRECT_BASE + '/slack/callback'
+  },
+  notion: {
+    clientId: process.env.NOTION_CLIENT_ID!,
+    clientSecret: process.env.NOTION_CLIENT_SECRET!,
+    authUrl: 'https://api.notion.com/v1/oauth/authorize',
+    tokenUrl: 'https://api.notion.com/v1/oauth/token',
+    scopes: [],
+    redirectUri: process.env.OAUTH_REDIRECT_BASE + '/notion/callback'
+  },
+  github: {
+    clientId: process.env.GITHUB_CLIENT_ID!,
+    clientSecret: process.env.GITHUB_CLIENT_SECRET!,
+    authUrl: 'https://github.com/login/oauth/authorize',
+    tokenUrl: 'https://github.com/login/oauth/access_token',
+    scopes: ['repo', 'read:user', 'user:email'],
+    redirectUri: process.env.OAUTH_REDIRECT_BASE + '/github/callback'
+  }
+} as const
+
+export type OAuthProvider = keyof typeof OAUTH_CONFIG
+
+
+=== src\lib\relay-server.ts ===
+import { createServer, Server } from 'http'
+import { WebSocketServer, WebSocket } from 'ws'
+import type { IncomingMessage } from 'http'
+
+interface RelayInfo {
+  server: Server
+  cdpWsUrl: string
+  port: number
+  _wss: WebSocketServer
+  _sessions: Map<string, Session>
+}
+
+const relayServers = new Map<string, RelayInfo>()
+
+// Real tab sessions announced by the extension via Target.attachedToTarget events
+const attachedTabs = new Map<string, { sessionId: string; targetId: string; tabId?: number }>()
+
+// Session map shared across all connections for this relay server instance
+type Session = { sessionId: string; tabId: number }
+
+// Forward declarations — index.ts provides these via setExtensionBridge
+let _getConnection: (userId: string) => WebSocket | undefined
+let _getPending: (userId: string) => Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }> | undefined
+let _getNextId: () => number
+
+export function setExtensionBridge(opts: {
+  getConnection: (userId: string) => WebSocket | undefined
+  getPending: (userId: string) => Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }> | undefined
+  getNextId: () => number
+}) {
+  _getConnection = opts.getConnection
+  _getPending = opts.getPending
+  _getNextId = opts.getNextId
+}
+
+function sendThroughRelay(
+  userId: string,
+  message: Record<string, unknown>
+): Promise<any> {
+  const ws = _getConnection(userId)
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    throw new Error('Extension not connected')
+  }
+  const pending = _getPending(userId)
+  if (!pending) throw new Error('No pending map for user')
+  const id = _getNextId()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id)
+      reject(new Error('CDP relay timeout'))
+    }, 15000)
+    pending.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v) },
+      reject: (e) => { clearTimeout(timer); reject(e) }
+    })
+    ws.send(JSON.stringify({ ...message, id }))
+  })
+}
+
+// Called by index.ts when the extension sends a CDP event
+export function handleExtensionEvent(userId: string, eventMethod: string, eventParams: any) {
+  const info = relayServers.get(userId)
+  if (!info) return
+
+  // Track real attached tabs
+  if (eventMethod === 'Target.attachedToTarget' && eventParams?.sessionId && eventParams?.targetInfo?.targetId) {
+    attachedTabs.set(eventParams.targetInfo.targetId, {
+      sessionId: eventParams.sessionId,
+      targetId: eventParams.targetInfo.targetId,
+      tabId: eventParams.targetInfo.tabId
+    })
+    // Register in sessions map so page-level CDP routing works
+    info._sessions.set(eventParams.sessionId, {
+      sessionId: eventParams.sessionId,
+      tabId: eventParams.targetInfo.tabId ?? 1
+    })
+  }
+
+  // Forward the event to all Playwright clients connected to this user's relay
+  const eventMsg = JSON.stringify({ method: eventMethod, params: eventParams })
+  for (const client of info._wss.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(eventMsg)
+    }
+  }
+}
+
+export async function startRelayServer(userId: string): Promise<RelayInfo> {
+  const existing = relayServers.get(userId)
+  if (existing) return existing
+
+  const server = createServer((req, res) => {
+    if (req.url === '/json/version' || req.url === '/json/version/') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+      res.end(JSON.stringify({
+        'Browser': 'Chrome/Extension-Relay',
+        'Protocol-Version': '1.3',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'V8-Version': '12.0.0',
+        'WebKit-Version': '537.36',
+        webSocketDebuggerUrl: `ws://127.0.0.1:${(server.address() as any)?.port}/cdp`
+      }))
+    } else if (req.url === '/json/list' || req.url === '/json') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+      res.end(JSON.stringify([]))
+    } else {
+      res.writeHead(404)
+      res.end()
+    }
+  })
+
+  const wss = new WebSocketServer({ noServer: true })
+
+  server.on('upgrade', (req: IncomingMessage, socket: any, head: Buffer) => {
+    if (req.url === '/cdp') {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req)
+      })
+    } else {
+      socket.destroy()
+    }
+  })
+
+  // ── CDP session multiplexing ──
+  // Playwright uses sessionId to multiplex commands on a single WebSocket.
+  // The extension relay uses tabId. We bridge by mapping sessionId → tabId.
+
+  const sessions = new Map<string, Session>()
+  let sessionCounter = 0
+  let browserContextId: string | null = null
+
+  wss.on('connection', (ws: WebSocket) => {
+    function sendResult(id: number, result: unknown) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ id, result }))
+      }
+    }
+
+    function sendError(id: number, code: number, message: string) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ id, error: { code, message } }))
+      }
+    }
+
+    function sendEvent(method: string, params: unknown) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ method, params }))
+      }
+    }
+
+    ws.on('message', async (raw: Buffer | string) => {
+      let msg: Record<string, unknown>
+      try {
+        msg = JSON.parse(String(raw))
+      } catch {
+        return
+      }
+
+      const id = msg.id as number
+      const method = msg.method as string
+      const params = (msg.params ?? {}) as Record<string, unknown>
+      const sessionId = msg.sessionId as string | undefined
+
+      // ── Session-scoped commands (page-level CDP) ──
+      if (sessionId) {
+        const session = sessions.get(sessionId)
+        if (!session) {
+          sendError(id, -32001, `Session ${sessionId} not found`)
+          return
+        }
+        try {
+          const result = await sendThroughRelay(userId, {
+            method: 'forwardCDPCommand',
+            params: {
+              method,
+              params: { ...params },
+              tabId: session.tabId
+            }
+          })
+          sendResult(id, result ?? {})
+        } catch (err) {
+          sendError(id, -32000, String(err))
+        }
+        return
+      }
+
+      // ── Browser-scoped commands ──
+      switch (method) {
+        case 'Browser.getVersion': {
+          sendResult(id, {
+            protocolVersion: '1.3',
+            product: 'Chrome/Extension-Relay',
+            revision: '1.0',
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            jsVersion: '12.0.0'
+          })
+          break
+        }
+
+        case 'Browser.getWindowForTarget': {
+          sendResult(id, {
+            windowId: 1,
+            bounds: { left: 0, top: 0, width: 1280, height: 720, windowState: 'normal' }
+          })
+          break
+        }
+
+        case 'Target.getBrowserContexts': {
+          if (!browserContextId) {
+            browserContextId = `browser-context-${userId}`
+          }
+          sendResult(id, {
+            browserContextIds: [{ browserContextId }]
+          })
+          break
+        }
+
+        case 'Target.getTargets': {
+          const targetInfos = Array.from(attachedTabs.values()).map(t => ({
+            targetId: t.targetId,
+            type: 'page',
+            title: '',
+            url: '',
+            attached: true,
+            canAccessOpener: false
+          }))
+          sendResult(id, { targetInfos })
+          break
+        }
+
+        case 'Target.createTarget': {
+          try {
+            await sendThroughRelay(userId, {
+              method: 'forwardCDPCommand',
+              params: { method: 'Page.navigate', params: { url: (params.url as string) || 'about:blank' } }
+            })
+            sessionCounter++
+            const newSessionId = `session-${sessionCounter}`
+            sessions.set(newSessionId, { sessionId: newSessionId, tabId: sessionCounter })
+            sendResult(id, { targetId: `target-${sessionCounter}` })
+          } catch (err) {
+            sendError(id, -32000, String(err))
+          }
+          break
+        }
+
+        case 'Target.attachToTarget': {
+          const targetId = params.targetId as string
+
+          // Look up the real session the extension announced for this target
+          const real = targetId ? attachedTabs.get(targetId) : undefined
+          const firstReal = real ?? attachedTabs.values().next().value
+
+          if (firstReal) {
+            // Make sure it's registered in sessions for page-level CDP routing
+            if (!sessions.has(firstReal.sessionId)) {
+              sessions.set(firstReal.sessionId, {
+                sessionId: firstReal.sessionId,
+                tabId: firstReal.tabId ?? sessionCounter
+              })
+            }
+            sendResult(id, { sessionId: firstReal.sessionId })
+            sendEvent('Target.attachedToTarget', {
+              sessionId: firstReal.sessionId,
+              targetInfo: {
+                targetId: firstReal.targetId,
+                type: 'page',
+                title: '',
+                url: '',
+                attached: true,
+                canAccessOpener: false
+              },
+              waitingForDebugger: false
+            })
+          } else {
+            // No real tab attached yet
+            sendError(id, -32001, 'No tab attached. Click the Felo extension badge ON on a Chrome tab first.')
+          }
+          break
+        }
+
+        case 'Target.setAutoAttach': {
+          sendResult(id, {})
+          break
+        }
+
+        case 'Target.detachFromTarget': {
+          const sid = params.sessionId as string
+          if (sid) sessions.delete(sid)
+          sendResult(id, {})
+          break
+        }
+
+        case 'Target.setDiscoverTargets': {
+          sendResult(id, {})
+          break
+        }
+
+        case 'Target.activateTarget': {
+          sendResult(id, {})
+          break
+        }
+
+        case 'Schema.getDomains': {
+          sendResult(id, { domains: [] })
+          break
+        }
+
+        default: {
+          // Forward everything else through the relay
+          try {
+            const result = await sendThroughRelay(userId, {
+              method: 'forwardCDPCommand',
+              params: { method, params }
+            })
+            sendResult(id, result ?? {})
+          } catch (err) {
+            sendError(id, -32000, String(err))
+          }
+          break
+        }
+      }
+    })
+  })
+
+  return new Promise<RelayInfo>((resolve, reject) => {
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address()
+      if (!addr || typeof addr === 'string') {
+        reject(new Error('Failed to get server address'))
+        return
+      }
+      const info: RelayInfo = {
+        server,
+        port: addr.port,
+        cdpWsUrl: `ws://127.0.0.1:${addr.port}/cdp`,
+        _wss: wss,
+        _sessions: sessions
+      }
+      relayServers.set(userId, info)
+      console.log(`📡 CDP relay for ${userId} on port ${addr.port}`)
+      resolve(info)
+    })
+    server.on('error', reject)
+  })
+}
+
+export function stopRelayServer(userId: string): void {
+  const info = relayServers.get(userId)
+  if (info) {
+    info.server.close()
+    relayServers.delete(userId)
+  }
+}
+
+export function getRelayServerInfo(userId: string): RelayInfo | undefined {
+  return relayServers.get(userId)
+}
+
+export function hasRelayServer(userId: string): boolean {
+  return relayServers.has(userId)
+}
+
+
+=== src\lib\scheduler.ts ===
+import { createHash } from 'crypto'
+import { Cron } from 'croner'
+import OpenAI from 'openai'
+import { createClient } from '@supabase/supabase-js'
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+)
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const MIN_REFIRE_GAP_MS = 2000
+const MAX_TIMER_DELAY_MS = 60_000
+const DEFAULT_TOP_OF_HOUR_STAGGER_MS = 5 * 60 * 1000 // 5 minutes
+const BACKOFF_MS = [30_000, 60_000, 300_000, 900_000, 3_600_000]
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface ScheduledTask {
+  taskId: string
+  userId: string
+  prompt: string
+  cronExpr: string
+  lastRunAt?: number
+  consecutiveErrors: number
+  nextRunAt: number
+}
+
+// ─── In-memory store ──────────────────────────────────────────────────────────
+
+const scheduledTasks = new Map<string, ScheduledTask>()
+const runningTasks = new Set<string>()
+let timerHandle: NodeJS.Timeout | null = null
+let timerRunning = false
+
+// ─── Stagger ──────────────────────────────────────────────────────────────────
+
+function resolveStaggerOffset(taskId: string, windowMs: number): number {
+  if (windowMs <= 0) return 0
+  const hash = createHash('sha256').update(taskId).digest()
+  return hash.readUInt32BE(0) % windowMs
+}
+
+function isTopOfHourCron(expr: string): boolean {
+  const parts = expr.trim().split(/\s+/)
+  if (parts.length < 2) return false
+  return parts[0] === '0'
+}
+
+// ─── Next run computation ─────────────────────────────────────────────────────
+
+export function computeNextRun(
+  taskId: string,
+  cronExpr: string,
+  lastRunAt?: number
+): number {
+  const nowMs = Date.now()
+  const staggerWindowMs = isTopOfHourCron(cronExpr)
+    ? DEFAULT_TOP_OF_HOUR_STAGGER_MS
+    : 0
+  const stagger = resolveStaggerOffset(taskId, staggerWindowMs)
+
+  try {
+    const c = new Cron(cronExpr)
+    let next = c.nextRun(new Date(nowMs))
+
+    // Croner timezone bug workaround — retry from next second
+    if (!next || next.getTime() <= nowMs) {
+      next = c.nextRun(new Date(nowMs + 1000))
+    }
+    // Still stuck — retry from start of tomorrow
+    if (!next || next.getTime() <= nowMs) {
+      const tomorrow = new Date()
+      tomorrow.setDate(tomorrow.getDate() + 1)
+      tomorrow.setHours(0, 0, 1, 0)
+      next = c.nextRun(tomorrow)
+    }
+
+    if (!next) throw new Error(`Cannot compute next run for: ${cronExpr}`)
+    return next.getTime() + stagger
+  } catch (err) {
+    console.error(`computeNextRun error for ${cronExpr}:`, err)
+    // Fallback: 1 hour from now
+    return nowMs + 3_600_000
+  }
+}
+
+function computeNextRunWithBackoff(
+  taskId: string,
+  cronExpr: string,
+  consecutiveErrors: number,
+  endedAtMs: number
+): number {
+  const natural = computeNextRun(taskId, cronExpr, endedAtMs)
+  if (consecutiveErrors === 0) return natural
+  const backoff = BACKOFF_MS[Math.min(consecutiveErrors - 1, BACKOFF_MS.length - 1)]
+  return Math.max(natural, endedAtMs + backoff)
+}
+
+// ─── Natural language parsing ─────────────────────────────────────────────────
+
+export async function parseSchedule(input: string): Promise<{
+  cron: string
+  human: string
+} | null> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `Convert natural language schedule descriptions to cron expressions.
+Return ONLY a valid JSON object with exactly two fields:
+- cron: standard 5-field cron expression (minute hour day month weekday)
+- human: clean human-readable description
+
+Examples:
+"every morning at 9am" -> {"cron":"0 9 * * *","human":"Every day at 9:00 AM"}
+"every monday at 8am" -> {"cron":"0 8 * * 1","human":"Every Monday at 8:00 AM"}
+"every hour" -> {"cron":"0 * * * *","human":"Every hour"}
+"every day at 6pm" -> {"cron":"0 18 * * *","human":"Every day at 6:00 PM"}
+"every 30 minutes" -> {"cron":"*/30 * * * *","human":"Every 30 minutes"}
+"every weekday at 9am" -> {"cron":"0 9 * * 1-5","human":"Every weekday at 9:00 AM"}
+"every sunday at noon" -> {"cron":"0 12 * * 0","human":"Every Sunday at 12:00 PM"}
+
+Return null if input is not a valid schedule description.
+Return ONLY the JSON object, no markdown, no explanation.`
+        },
+        { role: 'user', content: input }
+      ],
+      max_tokens: 100
+    })
+
+    const text = response.choices[0].message.content?.trim() || ''
+    if (text === 'null' || !text) return null
+    const clean = text.replace(/```json|```/g, '').trim()
+    const parsed = JSON.parse(clean)
+    if (!parsed.cron || !parsed.human) return null
+    return parsed
+  } catch (err) {
+    console.error('parseSchedule error:', err)
+    return null
+  }
+}
+
+// ─── Inbox messages ───────────────────────────────────────────────────────────
+
+export async function createMessage(
+  userId: string,
+  taskId: string,
+  content: string
+): Promise<void> {
+  try {
+    await supabase.from('messages').insert({
+      user_id: userId,
+      task_id: taskId,
+      content,
+      read: false
+    })
+  } catch (err) {
+    console.error('createMessage error:', err)
+  }
+}
+
+// ─── Timer loop ───────────────────────────────────────────────────────────────
+
+// Import this from routes/tasks.ts when wiring up
+let _runTaskFn: ((taskId: string, prompt: string, userId: string) => Promise<void>) | null = null
+
+export function setRunTaskFn(
+  fn: (taskId: string, prompt: string, userId: string) => Promise<void>
+) {
+  _runTaskFn = fn
+}
+
+export function armTimer(): void {
+  if (timerHandle) {
+    clearTimeout(timerHandle)
+    timerHandle = null
+  }
+
+  if (scheduledTasks.size === 0) return
+
+  const nowMs = Date.now()
+  let nearestMs = Infinity
+
+  for (const task of scheduledTasks.values()) {
+    if (task.nextRunAt < nearestMs) {
+      nearestMs = task.nextRunAt
+    }
+  }
+
+  if (nearestMs === Infinity) return
+
+  let delayMs = Math.max(nearestMs - nowMs, 0)
+
+  // Enforce minimum gap to prevent tight loops
+  if (delayMs < MIN_REFIRE_GAP_MS) delayMs = MIN_REFIRE_GAP_MS
+
+  // Clamp to max for drift recovery
+  if (delayMs > MAX_TIMER_DELAY_MS) delayMs = MAX_TIMER_DELAY_MS
+
+  console.log(`⏱ Timer armed — next task in ${Math.round(delayMs / 1000)}s`)
+
+  timerHandle = setTimeout(() => onTimer(), delayMs)
+}
+
+async function onTimer(): Promise<void> {
+  if (timerRunning) {
+    armTimer()
+    return
+  }
+
+  timerRunning = true
+
+  try {
+    const nowMs = Date.now()
+
+    // Collect all due tasks
+    const dueTasks: ScheduledTask[] = []
+    for (const task of scheduledTasks.values()) {
+      if (task.nextRunAt <= nowMs) {
+        dueTasks.push(task)
+      }
+    }
+
+    if (dueTasks.length === 0) {
+      armTimer()
+      return
+    }
+
+    console.log(`⏰ ${dueTasks.length} task(s) due`)
+
+    // Run all due tasks
+    for (const task of dueTasks) {
+      runScheduledTask(task).catch(err => {
+        console.error(`Scheduled task ${task.taskId} threw:`, err)
+      })
+    }
+  } finally {
+    timerRunning = false
+    armTimer()
+  }
+}
+
+async function runScheduledTask(task: ScheduledTask): Promise<void> {
+  // Skip if already running in memory — prevents duplicate runs
+  if (runningTasks.has(task.taskId)) {
+    console.log(`Task ${task.taskId} already running in memory, skipping`)
+    return
+  }
+  runningTasks.add(task.taskId)
+
+  try {
+    const { taskId, userId, prompt, cronExpr } = task
+
+    // Check if extension is connected — import dynamically to avoid circular deps
+    const { isExtensionConnected } = await import('../index.js')
+
+    // Write running_at BEFORE executing — distributed lock
+    const { error: lockError } = await supabase
+      .from('tasks')
+      .update({ running_at: new Date().toISOString() })
+      .eq('id', taskId)
+      .is('running_at', null) // only if not already running
+
+    if (lockError) {
+      console.warn(`Could not lock task ${taskId} — may already be running`)
+      return
+    }
+
+    const extensionConnected = isExtensionConnected(userId)
+
+    if (!extensionConnected) {
+      // Queue it — extension not connected
+      await supabase
+        .from('tasks')
+        .update({
+          status: 'queued',
+          running_at: null,
+          last_run: new Date().toISOString()
+        })
+        .eq('id', taskId)
+
+      await createMessage(
+        userId,
+        taskId,
+        `⏳ Task queued — your browser isn't connected. It will run automatically when you open Chrome.`
+      )
+
+      console.log(`Task ${taskId} queued — extension offline`)
+
+      // Compute next run and update
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, task.consecutiveErrors, Date.now())
+      const updated = { ...task, nextRunAt }
+      scheduledTasks.set(taskId, updated)
+      await supabase
+        .from('tasks')
+        .update({ next_run: new Date(nextRunAt).toISOString() })
+        .eq('id', taskId)
+
+      return
+    }
+
+    // Extension is connected — run now
+    await supabase
+      .from('tasks')
+      .update({ status: 'running', output: '' })
+      .eq('id', taskId)
+
+    const startedAt = Date.now()
+
+    try {
+      if (!_runTaskFn) throw new Error('runTaskFn not set')
+      await _runTaskFn(taskId, prompt, userId)
+
+      // Success
+      const endedAt = Date.now()
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, 0, endedAt)
+
+      await supabase
+        .from('tasks')
+        .update({
+          last_run: new Date(startedAt).toISOString(),
+          next_run: new Date(nextRunAt).toISOString(),
+          running_at: null,
+          consecutive_errors: 0
+        })
+        .eq('id', taskId)
+
+      const updated = { ...task, lastRunAt: startedAt, consecutiveErrors: 0, nextRunAt }
+      scheduledTasks.set(taskId, updated)
+
+      console.log(`✅ Scheduled task ${taskId} done. Next run: ${new Date(nextRunAt).toISOString()}`)
+
+    } catch (err) {
+      // Error — apply backoff
+      const endedAt = Date.now()
+      const newErrors = task.consecutiveErrors + 1
+      const nextRunAt = computeNextRunWithBackoff(taskId, cronExpr, newErrors, endedAt)
+
+      await supabase
+        .from('tasks')
+        .update({
+          last_run: new Date(startedAt).toISOString(),
+          next_run: new Date(nextRunAt).toISOString(),
+          running_at: null,
+          consecutive_errors: newErrors,
+          status: 'error'
+        })
+        .eq('id', taskId)
+
+      await createMessage(
+        userId,
+        taskId,
+        `❌ Scheduled task failed (attempt ${newErrors}): ${String(err).slice(0, 200)}`
+      )
+
+      const updated = { ...task, consecutiveErrors: newErrors, nextRunAt }
+      scheduledTasks.set(taskId, updated)
+
+      console.error(`Scheduled task ${taskId} failed (errors: ${newErrors}). Next retry: ${new Date(nextRunAt).toISOString()}`)
+    }
+  } finally {
+    runningTasks.delete(task.taskId)
+  }
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+export function scheduleTask(
+  taskId: string,
+  userId: string,
+  prompt: string,
+  cronExpr: string,
+  lastRunAt?: number,
+  consecutiveErrors = 0
+): void {
+  const nextRunAt = computeNextRun(taskId, cronExpr, lastRunAt)
+
+  scheduledTasks.set(taskId, {
+    taskId,
+    userId,
+    prompt,
+    cronExpr,
+    lastRunAt,
+    consecutiveErrors,
+    nextRunAt
+  })
+
+  console.log(`📅 Scheduled task ${taskId} — next run: ${new Date(nextRunAt).toISOString()}`)
+  armTimer()
+}
+
+export function cancelTask(taskId: string): void {
+  if (scheduledTasks.has(taskId)) {
+    scheduledTasks.delete(taskId)
+    console.log(`🗑 Cancelled scheduled task ${taskId}`)
+    armTimer()
+  }
+}
+
+export function getScheduledTask(taskId: string): ScheduledTask | undefined {
+  return scheduledTasks.get(taskId)
+}
+
+export function getAllScheduledTasks(): ScheduledTask[] {
+  return Array.from(scheduledTasks.values())
+}
+
+// ─── Startup — load all recurring tasks from Supabase ─────────────────────────
+
+export async function loadScheduledTasks(
+  runTaskFn: (taskId: string, prompt: string, userId: string) => Promise<void>
+): Promise<void> {
+  setRunTaskFn(runTaskFn)
+
+  // Clear stale running_at markers from crashed previous process
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
+  await supabase
+    .from('tasks')
+    .update({ running_at: null, status: 'idle' })
+    .lt('running_at', twoHoursAgo)
+    .not('running_at', 'is', null)
+
+  // Load all recurring tasks
+  const { data: tasks, error } = await supabase
+    .from('tasks')
+    .select('id, user_id, prompt, schedule, last_run, consecutive_errors, status')
+    .eq('is_recurring', true)
+    .not('schedule', 'is', null)
+
+  if (error) {
+    console.error('loadScheduledTasks error:', error)
+    return
+  }
+
+  if (!tasks?.length) {
+    console.log('📅 No recurring tasks to load')
+    return
+  }
+
+  for (const task of tasks) {
+    scheduleTask(
+      task.id,
+      task.user_id,
+      task.prompt,
+      task.schedule,
+      task.last_run ? new Date(task.last_run).getTime() : undefined,
+      task.consecutive_errors || 0
+    )
+  }
+
+  console.log(`📅 Loaded ${tasks.length} recurring tasks`)
+  armTimer()
+}
+
+
+=== src\lib\supabase.ts ===
+import { createClient } from '@supabase/supabase-js'
+
+export const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+)
+
+
+=== src\routes\connections.ts ===
+import { Router } from 'express'
+import { nango, INTEGRATIONS } from '../lib/nango.js'
+
+export const connectionsRouter = Router()
+
+// Get all connected integrations for a user
+connectionsRouter.get('/connections/:userId', async (req, res) => {
+  const { userId } = req.params
+  const results: Record<string, boolean> = {}
+
+  for (const [name, integrationId] of Object.entries(INTEGRATIONS)) {
+    try {
+      const connection = await nango.getConnection(integrationId, userId)
+      results[name] = !!connection
+    } catch {
+      results[name] = false
+    }
+  }
+
+  res.json(results)
+})
+
+// Create a Nango connect session for a user
+connectionsRouter.post('/connections/session', async (req, res) => {
+  const { userId, integrationId } = req.body
+  if (!userId || !integrationId) {
+    return res.status(400).json({ error: 'Missing userId or integrationId' })
+  }
+
+  try {
+    const session = await nango.createConnectSession({
+      end_user: { id: userId },
+      allowed_integrations: [integrationId]
+    })
+    res.json({ sessionToken: session.data.token })
+  } catch (err) {
+    console.error('Nango session error:', err)
+    res.status(500).json({ error: 'Failed to create connect session' })
+  }
+})
+
+// Disconnect an integration for a user
+connectionsRouter.delete('/connections/:userId/:integrationId', async (req, res) => {
+  const { userId, integrationId } = req.params
+  try {
+    await nango.deleteConnection(integrationId, userId)
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to disconnect' })
+  }
+})
+
+
+=== src\routes\messages.ts ===
+import { Router } from 'express'
+import { supabase } from '../lib/supabase.js'
+
+export const messagesRouter = Router()
+
+// Get all messages for a user
+messagesRouter.get('/messages/:userId', async (req, res) => {
+  const { data } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('user_id', req.params.userId)
+    .order('created_at', { ascending: false })
+    .limit(50)
+  res.json(data || [])
+})
+
+// Get unread count
+messagesRouter.get('/messages/:userId/unread', async (req, res) => {
+  const { count } = await supabase
+    .from('messages')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_id', req.params.userId)
+    .eq('read', false)
+  res.json({ count: count || 0 })
+})
+
+// Mark single message as read
+messagesRouter.patch('/messages/:messageId/read', async (req, res) => {
+  await supabase
+    .from('messages')
+    .update({ read: true })
+    .eq('id', req.params.messageId)
+  res.json({ ok: true })
+})
+
+// Mark all messages as read for user
+messagesRouter.patch('/messages/:userId/read-all', async (req, res) => {
+  await supabase
+    .from('messages')
+    .update({ read: true })
+    .eq('user_id', req.params.userId)
+    .eq('read', false)
+  res.json({ ok: true })
+})
+
+
+=== src\routes\oauth.ts ===
+import { Router } from 'express'
+import { createClient } from '@supabase/supabase-js'
+import { OAUTH_CONFIG, OAuthProvider } from '../lib/oauth-config.js'
+import { encrypt, decrypt } from '../lib/encryption.js'
+
+export const oauthRouter = Router()
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+)
+
+// Step 1 — redirect user to provider OAuth page
+oauthRouter.get('/oauth/:provider/connect', (req, res) => {
+  const provider = req.params.provider as OAuthProvider
+  const { userId } = req.query
+
+  if (!userId || !OAUTH_CONFIG[provider]) {
+    return res.status(400).json({ error: 'Invalid provider or missing userId' })
+  }
+
+  const config = OAUTH_CONFIG[provider]
+  const state = Buffer.from(JSON.stringify({ userId, provider })).toString('base64')
+
+  const params = new URLSearchParams({
+    client_id: config.clientId,
+    redirect_uri: config.redirectUri,
+    response_type: 'code',
+    state,
+    access_type: 'offline',
+    prompt: 'consent'
+  })
+
+  if (config.scopes.length > 0) {
+    params.set('scope', config.scopes.join(' '))
+  }
+
+  res.redirect(`${config.authUrl}?${params.toString()}`)
+})
+
+// Step 2 — handle callback from provider
+oauthRouter.get('/oauth/:provider/callback', async (req, res) => {
+  const provider = req.params.provider as OAuthProvider
+  const { code, state, error } = req.query
+
+  if (error) {
+    return res.redirect(`${process.env.FRONTEND_URL}?oauth_error=${error}`)
+  }
+
+  if (!code || !state) {
+    return res.status(400).json({ error: 'Missing code or state' })
+  }
+
+  let userId: string
+  try {
+    const decoded = JSON.parse(Buffer.from(state as string, 'base64').toString())
+    userId = decoded.userId
+  } catch {
+    return res.status(400).json({ error: 'Invalid state' })
+  }
+
+  const config = OAUTH_CONFIG[provider]
+
+  try {
+    // Exchange code for tokens
+    const tokenRes = await fetch(config.tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+        ...(provider === 'notion' ? {
+          'Authorization': 'Basic ' + Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64')
+        } : {})
+      },
+      body: new URLSearchParams({
+        code: code as string,
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        redirect_uri: config.redirectUri,
+        grant_type: 'authorization_code'
+      }).toString()
+    })
+
+    const tokens = await tokenRes.json()
+    console.log(`OAuth tokens for ${provider}:`, JSON.stringify(tokens).slice(0, 200))
+
+    if (!tokens.access_token && !tokens.authed_user) {
+      throw new Error('No access token in response: ' + JSON.stringify(tokens))
+    }
+
+    // Handle Slack's different token structure
+    const accessToken = provider === 'slack'
+      ? tokens.authed_user?.access_token || tokens.access_token
+      : tokens.access_token
+
+    const refreshToken = tokens.refresh_token || null
+    const expiresAt = tokens.expires_in
+      ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+      : null
+
+    // Store encrypted tokens in Supabase
+    await supabase
+      .from('oauth_tokens')
+      .upsert({
+        user_id: userId,
+        provider,
+        access_token: encrypt(accessToken),
+        refresh_token: refreshToken ? encrypt(refreshToken) : null,
+        expires_at: expiresAt,
+        scope: tokens.scope || null,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id,provider' })
+
+    // Redirect back to dashboard with success
+    res.redirect(`${process.env.FRONTEND_URL}?oauth_success=${provider}`)
+
+  } catch (err) {
+    console.error(`OAuth callback error for ${provider}:`, err)
+    res.redirect(`${process.env.FRONTEND_URL}?oauth_error=token_exchange_failed`)
+  }
+})
+
+// Get connected providers for a user
+oauthRouter.get('/oauth/status/:userId', async (req, res) => {
+  const { userId } = req.params
+  const { data } = await supabase
+    .from('oauth_tokens')
+    .select('provider')
+    .eq('user_id', userId)
+
+  const connected: Record<string, boolean> = {
+    gmail: false,
+    'google-calendar': false,
+    'google-sheets': false,
+    slack: false,
+    notion: false,
+    github: false
+  }
+
+  data?.forEach(row => {
+    connected[row.provider] = true
+  })
+
+  res.json(connected)
+})
+
+// Disconnect a provider
+oauthRouter.delete('/oauth/:provider/:userId', async (req, res) => {
+  const { provider, userId } = req.params
+  await supabase
+    .from('oauth_tokens')
+    .delete()
+    .eq('user_id', userId)
+    .eq('provider', provider)
+  res.json({ ok: true })
+})
+
+// Get decrypted token for a user+provider (internal use by agent)
+oauthRouter.get('/oauth/token/:provider/:userId', async (req, res) => {
+  const { provider, userId } = req.params
+  const { data } = await supabase
+    .from('oauth_tokens')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('provider', provider)
+    .single()
+
+  if (!data) return res.status(404).json({ error: 'Not connected' })
+
+  // Check if token needs refresh
+  if (data.expires_at && data.refresh_token) {
+    const expiresAt = new Date(data.expires_at)
+    const fiveMinutes = 5 * 60 * 1000
+    if (expiresAt.getTime() - Date.now() < fiveMinutes) {
+      try {
+        const config = OAUTH_CONFIG[provider as OAuthProvider]
+        const refreshRes = await fetch(config.tokenUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            refresh_token: decrypt(data.refresh_token),
+            client_id: config.clientId,
+            client_secret: config.clientSecret
+          }).toString()
+        })
+        const refreshed = await refreshRes.json()
+        if (refreshed.access_token) {
+          const newExpiresAt = new Date(Date.now() + refreshed.expires_in * 1000).toISOString()
+          await supabase
+            .from('oauth_tokens')
+            .update({
+              access_token: encrypt(refreshed.access_token),
+              expires_at: newExpiresAt,
+              updated_at: new Date().toISOString()
+            })
+            .eq('user_id', userId)
+            .eq('provider', provider)
+          return res.json({ accessToken: refreshed.access_token, expiresAt: newExpiresAt })
+        }
+      } catch (err) {
+        console.error('Token refresh error:', err)
+      }
+    }
+  }
+
+  res.json({
+    accessToken: decrypt(data.access_token),
+    expiresAt: data.expires_at
+  })
+})
+
+
+=== src\routes\tasks.ts ===
+import { Router } from 'express'
+import { supabase } from '../lib/supabase.js'
+import { isExtensionConnected, extensionConnections } from '../index.js'
+import { runAgentWithExtension } from '../lib/agent-extension.js'
+import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
+
+export const tasksRouter = Router()
+
+async function appendOutput(taskId: string, line: string) {
+  const { data } = await supabase
+    .from('tasks')
+    .select('output')
+    .eq('id', taskId)
+    .single()
+  const current = data?.output || ''
+  await supabase
+    .from('tasks')
+    .update({ output: current + line + '\n', status: 'running' })
+    .eq('id', taskId)
+}
+
+export async function runTaskInBackground(taskId: string, prompt: string, userId: string, useApiMode?: boolean) {
+  console.log(`runTaskInBackground: taskId=${taskId} userId=${userId}`)
+  console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
+  console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)
+
+  // Always use cloud browser (agent-extension.ts) for reliability
+  // The agent-extension.ts uses aria-snapshot which is more reliable than CSS selectors
+  await appendOutput(taskId, '☁️ Starting browser agent...\n')
+  try {
+    const result = await runAgentWithExtension(prompt, userId, async (step) => {
+      console.log(`[${taskId}] ${step}`)
+      await appendOutput(taskId, step + '\n')
+    }, taskId)
+    const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+    await supabase.from('tasks').update({
+      status: 'done',
+      output: (data?.output || '') + `✅ Done: ${result}\n`
+    }).eq('id', taskId)
+
+    await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
+  } catch (err) {
+    const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+    await supabase.from('tasks').update({
+      status: 'error',
+      output: (data?.output || '') + `❌ Error: ${String(err)}\n`
+    }).eq('id', taskId)
+
+    await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
+  }
+}
+
+tasksRouter.post('/create-task', async (req, res) => {
+  const { prompt, userId, useApiMode } = req.body
+  console.log(`Create task: userId=${userId}, extensionConnected=${isExtensionConnected(userId)}`)
+  console.log(`All connected extensions: ${[...extensionConnections.keys()].join(', ')}`)
+  if (!prompt || !userId) {
+    return res.status(400).json({ error: 'Missing prompt or userId' })
+  }
+  const { data, error } = await supabase
+    .from('tasks')
+    .insert({ user_id: userId, prompt, output: '', status: 'running' })
+    .select()
+    .single()
+  if (error || !data) {
+    console.error('Supabase insert error:', error)
+    return res.status(500).json({ error: 'Failed to create task' })
+  }
+  res.json({ taskId: data.id })
+  runTaskInBackground(data.id, prompt, userId, useApiMode)
+})
+
+tasksRouter.get('/tasks/:userId', async (req, res) => {
+  const { data } = await supabase
+    .from('tasks')
+    .select('id, prompt, status, output, created_at, is_recurring, schedule_human, next_run, last_run')
+    .eq('user_id', req.params.userId)
+    .order('created_at', { ascending: false })
+    .limit(50)
+  res.json(data || [])
+})
+
+tasksRouter.post('/refresh-token', async (req, res) => {
+  const { refreshToken } = req.body
+  if (!refreshToken) return res.status(400).json({ error: 'Missing refresh token' })
+  try {
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken })
+    if (error || !data.session) throw new Error('Refresh failed')
+    res.json({ accessToken: data.session.access_token, refreshToken: data.session.refresh_token })
+  } catch (err) {
+    res.status(401).json({ error: String(err) })
+  }
+})
+
+tasksRouter.post('/create-scheduled-task', async (req, res) => {
+  const { prompt, userId, scheduleText } = req.body
+  if (!prompt || !userId || !scheduleText) {
+    return res.status(400).json({ error: 'Missing prompt, userId, or scheduleText' })
+  }
+
+  const parsed = await parseSchedule(scheduleText)
+  if (!parsed) {
+    return res.status(400).json({ error: 'Could not understand that schedule. Try "every day at 9am" or "every monday at 8am".' })
+  }
+
+  const nextRun = computeNextRun(userId, parsed.cron)
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .insert({
+      user_id: userId,
+      prompt,
+      output: '',
+      status: 'idle',
+      schedule: parsed.cron,
+      schedule_human: parsed.human,
+      is_recurring: true,
+      requires_extension: true,
+      next_run: new Date(nextRun).toISOString()
+    })
+    .select()
+    .single()
+
+  if (error || !data) {
+    return res.status(500).json({ error: 'Failed to create scheduled task' })
+  }
+
+  // Register with in-memory scheduler
+  scheduleTask(data.id, userId, prompt, parsed.cron)
+
+  // Send confirmation to inbox
+  await createMessage(userId, data.id, `📅 Scheduled: "${prompt}" — ${parsed.human}`)
+
+  res.json({ taskId: data.id, schedule: parsed.human, nextRun: new Date(nextRun).toISOString() })
+})
+
+tasksRouter.delete('/scheduled-tasks/:userId', async (req, res) => {
+  const { userId } = req.params
+
+  // Get all recurring tasks for this user
+  const { data: tasks } = await supabase
+    .from('tasks')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('is_recurring', true)
+
+  if (!tasks?.length) {
+    return res.json({ cancelled: 0 })
+  }
+
+  // Cancel all from in-memory scheduler
+  const { cancelTask } = await import('../lib/scheduler.js')
+  for (const task of tasks) {
+    cancelTask(task.id)
+  }
+
+  // Update all to idle in Supabase
+  await supabase
+    .from('tasks')
+    .update({
+      is_recurring: false,
+      schedule: null,
+      schedule_human: null,
+      next_run: null,
+      status: 'idle'
+    })
+    .eq('user_id', userId)
+    .eq('is_recurring', true)
+
+  res.json({ cancelled: tasks.length })
+})
+
+tasksRouter.get('/executions/:userId', async (req, res) => {
+  const { data, error } = await supabase
+    .from('task_executions')
+    .select('id, task_id, task_prompt, plan, status, result_summary, steps_log, started_at, completed_at, duration_ms, created_at')
+    .eq('user_id', req.params.userId)
+    .order('created_at', { ascending: false })
+    .limit(50)
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data || [])
+})
+
+
