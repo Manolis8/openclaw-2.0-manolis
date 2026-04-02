@@ -12,14 +12,14 @@ import * as github from './integrations/github.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
-// ─── Headless Playwright browser (no CDP, no extension) ───
+// ─── Playwright browser (headed, visible window) ───
 
 let browser: Browser | null = null
 
 async function getBrowser(): Promise<Browser> {
   if (!browser || !browser.isConnected()) {
     browser = await chromium.launch({
-      headless: true,
+      headless: false, // visible window
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -27,7 +27,7 @@ async function getBrowser(): Promise<Browser> {
         '--disable-gpu'
       ]
     })
-    console.log('[playwright] browser launched')
+    console.log('[playwright] browser launched (visible window)')
   }
   return browser
 }
@@ -40,7 +40,15 @@ async function newPage(): Promise<Page> {
   return context.newPage()
 }
 
-// ─── Snapshot / role-ref system (OpenClaw-style) ───
+async function closeBrowser(): Promise<void> {
+  if (browser && browser.isConnected()) {
+    await browser.close()
+    browser = null
+    console.log('[playwright] browser closed')
+  }
+}
+
+// ─── Snapshot / role-ref system ───
 
 type RoleRef = { role: string; name?: string; nth?: number }
 type RoleRefMap = Record<string, RoleRef>
@@ -247,13 +255,15 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_list_issues', description: 'List GitHub issues', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' } }, required: ['owner', 'repo'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome browser tab.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a Chrome browser.
 
-Rules:
+IMPORTANT RULES:
 - ALWAYS call browser_snapshot before any action and after every action to see what changed
-- NEVER call task_complete just because you clicked something — wait for visual confirmation (post appeared, form gone, success message)
+- NEVER try to log in or create accounts — assume you are already logged in. If a page asks for login, check the current state first by taking a snapshot.
+- NEVER call task_complete just because you clicked something — wait for visual confirmation
 - If an element ref is stale, call browser_snapshot again to get fresh refs
 - If something fails twice, try a completely different approach
+- Do NOT attempt to login to any site — if login is required, report that login is needed and stop
 - For typing in contenteditable areas (like Twitter/X post box), click first then type`
 
 // ─── Agent loop ───
@@ -295,6 +305,11 @@ async function runAgentLoop(opts: {
       }
 
       const toolResults: OpenAI.ChatCompletionToolMessageParam[] = []
+
+      // Only process if there are tool calls
+      if (!msg.tool_calls?.length) {
+        return { success: false, summary: 'Agent stopped unexpectedly' }
+      }
 
       for (const toolCall of msg.tool_calls as any[]) {
         const args = JSON.parse(toolCall.function.arguments || '{}')
@@ -454,6 +469,8 @@ async function runAgentLoop(opts: {
           await opts.onProgress(`⚠️ ${result}`)
         }
 
+        // FIX: Each tool result must directly follow its tool_call in the messages array
+        // We already pushed the assistant message with tool_calls above, now push tool result
         toolResults.push({
           role: 'tool',
           tool_call_id: toolCall.id,
@@ -488,7 +505,7 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('☁️ Starting cloud browser...')
+    await onStep('🌐 Opening browser...')
     const page = await newPage()
     const tabKey = `${userId}:${Date.now()}`
 
@@ -517,6 +534,10 @@ export async function runAgentWithExtension(
 
   } finally {
     runningTasks.delete(taskKey)
+    
+    // Close browser after task completes
+    await closeBrowser()
+    
     try {
       await supabase.from('task_executions').insert({
         user_id: userId, task_id: taskId || null, task_prompt: task, plan: [],
