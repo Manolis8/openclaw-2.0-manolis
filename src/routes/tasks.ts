@@ -1,7 +1,5 @@
 import { Router } from 'express'
 import { supabase } from '../lib/supabase.js'
-import { newPage } from '../lib/browser.js'
-import { runAgent } from '../lib/agent.js'
 import { isExtensionConnected, extensionConnections } from '../index.js'
 import { runAgentWithExtension } from '../lib/agent-extension.js'
 import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
@@ -25,63 +23,30 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   console.log(`runTaskInBackground: taskId=${taskId} userId=${userId}`)
   console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
   console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)
-  const extensionConnected = isExtensionConnected(userId)
 
-  // If useApiMode is true, prefer cloud agent (which has API tools)
-  // If useApiMode is false, prefer extension (browser)
-  if (!useApiMode && extensionConnected) {
-    // Use user's real Chrome via extension
-    await appendOutput(taskId, '🔌 Using your real browser via extension\n')
-    try {
-      const result = await runAgentWithExtension(prompt, userId, async (step) => {
-        console.log(`[${taskId}] ${step}`)
-        await appendOutput(taskId, step + '\n')
-      }, taskId)
-      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
-      await supabase.from('tasks').update({
-        status: 'done',
-        output: (data?.output || '') + `✅ Done: ${result}\n`
-      }).eq('id', taskId)
+  // Always use cloud browser (agent-extension.ts) for reliability
+  // The agent-extension.ts uses aria-snapshot which is more reliable than CSS selectors
+  await appendOutput(taskId, '☁️ Starting browser agent...\n')
+  try {
+    const result = await runAgentWithExtension(prompt, userId, async (step) => {
+      console.log(`[${taskId}] ${step}`)
+      await appendOutput(taskId, step + '\n')
+    }, taskId)
+    const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+    await supabase.from('tasks').update({
+      status: 'done',
+      output: (data?.output || '') + `✅ Done: ${result}\n`
+    }).eq('id', taskId)
 
-      // Write inbox message
-      await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
-    } catch (err) {
-      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
-      await supabase.from('tasks').update({
-        status: 'error',
-        output: (data?.output || '') + `❌ Error: ${String(err)}\n`
-      }).eq('id', taskId)
+    await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
+  } catch (err) {
+    const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+    await supabase.from('tasks').update({
+      status: 'error',
+      output: (data?.output || '') + `❌ Error: ${String(err)}\n`
+    }).eq('id', taskId)
 
-      await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
-    }
-  } else {
-    // Use cloud agent with API tools
-    await appendOutput(taskId, '☁️ Using cloud browser (connect extension for full access)\n')
-    const page = await newPage()
-    try {
-      const result = await runAgent(prompt, page, async (step) => {
-        console.log(`[${taskId}] ${step}`)
-        await appendOutput(taskId, step + '\n')
-      }, userId)
-      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
-      await supabase.from('tasks').update({
-        status: 'done',
-        output: (data?.output || '') + `✅ Done: ${result}\n`
-      }).eq('id', taskId)
-
-      // Write inbox message
-      await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
-    } catch (err) {
-      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
-      await supabase.from('tasks').update({
-        status: 'error',
-        output: (data?.output || '') + `❌ Error: ${String(err)}\n`
-      }).eq('id', taskId)
-
-      await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
-    } finally {
-      await page.close()
-    }
+    await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
   }
 }
 
