@@ -19,7 +19,7 @@ let browser: Browser | null = null
 async function getBrowser(): Promise<Browser> {
   if (!browser || !browser.isConnected()) {
     browser = await chromium.launch({
-      headless: false, // visible window
+      headless: true, // Railway has no X server, use headless
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -27,7 +27,7 @@ async function getBrowser(): Promise<Browser> {
         '--disable-gpu'
       ]
     })
-    console.log('[playwright] browser launched (visible window)')
+    console.log('[playwright] browser launched')
   }
   return browser
 }
@@ -505,7 +505,7 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('🌐 Opening browser...')
+    await onStep('☁️ Starting cloud browser...')
     const page = await newPage()
     const tabKey = `${userId}:${Date.now()}`
 
