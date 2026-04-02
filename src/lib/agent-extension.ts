@@ -1,7 +1,6 @@
 import OpenAI from 'openai'
 import { chromium } from 'playwright'
 import type { Browser, Page } from 'playwright'
-import { sendExtensionMessage } from '../index.js'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
 import { getRelayServerInfo } from './relay-server.js'
@@ -12,43 +11,68 @@ import * as slack from './integrations/slack.js'
 import * as github from './integrations/github.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-
 const runningTasks = new Set<string>()
-
-// ─── Per-user Playwright browser connection, reused across tasks ───
-
 const userBrowserConnections = new Map<string, Browser>()
+
+// ─── Browser connection ───
 
 async function getPlaywrightPage(userId: string): Promise<{ page: Page }> {
   const relayServer = getRelayServerInfo(userId)
   if (!relayServer) {
-    throw new Error('Extension not connected. Make sure the Felo extension is installed and the badge is ON.')
+    throw new Error('Extension not connected. Click the Felo extension badge ON on a Chrome tab first.')
   }
 
-  // cdpWsUrl is like ws://127.0.0.1:{port}/cdp
-  // chromium.connectOverCDP takes the HTTP base URL, not the WebSocket URL
+  // ws://127.0.0.1:{port}/cdp → http://127.0.0.1:{port}
   const cdpUrl = relayServer.cdpWsUrl
     .replace('ws://', 'http://')
     .replace('/cdp', '')
 
+  // Always get a fresh connection — don't reuse across tasks
+  // because the relay session state resets between connections
   let browser = userBrowserConnections.get(userId)
-  if (!browser || !browser.isConnected()) {
-    browser = await chromium.connectOverCDP(cdpUrl, { timeout: 10_000 })
-    userBrowserConnections.set(userId, browser)
-    browser.on('disconnected', () => userBrowserConnections.delete(userId))
+  if (browser) {
+    try { await browser.close() } catch {}
+    userBrowserConnections.delete(userId)
   }
 
-  const context = browser.contexts()[0]
-  if (!context) throw new Error('No browser context. Is a tab attached in Chrome?')
+  console.log(`[playwright] connecting to relay at ${cdpUrl}`)
+  browser = await chromium.connectOverCDP(cdpUrl, { timeout: 15_000 })
+  userBrowserConnections.set(userId, browser)
+  browser.on('disconnected', () => userBrowserConnections.delete(userId))
+  console.log(`[playwright] connected`)
+
+  // Wait up to 5s for a context and page to appear
+  let context = browser.contexts()[0]
+  if (!context) {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('No browser context after 5s. Is a tab attached?')), 5000)
+      const check = () => {
+        const ctx = browser.contexts()[0]
+        if (ctx) { clearTimeout(timeout); resolve() }
+      }
+      // Poll every 500ms
+      const interval = setInterval(() => {
+        if (browser.contexts()[0]) { clearInterval(interval); check() }
+      }, 500)
+      check()
+    })
+  }
 
   const pages = context.pages()
-  if (!pages.length) throw new Error('No tabs found. Click the extension badge ON on a Chrome tab first.')
+  if (!pages.length) {
+    throw new Error('No tabs found. Click the Felo extension badge ON on a Chrome tab first.')
+  }
 
-  const page = pages.find(p => p.url() !== 'about:blank' && p.url() !== '') ?? pages[0]
+  const page = pages.find(p => {
+    const url = p.url()
+    return url && url !== 'about:blank' && !url.startsWith('chrome://')
+  }) ?? pages[0]
+
+  console.log(`[playwright] using page: ${page.url()}`)
   return { page }
 }
 
-// ─── Snapshot / role-ref system ───
+// ─── Snapshot / role-ref system (OpenClaw-style) ───
 
 type RoleRef = { role: string; name?: string; nth?: number }
 type RoleRefMap = Record<string, RoleRef>
@@ -59,7 +83,6 @@ const INTERACTIVE_ROLES = new Set([
   'slider', 'spinbutton', 'switch', 'tab', 'treeitem'
 ])
 
-// Per-tab ref storage: key = userId:tabKey
 const tabRoleRefs = new Map<string, { refs: RoleRefMap; url: string }>()
 
 function buildRoleRefsFromSnapshot(ariaSnapshot: string): { snapshot: string; refs: RoleRefMap } {
@@ -70,8 +93,6 @@ function buildRoleRefsFromSnapshot(ariaSnapshot: string): { snapshot: string; re
   const out: string[] = []
   let counter = 0
 
-  const getKey = (role: string, name?: string) => `${role}:${name ?? ''}`
-
   for (const line of lines) {
     const match = line.match(/^(\s*-\s*)(\w+)(?:\s+"([^"]*)")?(.*)$/)
     if (!match) { out.push(line); continue }
@@ -81,10 +102,9 @@ function buildRoleRefsFromSnapshot(ariaSnapshot: string): { snapshot: string; re
 
     counter++
     const ref = `e${counter}`
-    const key = getKey(role, name)
+    const key = `${role}:${name ?? ''}`
     const nth = counts.get(key) ?? 0
     counts.set(key, nth + 1)
-
     const existing = refsByKey.get(key) ?? []
     existing.push(ref)
     refsByKey.set(key, existing)
@@ -98,49 +118,43 @@ function buildRoleRefsFromSnapshot(ariaSnapshot: string): { snapshot: string; re
     out.push(enhanced)
   }
 
-  // Remove nth from non-duplicates
-  for (const [key, refList] of refsByKey) {
+  for (const [, refList] of refsByKey) {
     if (refList.length <= 1) {
-      for (const r of refList) { delete refs[r]?.nth }
+      for (const r of refList) { if (refs[r]) delete refs[r].nth }
     }
   }
 
-  return {
-    snapshot: out.join('\n') || '(no interactive elements)',
-    refs
-  }
+  return { snapshot: out.join('\n') || '(no interactive elements)', refs }
 }
 
 async function snapshotPage(page: Page, tabKey: string): Promise<string> {
-  const ariaSnapshot = await page.locator(':root').ariaSnapshot()
+  const ariaSnapshot = await page.locator(':root').ariaSnapshot({ timeout: 10_000 })
   const url = page.url()
   const { snapshot, refs } = buildRoleRefsFromSnapshot(ariaSnapshot)
   tabRoleRefs.set(tabKey, { refs, url })
   return `URL: ${url}\n${snapshot}`
 }
 
-// ─── Element resolution via Playwright getByRole ───
-
 function refLocator(page: Page, ref: string, tabKey: string) {
   const stored = tabRoleRefs.get(tabKey)
   if (!stored?.refs[ref]) {
-    throw new Error(`Unknown ref "${ref}". Run a new snapshot — refs may be stale.`)
+    throw new Error(`Unknown ref "${ref}". Call browser_snapshot first to get current refs.`)
   }
-  const { role, name, nth = 0 } = stored.refs[ref]
+  const { role, name, nth } = stored.refs[ref]
   const locator = name
     ? page.getByRole(role as any, { name, exact: true })
     : page.getByRole(role as any)
-  return nth > 0 ? locator.nth(nth) : locator
+  return (nth !== undefined && nth > 0) ? locator.nth(nth) : locator
 }
 
-// ─── Browser tools for the LLM agent loop ───
+// ─── Tools ───
 
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
       name: 'browser_snapshot',
-      description: 'Read the current page. Returns interactive elements with refs like e1, e2. Always call first, and after every action to verify it worked.',
+      description: 'Read the current page state. Returns all interactive elements with ref IDs like e1, e2. ALWAYS call this first before any action, and after every action to confirm what changed.',
       parameters: { type: 'object', properties: {}, required: [] }
     }
   },
@@ -148,10 +162,10 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_navigate',
-      description: 'Navigate to a URL.',
+      description: 'Navigate the current tab to a URL.',
       parameters: {
         type: 'object',
-        properties: { url: { type: 'string' } },
+        properties: { url: { type: 'string', description: 'Full URL including https://' } },
         required: ['url']
       }
     }
@@ -160,10 +174,10 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_click',
-      description: 'Click an element by ref from the last snapshot.',
+      description: 'Click an element by its ref from the last snapshot.',
       parameters: {
         type: 'object',
-        properties: { ref: { type: 'string' } },
+        properties: { ref: { type: 'string', description: 'Ref like e1, e2 from snapshot' } },
         required: ['ref']
       }
     }
@@ -172,7 +186,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_type',
-      description: 'Type text into a textbox or input.',
+      description: 'Type text into a textbox or input field.',
       parameters: {
         type: 'object',
         properties: {
@@ -188,7 +202,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_key',
-      description: 'Press a keyboard key like Enter, Tab, Escape.',
+      description: 'Press a keyboard key. Examples: Enter, Tab, Escape, ArrowDown.',
       parameters: {
         type: 'object',
         properties: { key: { type: 'string' } },
@@ -200,12 +214,12 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_scroll',
-      description: 'Scroll the page.',
+      description: 'Scroll the page up or down.',
       parameters: {
         type: 'object',
         properties: {
           direction: { type: 'string', enum: ['up', 'down'] },
-          amount: { type: 'number' }
+          amount: { type: 'number', description: 'Pixels to scroll, default 300' }
         },
         required: ['direction']
       }
@@ -215,7 +229,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_wait',
-      description: 'Wait for page to stabilize or for text to appear.',
+      description: 'Wait for milliseconds or for text to appear on page.',
       parameters: {
         type: 'object',
         properties: {
@@ -229,10 +243,10 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'task_complete',
-      description: 'Call when task is confirmed done. Require visual confirmation — composer closed, form gone, item visible.',
+      description: 'Mark task as done. Only call after visual confirmation the action succeeded — post appeared, form submitted, item created.',
       parameters: {
         type: 'object',
-        properties: { summary: { type: 'string' } },
+        properties: { summary: { type: 'string', description: 'What was accomplished' } },
         required: ['summary']
       }
     }
@@ -241,7 +255,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'task_failed',
-      description: 'Call when task cannot be completed.',
+      description: 'Mark task as failed after exhausting all approaches.',
       parameters: {
         type: 'object',
         properties: { reason: { type: 'string' } },
@@ -249,177 +263,32 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
       }
     }
   },
-  {
-    type: 'function',
-    function: {
-      name: 'gmail_list',
-      description: 'List recent emails from Gmail',
-      parameters: {
-        type: 'object',
-        properties: { maxResults: { type: 'number' } }
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'gmail_send',
-      description: 'Send an email via Gmail',
-      parameters: {
-        type: 'object',
-        properties: {
-          to: { type: 'string' },
-          subject: { type: 'string' },
-          body: { type: 'string' }
-        },
-        required: ['to', 'subject', 'body']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'gmail_read',
-      description: 'Get content of a specific email',
-      parameters: {
-        type: 'object',
-        properties: { messageId: { type: 'string' } },
-        required: ['messageId']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'gmail_summarize',
-      description: 'Get a summary of recent emails',
-      parameters: { type: 'object', properties: {} }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'notion_create_page',
-      description: 'Create a new page in Notion',
-      parameters: {
-        type: 'object',
-        properties: {
-          parentId: { type: 'string' },
-          title: { type: 'string' },
-          content: { type: 'string' }
-        },
-        required: ['parentId', 'title', 'content']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'notion_list_databases',
-      description: 'List Notion databases',
-      parameters: { type: 'object', properties: {} }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'notion_query_database',
-      description: 'Query a Notion database',
-      parameters: {
-        type: 'object',
-        properties: { databaseId: { type: 'string' } },
-        required: ['databaseId']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'slack_send',
-      description: 'Send a message to a Slack channel',
-      parameters: {
-        type: 'object',
-        properties: {
-          channel: { type: 'string' },
-          text: { type: 'string' }
-        },
-        required: ['channel', 'text']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'slack_list_channels',
-      description: 'List Slack channels',
-      parameters: { type: 'object', properties: {} }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'slack_read_messages',
-      description: 'Read recent messages from a Slack channel',
-      parameters: {
-        type: 'object',
-        properties: {
-          channel: { type: 'string' },
-          limit: { type: 'number' }
-        },
-        required: ['channel']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'github_create_issue',
-      description: 'Create a GitHub issue',
-      parameters: {
-        type: 'object',
-        properties: {
-          owner: { type: 'string' },
-          repo: { type: 'string' },
-          title: { type: 'string' },
-          body: { type: 'string' }
-        },
-        required: ['owner', 'repo', 'title', 'body']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'github_list_repos',
-      description: 'List GitHub repositories',
-      parameters: { type: 'object', properties: {} }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'github_list_issues',
-      description: 'List GitHub issues in a repository',
-      parameters: {
-        type: 'object',
-        properties: {
-          owner: { type: 'string' },
-          repo: { type: 'string' },
-          state: { type: 'string' }
-        },
-        required: ['owner', 'repo']
-      }
-    }
-  }
+  // ── Integrations ──
+  { type: 'function', function: { name: 'gmail_list', description: 'List recent Gmail emails', parameters: { type: 'object', properties: { maxResults: { type: 'number' } } } } },
+  { type: 'function', function: { name: 'gmail_send', description: 'Send email via Gmail', parameters: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'subject', 'body'] } } },
+  { type: 'function', function: { name: 'gmail_read', description: 'Read a Gmail email by ID', parameters: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'] } } },
+  { type: 'function', function: { name: 'gmail_summarize', description: 'Summarize recent emails', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'notion_create_page', description: 'Create Notion page', parameters: { type: 'object', properties: { parentId: { type: 'string' }, title: { type: 'string' }, content: { type: 'string' } }, required: ['parentId', 'title', 'content'] } } },
+  { type: 'function', function: { name: 'notion_list_databases', description: 'List Notion databases', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'notion_query_database', description: 'Query Notion database', parameters: { type: 'object', properties: { databaseId: { type: 'string' } }, required: ['databaseId'] } } },
+  { type: 'function', function: { name: 'slack_send', description: 'Send Slack message', parameters: { type: 'object', properties: { channel: { type: 'string' }, text: { type: 'string' } }, required: ['channel', 'text'] } } },
+  { type: 'function', function: { name: 'slack_list_channels', description: 'List Slack channels', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'slack_read_messages', description: 'Read Slack messages', parameters: { type: 'object', properties: { channel: { type: 'string' }, limit: { type: 'number' } }, required: ['channel'] } } },
+  { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
+  { type: 'function', function: { name: 'github_list_repos', description: 'List GitHub repos', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'github_list_issues', description: 'List GitHub issues', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' } }, required: ['owner', 'repo'] } } },
 ]
 
-const AGENT_SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control a real Chrome browser.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome browser tab.
 
-After every action call browser_snapshot to see what changed. Only call task_complete when the page confirms success — composer closed, form gone, confirmation visible. Never call task_complete just because you clicked something.
+Rules:
+- ALWAYS call browser_snapshot before any action and after every action to see what changed
+- NEVER call task_complete just because you clicked something — wait for visual confirmation (post appeared, form gone, success message)
+- If an element ref is stale, call browser_snapshot again to get fresh refs
+- If something fails twice, try a completely different approach
+- For typing in contenteditable areas (like Twitter/X post box), click first then type`
 
-If an action fails or the page looks the same, try a different approach. Do not repeat the same action more than twice.`
-
-// ─── Agent execution loop ───
+// ─── Agent loop ───
 
 async function runAgentLoop(opts: {
   userId: string
@@ -427,18 +296,16 @@ async function runAgentLoop(opts: {
   taskPrompt: string
   page: Page
   tabKey: string
-  onProgress: (msg: string) => void
+  onProgress: (msg: string) => Promise<void>
 }): Promise<{ success: boolean; summary: string }> {
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: 'system', content: AGENT_SYSTEM_PROMPT },
+    { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user', content: opts.taskPrompt }
   ]
 
   const MAX_ITERATIONS = 20
-  const TOTAL_TIMEOUT_MS = 90_000
-  const deadline = Date.now() + TOTAL_TIMEOUT_MS
+  const deadline = Date.now() + 90_000
 
-  // Outer retry: 2 attempts
   for (let attempt = 0; attempt < 2; attempt++) {
     let iterations = 0
     while (iterations < MAX_ITERATIONS && Date.now() < deadline) {
@@ -447,7 +314,7 @@ async function runAgentLoop(opts: {
       const response = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages,
-        tools: browserTools as any,
+        tools: browserTools,
         tool_choice: 'required',
         max_tokens: 1000,
       })
@@ -456,179 +323,167 @@ async function runAgentLoop(opts: {
       messages.push(msg)
 
       if (!msg.tool_calls?.length) {
-        return { success: false, summary: 'Agent stopped without completing task' }
+        return { success: false, summary: 'Agent stopped unexpectedly' }
       }
 
       const toolResults: OpenAI.ChatCompletionToolMessageParam[] = []
-      for (const tc of msg.tool_calls) {
-        const toolCall = tc as any
+
+      for (const toolCall of msg.tool_calls as any[]) {
         const args = JSON.parse(toolCall.function.arguments || '{}')
         let result: string
 
         try {
           switch (toolCall.function.name) {
+
             case 'browser_snapshot': {
-              opts.onProgress('📸 Reading page...')
+              await opts.onProgress('📸 Reading page...')
               result = await snapshotPage(opts.page, opts.tabKey)
               break
             }
+
             case 'browser_navigate': {
-              opts.onProgress(`🌐 Navigating to ${args.url}...`)
-              // Use the relay's openTab so the extension creates a new tab properly
-              await sendExtensionMessage(opts.userId, 'openTab', { url: args.url }, 15000)
-              // Reconnect Playwright to pick up the new tab
-              const { page: newPage } = await getPlaywrightPage(opts.userId)
-              await newPage.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {})
-              opts.page = newPage
+              await opts.onProgress(`🌐 Navigating to ${args.url}...`)
+              await opts.page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: 20_000 })
+              await opts.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
               result = await snapshotPage(opts.page, opts.tabKey)
-              result = `Navigated to ${args.url}. Page is now:\n${result}`
+              result = `Navigated. Page is now:\n${result}`
               break
             }
+
             case 'browser_click': {
-              opts.onProgress(`🖱️ Clicking ${args.ref}...`)
+              await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
               const locator = refLocator(opts.page, args.ref, opts.tabKey)
               await locator.click({ timeout: 8000 })
               await opts.page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {})
               result = await snapshotPage(opts.page, opts.tabKey)
-              result = `Clicked ${args.ref}. Page is now:\n${result}`
+              result = `Clicked. Page is now:\n${result}`
               break
             }
+
             case 'browser_type': {
-              opts.onProgress(`⌨️ Typing into ${args.ref}...`)
+              await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
               const locator = refLocator(opts.page, args.ref, opts.tabKey)
               await locator.fill(args.text, { timeout: 8000 })
-              if (args.submit) {
-                await locator.press('Enter')
-              }
+              if (args.submit) await locator.press('Enter')
               result = await snapshotPage(opts.page, opts.tabKey)
-              result = `Typed "${args.text}" into ${args.ref}. Page is now:\n${result}`
+              result = `Typed. Page is now:\n${result}`
               break
             }
+
             case 'browser_key': {
-              opts.onProgress(`⌨️ Pressing ${args.key}...`)
+              await opts.onProgress(`⌨️ Pressing ${args.key}...`)
               await opts.page.keyboard.press(args.key)
               result = `Pressed ${args.key}`
               break
             }
+
             case 'browser_scroll': {
-              const amount = args.amount ?? 300
-              await opts.page.mouse.wheel(0, args.direction === 'down' ? amount : -amount)
+              await opts.page.mouse.wheel(0, args.direction === 'down' ? (args.amount ?? 300) : -(args.amount ?? 300))
               result = `Scrolled ${args.direction}`
               break
             }
+
             case 'browser_wait': {
               if (args.ms) await opts.page.waitForTimeout(args.ms)
-              if (args.text) {
-                await opts.page.getByText(args.text).first().waitFor({ state: 'visible', timeout: 5000 })
-              }
+              if (args.text) await opts.page.getByText(args.text).first().waitFor({ state: 'visible', timeout: 5000 })
               result = 'Done waiting'
               break
             }
+
             case 'task_complete': {
-              opts.onProgress(`✅ Done: ${args.summary}`)
+              await opts.onProgress(`✅ ${args.summary}`)
               return { success: true, summary: args.summary }
             }
+
             case 'task_failed': {
               if (attempt === 0) {
-                opts.onProgress(`⚠️ Attempt 1 failed: ${args.reason}. Retrying...`)
-                // Reset messages for retry
-                messages.length = 2 // keep system + user
-                messages.push({ role: 'user', content: `${opts.taskPrompt}\n\nPrevious attempt failed: ${args.reason}. Try a different approach.` })
+                await opts.onProgress(`⚠️ Retrying: ${args.reason}`)
+                messages.length = 2
+                messages[1] = { role: 'user', content: `${opts.taskPrompt}\n\nFirst attempt failed: ${args.reason}. Try a different approach.` }
               } else {
-                opts.onProgress(`❌ Failed: ${args.reason}`)
+                await opts.onProgress(`❌ ${args.reason}`)
                 return { success: false, summary: args.reason }
               }
-              result = 'Retrying...'
+              result = 'Retrying with different approach'
               break
             }
-            // ── Integration tools ──
+
+            // ── Integrations ──
             case 'gmail_list': {
-              const connected = await isProviderConnected(opts.userId, 'gmail')
-              if (!connected) { result = 'Gmail not connected. Ask user to connect Gmail.'; break }
+              if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
               result = JSON.stringify(await gmail.listEmails(opts.userId, { maxResults: args.maxResults || 10 }), null, 2)
               break
             }
             case 'gmail_send': {
-              const connected = await isProviderConnected(opts.userId, 'gmail')
-              if (!connected) { result = 'Gmail not connected. Ask user to connect Gmail.'; break }
+              if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
               await gmail.sendEmail(opts.userId, args.to, args.subject, args.body)
               result = `Email sent to ${args.to}`
               break
             }
             case 'gmail_read': {
-              const connected = await isProviderConnected(opts.userId, 'gmail')
-              if (!connected) { result = 'Gmail not connected. Ask user to connect Gmail.'; break }
+              if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
               result = (await gmail.getEmailContent(opts.userId, args.messageId)).slice(0, 2000)
               break
             }
             case 'gmail_summarize': {
-              const connected = await isProviderConnected(opts.userId, 'gmail')
-              if (!connected) { result = 'Gmail not connected. Ask user to connect Gmail.'; break }
+              if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
               result = await gmail.summarizeEmails(opts.userId)
               break
             }
             case 'notion_create_page': {
-              const connected = await isProviderConnected(opts.userId, 'notion')
-              if (!connected) { result = 'Notion not connected. Ask user to connect Notion.'; break }
+              if (!await isProviderConnected(opts.userId, 'notion')) { result = 'Notion not connected'; break }
               await notion.createPage(opts.userId, args.parentId, args.title, args.content)
-              result = `Created Notion page: ${args.title}`
+              result = `Created page: ${args.title}`
               break
             }
             case 'notion_list_databases': {
-              const connected = await isProviderConnected(opts.userId, 'notion')
-              if (!connected) { result = 'Notion not connected. Ask user to connect Notion.'; break }
+              if (!await isProviderConnected(opts.userId, 'notion')) { result = 'Notion not connected'; break }
               result = JSON.stringify(await notion.listDatabases(opts.userId), null, 2)
               break
             }
             case 'notion_query_database': {
-              const connected = await isProviderConnected(opts.userId, 'notion')
-              if (!connected) { result = 'Notion not connected. Ask user to connect Notion.'; break }
+              if (!await isProviderConnected(opts.userId, 'notion')) { result = 'Notion not connected'; break }
               result = JSON.stringify(await notion.queryDatabase(opts.userId, args.databaseId), null, 2)
               break
             }
             case 'slack_send': {
-              const connected = await isProviderConnected(opts.userId, 'slack')
-              if (!connected) { result = 'Slack not connected. Ask user to connect Slack.'; break }
+              if (!await isProviderConnected(opts.userId, 'slack')) { result = 'Slack not connected'; break }
               await slack.sendMessage(opts.userId, args.channel, args.text)
-              result = `Sent message to ${args.channel}`
+              result = `Sent to ${args.channel}`
               break
             }
             case 'slack_list_channels': {
-              const connected = await isProviderConnected(opts.userId, 'slack')
-              if (!connected) { result = 'Slack not connected. Ask user to connect Slack.'; break }
+              if (!await isProviderConnected(opts.userId, 'slack')) { result = 'Slack not connected'; break }
               result = JSON.stringify(await slack.listChannels(opts.userId), null, 2)
               break
             }
             case 'slack_read_messages': {
-              const connected = await isProviderConnected(opts.userId, 'slack')
-              if (!connected) { result = 'Slack not connected. Ask user to connect Slack.'; break }
+              if (!await isProviderConnected(opts.userId, 'slack')) { result = 'Slack not connected'; break }
               result = JSON.stringify(await slack.getMessages(opts.userId, args.channel, args.limit || 10), null, 2)
               break
             }
             case 'github_create_issue': {
-              const connected = await isProviderConnected(opts.userId, 'github')
-              if (!connected) { result = 'GitHub not connected. Ask user to connect GitHub.'; break }
-              result = `Created GitHub issue: ${args.title}`
+              if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
+              result = `Created issue: ${args.title}`
               break
             }
             case 'github_list_repos': {
-              const connected = await isProviderConnected(opts.userId, 'github')
-              if (!connected) { result = 'GitHub not connected. Ask user to connect GitHub.'; break }
+              if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
               result = JSON.stringify(await github.listRepos(opts.userId), null, 2)
               break
             }
             case 'github_list_issues': {
-              const connected = await isProviderConnected(opts.userId, 'github')
-              if (!connected) { result = 'GitHub not connected. Ask user to connect GitHub.'; break }
+              if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
               result = JSON.stringify(await github.listIssues(opts.userId, args.owner, args.repo, args.state || 'open'), null, 2)
               break
             }
+
             default:
               result = `Unknown tool: ${toolCall.function.name}`
           }
         } catch (err) {
           result = `Error: ${err instanceof Error ? err.message : String(err)}`
-          opts.onProgress(`⚠️ Error: ${result}`)
+          await opts.onProgress(`⚠️ ${result}`)
         }
 
         toolResults.push({
@@ -642,18 +497,12 @@ async function runAgentLoop(opts: {
     }
   }
 
-  return { success: false, summary: 'Task exceeded maximum iterations' }
+  return { success: false, summary: 'Exceeded max iterations' }
 }
 
 // ─── Entry point ───
 
-type StepLog = {
-  step: number
-  description: string
-  action: string
-  success: boolean
-  errorMsg?: string
-}
+type StepLog = { step: number; description: string; action: string; success: boolean; errorMsg?: string }
 
 export async function runAgentWithExtension(
   task: string,
@@ -662,9 +511,7 @@ export async function runAgentWithExtension(
   taskId?: string
 ): Promise<string> {
   const taskKey = taskId || `${userId}:${task.slice(0, 50)}`
-  if (runningTasks.has(taskKey)) {
-    throw new Error(`Task already running for ${taskKey}`)
-  }
+  if (runningTasks.has(taskKey)) throw new Error(`Task already running`)
   runningTasks.add(taskKey)
 
   const startTime = Date.now()
@@ -673,7 +520,7 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('🔌 Connecting to your browser via Playwright...')
+    await onStep('🔌 Connecting to your browser...')
     const { page } = await getPlaywrightPage(userId)
     const tabKey = `${userId}:${Date.now()}`
 
@@ -684,52 +531,32 @@ export async function runAgentWithExtension(
       page,
       tabKey,
       onProgress: async (msg) => {
-        stepsLog.push({
-          step: stepsLog.length + 1,
-          description: msg,
-          action: msg,
-          success: !msg.startsWith('⚠️') && !msg.startsWith('❌')
-        })
+        stepsLog.push({ step: stepsLog.length + 1, description: msg, action: msg, success: !msg.startsWith('⚠️') && !msg.startsWith('❌') })
         await onStep(msg)
       }
     })
 
     status = result.success ? 'success' : 'error'
     resultSummary = result.summary
-
-    if (taskId) {
-      await createMessage(userId, taskId, result.success ? `✅ ${resultSummary}` : resultSummary.slice(0, 300))
-    }
-
+    if (taskId) await createMessage(userId, taskId, result.success ? `✅ ${resultSummary}` : resultSummary.slice(0, 300))
     return resultSummary
+
   } catch (err) {
     status = 'error'
-    resultSummary = String(err)
-    if (taskId) {
-      await createMessage(userId, taskId, resultSummary.slice(0, 300))
-    }
+    resultSummary = err instanceof Error ? err.message : String(err)
+    if (taskId) await createMessage(userId, taskId, resultSummary.slice(0, 300))
     return resultSummary
+
   } finally {
     runningTasks.delete(taskKey)
-
-    const completedAt = new Date().toISOString()
-    const durationMs = Date.now() - startTime
-
     try {
       await supabase.from('task_executions').insert({
-        user_id: userId,
-        task_id: taskId || null,
-        task_prompt: task,
-        plan: [],
-        status,
-        result_summary: resultSummary.slice(0, 1000),
-        steps_log: stepsLog,
+        user_id: userId, task_id: taskId || null, task_prompt: task, plan: [],
+        status, result_summary: resultSummary.slice(0, 1000), steps_log: stepsLog,
         started_at: new Date(startTime).toISOString(),
-        completed_at: completedAt,
-        duration_ms: durationMs
+        completed_at: new Date().toISOString(),
+        duration_ms: Date.now() - startTime
       })
-    } catch (insertErr) {
-      console.error('Failed to insert task_execution:', insertErr)
-    }
+    } catch (e) { console.error('task_executions insert failed:', e) }
   }
 }

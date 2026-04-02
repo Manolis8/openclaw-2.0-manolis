@@ -246,31 +246,36 @@ export async function startRelayServer(userId: string): Promise<RelayInfo> {
 
         case 'Target.attachToTarget': {
           const targetId = params.targetId as string
-          // Use existing session or create one
-          let session: Session | undefined
-          for (const [, s] of sessions) {
-            session = s
-            break
+
+          // Look up the real session the extension announced for this target
+          const real = targetId ? attachedTabs.get(targetId) : undefined
+          const firstReal = real ?? attachedTabs.values().next().value
+
+          if (firstReal) {
+            // Make sure it's registered in sessions for page-level CDP routing
+            if (!sessions.has(firstReal.sessionId)) {
+              sessions.set(firstReal.sessionId, {
+                sessionId: firstReal.sessionId,
+                tabId: firstReal.tabId ?? sessionCounter
+              })
+            }
+            sendResult(id, { sessionId: firstReal.sessionId })
+            sendEvent('Target.attachedToTarget', {
+              sessionId: firstReal.sessionId,
+              targetInfo: {
+                targetId: firstReal.targetId,
+                type: 'page',
+                title: '',
+                url: '',
+                attached: true,
+                canAccessOpener: false
+              },
+              waitingForDebugger: false
+            })
+          } else {
+            // No real tab attached yet
+            sendError(id, -32001, 'No tab attached. Click the Felo extension badge ON on a Chrome tab first.')
           }
-          if (!session) {
-            sessionCounter++
-            const sid = `session-${sessionCounter}`
-            session = { sessionId: sid, tabId: sessionCounter }
-            sessions.set(sid, session)
-          }
-          sendResult(id, { sessionId: session.sessionId })
-          sendEvent('Target.attachedToTarget', {
-            sessionId: session.sessionId,
-            targetInfo: {
-              targetId: targetId || `target-${session.tabId}`,
-              type: 'page',
-              title: '',
-              url: '',
-              attached: true,
-              canAccessOpener: false
-            },
-            waitingForDebugger: false
-          })
           break
         }
 

@@ -7,7 +7,7 @@ import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { connectionsRouter } from './routes/connections.js'
 import { oauthRouter } from './routes/oauth.js'
-import { setExtensionBridge, startRelayServer, stopRelayServer } from './lib/relay-server.js'
+import { setExtensionBridge, startRelayServer, stopRelayServer, handleExtensionEvent } from './lib/relay-server.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -150,6 +150,7 @@ wss.on('connection', async (ws, req) => {
       }
       if (msg.method === 'forwardCDPEvent') {
         console.log(`CDP event from ${userId}: ${msg.params?.method}`)
+        handleExtensionEvent(userId, msg.params?.method, msg.params?.params)
       }
     } catch (err) {
       console.error('Extension message error:', err)
