@@ -6,9 +6,17 @@ interface RelayInfo {
   server: Server
   cdpWsUrl: string
   port: number
+  _wss: WebSocketServer
+  _sessions: Map<string, Session>
 }
 
 const relayServers = new Map<string, RelayInfo>()
+
+// Real tab sessions announced by the extension via Target.attachedToTarget events
+const attachedTabs = new Map<string, { sessionId: string; targetId: string; tabId?: number }>()
+
+// Session map shared across all connections for this relay server instance
+type Session = { sessionId: string; tabId: number }
 
 // Forward declarations — index.ts provides these via setExtensionBridge
 let _getConnection: (userId: string) => WebSocket | undefined
@@ -47,6 +55,34 @@ function sendThroughRelay(
     })
     ws.send(JSON.stringify({ ...message, id }))
   })
+}
+
+// Called by index.ts when the extension sends a CDP event
+export function handleExtensionEvent(userId: string, eventMethod: string, eventParams: any) {
+  const info = relayServers.get(userId)
+  if (!info) return
+
+  // Track real attached tabs
+  if (eventMethod === 'Target.attachedToTarget' && eventParams?.sessionId && eventParams?.targetInfo?.targetId) {
+    attachedTabs.set(eventParams.targetInfo.targetId, {
+      sessionId: eventParams.sessionId,
+      targetId: eventParams.targetInfo.targetId,
+      tabId: eventParams.targetInfo.tabId
+    })
+    // Register in sessions map so page-level CDP routing works
+    info._sessions.set(eventParams.sessionId, {
+      sessionId: eventParams.sessionId,
+      tabId: eventParams.targetInfo.tabId ?? 1
+    })
+  }
+
+  // Forward the event to all Playwright clients connected to this user's relay
+  const eventMsg = JSON.stringify({ method: eventMethod, params: eventParams })
+  for (const client of info._wss.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(eventMsg)
+    }
+  }
 }
 
 export async function startRelayServer(userId: string): Promise<RelayInfo> {
@@ -89,7 +125,6 @@ export async function startRelayServer(userId: string): Promise<RelayInfo> {
   // Playwright uses sessionId to multiplex commands on a single WebSocket.
   // The extension relay uses tabId. We bridge by mapping sessionId → tabId.
 
-  type Session = { sessionId: string; tabId: number }
   const sessions = new Map<string, Session>()
   let sessionCounter = 0
   let browserContextId: string | null = null
@@ -181,15 +216,15 @@ export async function startRelayServer(userId: string): Promise<RelayInfo> {
         }
 
         case 'Target.getTargets': {
-          try {
-            const result = await sendThroughRelay(userId, {
-              method: 'forwardCDPCommand',
-              params: { method: 'Target.getTargets', params: {} }
-            })
-            sendResult(id, result ?? { targetInfos: [] })
-          } catch {
-            sendResult(id, { targetInfos: [] })
-          }
+          const targetInfos = Array.from(attachedTabs.values()).map(t => ({
+            targetId: t.targetId,
+            type: 'page',
+            title: '',
+            url: '',
+            attached: true,
+            canAccessOpener: false
+          }))
+          sendResult(id, { targetInfos })
           break
         }
 
@@ -293,7 +328,9 @@ export async function startRelayServer(userId: string): Promise<RelayInfo> {
       const info: RelayInfo = {
         server,
         port: addr.port,
-        cdpWsUrl: `ws://127.0.0.1:${addr.port}/cdp`
+        cdpWsUrl: `ws://127.0.0.1:${addr.port}/cdp`,
+        _wss: wss,
+        _sessions: sessions
       }
       relayServers.set(userId, info)
       console.log(`📡 CDP relay for ${userId} on port ${addr.port}`)
