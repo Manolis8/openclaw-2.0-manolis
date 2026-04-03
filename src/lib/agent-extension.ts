@@ -1,5 +1,5 @@
 import OpenAI from 'openai'
-import { sendExtensionMessage, extensionConnections } from '../index.js'
+import { sendCdpCommand, extensionConnections } from '../index.js'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
 import { supabase } from './supabase.js'
@@ -18,30 +18,55 @@ async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<vo
     throw new Error('Extension not connected. Install the Felo extension and make sure it is connected.')
   }
 
-  await sendExtensionMessage(userId, 'createAndAttachTab', { url }, 15000)
+  await sendCdpCommand(userId, 'Target.createTarget', { url }, 1, 10000)
+  const targets = await sendCdpCommand(userId, 'Target.getTargets', {}, 1, 5000) as any
+  const targetInfos = targets?.targetInfos ?? []
+  const targetId = targetInfos[targetInfos.length - 1]?.targetId
+  if (targetId) {
+    await sendCdpCommand(userId, 'Target.attachToTarget', { targetId, flatten: true }, 1, 10000)
+  }
   await new Promise(resolve => setTimeout(resolve, 1500))
 }
 
 async function closeTab(userId: string): Promise<void> {
-  const ws = extensionConnections.get(userId)
-  if (!ws || ws.readyState !== 1) return
-
   try {
-    await sendExtensionMessage(userId, 'closeCurrentTab', {}, 5000)
+    const targets = await sendCdpCommand(userId, 'Target.getTargets', {}, 1, 5000) as any
+    const targetInfos = targets?.targetInfos ?? []
+    const targetId = targetInfos[targetInfos.length - 1]?.targetId
+    if (targetId) {
+      await sendCdpCommand(userId, 'Target.closeTarget', { targetId }, 1, 5000)
+    }
   } catch {}
 }
 
 async function navigateTo(userId: string, url: string): Promise<void> {
-  await sendExtensionMessage(userId, 'navigateTo', { url }, 20000)
-  await new Promise(resolve => setTimeout(resolve, 2000))
+  await sendCdpCommand(userId, 'Page.navigate', { url }, 1, 20000)
+  await new Promise(resolve => setTimeout(resolve, 2500))
+}
+
+async function getPageUrl(userId: string): Promise<string> {
+  try {
+    const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+      expression: 'window.location.href',
+      returnByValue: true
+    }, 1, 5000) as any
+    return result?.result?.value ?? 'unknown'
+  } catch {
+    return 'unknown'
+  }
 }
 
 async function getAriaSnapshot(userId: string): Promise<string> {
-  const result = await sendExtensionMessage(userId, 'getAriaSnapshot', {}, 15000) as any
-  const url = result?.url ?? 'unknown'
-  const nodes = result?.nodes ?? []
-  const lines = buildSnapshotWithRefs(nodes, userId, '')
-  return `URL: ${url}\n${lines || '(no interactive elements)'}`
+  try {
+    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, 1, 15000) as any
+    const nodes = result?.nodes ?? []
+    const url = await getPageUrl(userId)
+    const lines = buildSnapshotWithRefs(nodes, userId, '')
+    return `URL: ${url}\n${lines || '(no interactive elements)'}`
+  } catch {
+    const url = await getPageUrl(userId)
+    return `URL: ${url}\n(no interactive elements)`
+  }
 }
 
 const INTERACTIVE_ROLES = new Set([
@@ -80,11 +105,16 @@ function buildSnapshotWithRefs(
 }
 
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
-  const result = await sendExtensionMessage(userId, 'getAriaSnapshot', {}, 15000) as any
-  const url = result?.url ?? 'unknown'
-  const nodes = result?.nodes ?? []
-  const snapshot = buildSnapshotWithRefs(nodes, userId, tabKey)
-  return `URL: ${url}\n${snapshot}`
+  try {
+    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, 1, 15000) as any
+    const nodes = result?.nodes ?? []
+    const url = await getPageUrl(userId)
+    const snapshot = buildSnapshotWithRefs(nodes, userId, tabKey)
+    return `URL: ${url}\n${snapshot}`
+  } catch {
+    const url = await getPageUrl(userId)
+    return `URL: ${url}\n(no interactive elements)`
+  }
 }
 
 async function clickRef(userId: string, tabKey: string, ref: string): Promise<void> {
@@ -92,11 +122,11 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  if (target.name) {
-    await sendExtensionMessage(userId, 'clickByText', { text: target.name }, 10000)
-  } else {
-    await sendExtensionMessage(userId, 'clickByRole', { role: target.role }, 10000)
-  }
+  const selector = `[aria-label="${target.name?.replace(/"/g, '\\"')}"]`
+  await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `document.querySelector('${selector}')?.click()`,
+    returnByValue: true
+  }, 1, 10000)
   await new Promise(resolve => setTimeout(resolve, 500))
 }
 
@@ -105,31 +135,122 @@ async function typeInRef(userId: string, tabKey: string, ref: string, text: stri
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  if (target.name) {
-    await sendExtensionMessage(userId, 'typeIntoByText', { text: target.name, value: text }, 10000)
-  } else {
-    await sendExtensionMessage(userId, 'typeIntoByRole', { role: target.role, value: text }, 10000)
-  }
+  const escapedText = JSON.stringify(text)
+  await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `(el => {
+      if (!el) return false;
+      el.focus();
+      if (el.isContentEditable) {
+        el.textContent = ${escapedText};
+      } else {
+        el.value = ${escapedText};
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })(document.querySelector('[aria-label="${target.name?.replace(/"/g, '\\"')}")))`,
+    returnByValue: true
+  }, 1, 10000)
 }
 
 async function pressKey(userId: string, key: string): Promise<void> {
-  await sendExtensionMessage(userId, 'pressKey', { key }, 5000)
+  const keyMap: Record<string, { code: string; keyCode: number }> = {
+    'Enter': { code: 'Enter', keyCode: 13 },
+    'Tab': { code: 'Tab', keyCode: 9 },
+    'Escape': { code: 'Escape', keyCode: 27 },
+    'ArrowDown': { code: 'ArrowDown', keyCode: 40 },
+    'ArrowUp': { code: 'ArrowUp', keyCode: 38 },
+  }
+  const k = keyMap[key] ?? { code: key, keyCode: 0 }
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
+    type: 'keyDown', key, code: k.code, keyCode: k.keyCode
+  }, 1, 5000)
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
+    type: 'keyUp', key, code: k.code, keyCode: k.keyCode
+  }, 1, 5000)
 }
 
 async function scrollPage(userId: string, direction: 'up' | 'down', amount = 300): Promise<void> {
-  await sendExtensionMessage(userId, 'scrollPage', { direction, amount }, 5000)
+  const delta = direction === 'down' ? amount : -amount
+  await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `window.scrollBy(0, ${delta})`,
+    returnByValue: true
+  }, 1, 5000)
 }
 
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
-  { type: 'function', function: { name: 'browser_snapshot', description: 'Read the current page. Returns interactive elements with ref IDs. ALWAYS call first and after every action.', parameters: { type: 'object', properties: {}, required: [] } } },
-  { type: 'function', function: { name: 'browser_navigate', description: 'Navigate to a URL.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
-  { type: 'function', function: { name: 'browser_click', description: 'Click an element by ref from the last snapshot.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] } } },
-  { type: 'function', function: { name: 'browser_type', description: 'Type text into an input or textbox.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
-  { type: 'function', function: { name: 'browser_key', description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
-  { type: 'function', function: { name: 'browser_scroll', description: 'Scroll the page.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
-  { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
-  { type: 'function', function: { name: 'task_complete', description: 'Task done. Only call after visual confirmation.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
-  { type: 'function', function: { name: 'task_failed', description: 'Task failed.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] } } },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_snapshot',
+      description: 'Read the current page. Returns interactive elements with ref IDs. ALWAYS call first and after every action.',
+      parameters: { type: 'object', properties: {}, required: [] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_navigate',
+      description: 'Navigate to a URL.',
+      parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_click',
+      description: 'Click an element by ref from the last snapshot.',
+      parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_type',
+      description: 'Type text into an input or textbox.',
+      parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_key',
+      description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.',
+      parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_scroll',
+      description: 'Scroll the page.',
+      parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_wait',
+      description: 'Wait milliseconds.',
+      parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'task_complete',
+      description: 'Task done. Only call after visual confirmation.',
+      parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'task_failed',
+      description: 'Task failed.',
+      parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] }
+    }
+  },
   { type: 'function', function: { name: 'gmail_list', description: 'List Gmail emails', parameters: { type: 'object', properties: { maxResults: { type: 'number' } } } } },
   { type: 'function', function: { name: 'gmail_send', description: 'Send email', parameters: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'subject', 'body'] } } },
   { type: 'function', function: { name: 'gmail_read', description: 'Read email', parameters: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'] } } },
@@ -145,7 +266,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control the user's Chrome browser via the Felo extension.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control the user's Chrome browser via CDP through the Felo extension.
 
 Rules:
 - ALWAYS call browser_snapshot before any action and after every action
@@ -206,7 +327,7 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_click': {
-              await opts.onProgress(`����️ Clicking ${args.ref}...`)
+              await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
               await clickRef(opts.userId, opts.tabKey, args.ref)
               result = await snapshotPage(opts.userId, opts.tabKey)
               result = `Clicked. Page:\n${result}`
