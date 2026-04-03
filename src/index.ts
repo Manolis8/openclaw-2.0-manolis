@@ -170,7 +170,7 @@ wss.on('connection', async (ws, req) => {
   ws.on('error', (err) => console.error(`WS error for ${userId}:`, err))
 })
 
-let cdpCommandId = 1
+export let cdpCommandId = 1
 setExtensionBridge({
   getConnection: (userId) => extensionConnections.get(userId),
   getPending: (userId) => pendingCdpCommands.get(userId),

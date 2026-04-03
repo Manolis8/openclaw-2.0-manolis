@@ -1,5 +1,5 @@
 import OpenAI from 'openai'
-import { sendCdpCommand, extensionConnections } from '../index.js'
+import { sendCdpCommand, sendExtensionMessage, extensionConnections } from '../index.js'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
 import { supabase } from './supabase.js'
@@ -11,6 +11,7 @@ import * as github from './integrations/github.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nodeId: string }>>()
+const userTabIds = new Map<string, number>()
 
 async function enableDomains(userId: string): Promise<void> {
   await sendCdpCommand(userId, 'Runtime.enable', {}, 1, 5000).catch(() => {})
@@ -18,45 +19,63 @@ async function enableDomains(userId: string): Promise<void> {
   await sendCdpCommand(userId, 'Log.enable', {}, 1, 5000).catch(() => {})
 }
 
-async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<void> {
+async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<number> {
   const ws = extensionConnections.get(userId)
   if (!ws || ws.readyState !== 1) {
-    throw new Error('Extension not connected. Install the Felo extension and make sure it is connected.')
+    throw new Error('Extension not connected. Make sure the Felo extension is installed and connected.')
   }
 
-  await sendCdpCommand(userId, 'Target.createTarget', { url }, 1, 10000)
-  const targets = await sendCdpCommand(userId, 'Target.getTargets', {}, 1, 5000) as any
-  const targetInfos = targets?.targetInfos ?? []
-  const targetId = targetInfos[targetInfos.length - 1]?.targetId
-  if (targetId) {
-    await sendCdpCommand(userId, 'Target.attachToTarget', { targetId, flatten: true }, 1, 10000)
+  console.log(`[agent] sending createAndAttachTab to extension for user ${userId}`)
+
+  const { pendingCdpCommands } = await import('../index.js')
+  let cmdId: number
+  {
+    const mod = await import('../index.js')
+    cmdId = mod.cdpCommandId ? mod.cdpCommandId++ : Math.floor(Math.random() * 100000)
   }
-  await new Promise(resolve => setTimeout(resolve, 1000))
-  await enableDomains(userId)
+
+  const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url }, 20000) as any
+  console.log(`[agent] createAndAttachTab response:`, JSON.stringify(result))
+
+  const tabId = result?.tabId
+  if (!tabId || typeof tabId !== 'number') {
+    throw new Error(`Extension did not return a valid tabId. Got: ${JSON.stringify(result)}`)
+  }
+
+  userTabIds.set(userId, tabId)
+  console.log(`[agent] tab ${tabId} opened and attached for user ${userId}`)
+  await new Promise(r => setTimeout(r, 1500))
+  return tabId
 }
 
 async function closeTab(userId: string): Promise<void> {
+  const tabId = userTabIds.get(userId)
+  if (!tabId) return
   try {
-    const targets = await sendCdpCommand(userId, 'Target.getTargets', {}, 1, 5000) as any
-    const targetInfos = targets?.targetInfos ?? []
-    const targetId = targetInfos[targetInfos.length - 1]?.targetId
-    if (targetId) {
-      await sendCdpCommand(userId, 'Target.closeTarget', { targetId }, 1, 5000)
-    }
+    await sendCdpCommand(userId, 'Target.closeTarget', { targetId: `tab-${tabId}` }, tabId, 5000)
   } catch {}
+  userTabIds.delete(userId)
+}
+
+function getTabId(userId: string): number {
+  const tabId = userTabIds.get(userId)
+  if (!tabId) throw new Error(`No tab opened for user ${userId}`)
+  return tabId
 }
 
 async function navigateTo(userId: string, url: string): Promise<void> {
-  await sendCdpCommand(userId, 'Page.navigate', { url }, 1, 20000)
+  const tabId = getTabId(userId)
+  await sendCdpCommand(userId, 'Page.navigate', { url }, tabId, 20000)
   await new Promise(resolve => setTimeout(resolve, 2500))
 }
 
 async function getPageUrl(userId: string): Promise<string> {
+  const tabId = getTabId(userId)
   try {
     const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
       expression: 'window.location.href',
       returnByValue: true
-    }, 1, 5000) as any
+    }, tabId, 5000) as any
     return result?.result?.value ?? 'unknown'
   } catch {
     return 'unknown'
@@ -64,9 +83,10 @@ async function getPageUrl(userId: string): Promise<string> {
 }
 
 async function getAriaSnapshot(userId: string): Promise<string> {
+  const tabId = getTabId(userId)
   const url = await getPageUrl(userId)
   try {
-    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, 1, 10000) as any
+    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, tabId, 10000) as any
     const nodes = result?.nodes ?? []
     if (nodes.length > 0) {
       const lines = buildSnapshotWithRefs(nodes, userId, '')
@@ -112,9 +132,10 @@ function buildSnapshotWithRefs(
 }
 
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
+  const tabId = getTabId(userId)
   const url = await getPageUrl(userId)
   try {
-    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, 1, 10000) as any
+    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, tabId, 10000) as any
     const nodes = result?.nodes ?? []
     if (nodes.length > 0) {
       const snapshot = buildSnapshotWithRefs(nodes, userId, tabKey)
@@ -125,6 +146,7 @@ async function snapshotPage(userId: string, tabKey: string): Promise<string> {
 }
 
 async function clickRef(userId: string, tabKey: string, ref: string): Promise<void> {
+  const tabId = getTabId(userId)
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
@@ -133,11 +155,12 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
   await sendCdpCommand(userId, 'Runtime.evaluate', {
     expression: `document.querySelector('${selector}')?.click()`,
     returnByValue: true
-  }, 1, 10000)
+  }, tabId, 10000)
   await new Promise(resolve => setTimeout(resolve, 500))
 }
 
 async function typeInRef(userId: string, tabKey: string, ref: string, text: string): Promise<void> {
+  const tabId = getTabId(userId)
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
@@ -157,10 +180,11 @@ async function typeInRef(userId: string, tabKey: string, ref: string, text: stri
       return true;
     })(document.querySelector('[aria-label="${target.name?.replace(/"/g, '\\"')}")))`,
     returnByValue: true
-  }, 1, 10000)
+  }, tabId, 10000)
 }
 
 async function pressKey(userId: string, key: string): Promise<void> {
+  const tabId = getTabId(userId)
   const keyMap: Record<string, { code: string; keyCode: number }> = {
     'Enter': { code: 'Enter', keyCode: 13 },
     'Tab': { code: 'Tab', keyCode: 9 },
@@ -171,18 +195,19 @@ async function pressKey(userId: string, key: string): Promise<void> {
   const k = keyMap[key] ?? { code: key, keyCode: 0 }
   await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
     type: 'keyDown', key, code: k.code, keyCode: k.keyCode
-  }, 1, 5000)
+  }, tabId, 5000)
   await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
     type: 'keyUp', key, code: k.code, keyCode: k.keyCode
-  }, 1, 5000)
+  }, tabId, 5000)
 }
 
 async function scrollPage(userId: string, direction: 'up' | 'down', amount = 300): Promise<void> {
+  const tabId = getTabId(userId)
   const delta = direction === 'down' ? amount : -amount
   await sendCdpCommand(userId, 'Runtime.evaluate', {
     expression: `window.scrollBy(0, ${delta})`,
     returnByValue: true
-  }, 1, 5000)
+  }, tabId, 5000)
 }
 
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
