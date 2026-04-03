@@ -1,6 +1,7 @@
 import OpenAI from 'openai'
 import { chromium } from 'playwright'
 import type { Browser, Page } from 'playwright'
+import { getRelayServerInfo } from './relay-server.js'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
 import { supabase } from './supabase.js'
@@ -12,40 +13,39 @@ import * as github from './integrations/github.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
-// ─── Playwright browser (headed, visible window) ───
+const userBrowsers = new Map<string, Browser>()
 
-let browser: Browser | null = null
-
-async function getBrowser(): Promise<Browser> {
-  if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch({
-      headless: true, // Railway has no X server, use headless
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
-    })
-    console.log('[playwright] browser launched')
+async function getPageForUser(userId: string): Promise<Page> {
+  const relay = getRelayServerInfo(userId)
+  if (!relay) {
+    throw new Error('Extension not connected. Click the Felo badge ON on a Chrome tab first.')
   }
-  return browser
-}
 
-async function newPage(): Promise<Page> {
-  const b = await getBrowser()
-  const context = await b.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  })
-  return context.newPage()
-}
+  // ws://127.0.0.1:{port}/cdp → http://127.0.0.1:{port}
+  const cdpUrl = relay.cdpWsUrl.replace('ws://', 'http://').replace('/cdp', '')
+  console.log(`[playwright] connecting to ${cdpUrl}`)
 
-async function closeBrowser(): Promise<void> {
-  if (browser && browser.isConnected()) {
-    await browser.close()
-    browser = null
-    console.log('[playwright] browser closed')
-  }
+  // Close stale connection if any
+  const old = userBrowsers.get(userId)
+  if (old) { try { await old.close() } catch {} userBrowsers.delete(userId) }
+
+  const browser = await chromium.connectOverCDP(cdpUrl, { timeout: 15_000 })
+  userBrowsers.set(userId, browser)
+  browser.on('disconnected', () => userBrowsers.delete(userId))
+
+  const contexts = browser.contexts()
+  if (!contexts.length) throw new Error('No browser context. Is a tab attached?')
+
+  const pages = contexts[0].pages()
+  if (!pages.length) throw new Error('No open tabs. Click the Felo extension badge ON on a Chrome tab.')
+
+  const page = pages.find(p => {
+    const u = p.url()
+    return u && u !== 'about:blank' && !u.startsWith('chrome://')
+  }) ?? pages[0]
+
+  console.log(`[playwright] connected to page: ${page.url()}`)
+  return page
 }
 
 // ─── Snapshot / role-ref system ───
@@ -505,8 +505,8 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('☁️ Starting cloud browser...')
-    const page = await newPage()
+    await onStep('🔌 Connecting to your browser...')
+    const page = await getPageForUser(userId)
     const tabKey = `${userId}:${Date.now()}`
 
     const result = await runAgentLoop({
@@ -534,9 +534,6 @@ export async function runAgentWithExtension(
 
   } finally {
     runningTasks.delete(taskKey)
-    
-    // Close browser after task completes
-    await closeBrowser()
     
     try {
       await supabase.from('task_executions').insert({
