@@ -149,12 +149,43 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const selector = `[aria-label="${target.name?.replace(/"/g, '\\"')}"]`
-  await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `document.querySelector('${selector}')?.click()`,
+  const nameSafe = (target.name ?? '').replace(/`/g, '\\`').replace(/\\/g, '\\\\')
+  const targetRole = target.role
+
+  const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `
+      (() => {
+        let el = document.querySelector('[aria-label="${nameSafe}"]');
+        if (!el) {
+          const candidates = document.querySelectorAll('[role="${targetRole}"]');
+          for (const c of candidates) {
+            if (c.textContent?.trim() === '${nameSafe}' || c.getAttribute('aria-label') === '${nameSafe}') {
+              el = c; break;
+            }
+          }
+        }
+        if (!el) el = document.querySelector('[role="${targetRole}"]');
+        if (!el && ('${targetRole}' === 'button' || '${targetRole}' === 'link')) {
+          const all = document.querySelectorAll('${targetRole === 'link' ? 'a' : 'button'}');
+          for (const c of all) {
+            if (c.textContent?.trim() === '${nameSafe}' || c.getAttribute('aria-label') === '${nameSafe}') {
+              el = c; break;
+            }
+          }
+        }
+        if (!el) return 'not_found';
+        el.focus();
+        el.click();
+        return 'clicked';
+      })()
+    `,
     returnByValue: true
-  }, tabId, 10000)
-  await new Promise(resolve => setTimeout(resolve, 500))
+  }, tabId, 10000) as any
+
+  if (result?.result?.value === 'not_found') {
+    throw new Error(`Could not find element for ref "${ref}" (${target.role} "${target.name}"). Take a new snapshot.`)
+  }
+  await new Promise(r => setTimeout(r, 300))
 }
 
 async function typeInRef(userId: string, tabKey: string, ref: string, text: string): Promise<void> {
@@ -163,22 +194,40 @@ async function typeInRef(userId: string, tabKey: string, ref: string, text: stri
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const escapedText = JSON.stringify(text)
+  const nameSafe = (target.name ?? '').replace(/`/g, '\\`').replace(/\\/g, '\\\\')
+  const targetRole = target.role
+
   await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `(el => {
-      if (!el) return false;
-      el.focus();
-      if (el.isContentEditable) {
-        el.textContent = ${escapedText};
-      } else {
-        el.value = ${escapedText};
-      }
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    })(document.querySelector('[aria-label="${target.name?.replace(/"/g, '\\"')}")))`,
+    expression: `
+      (() => {
+        let el = document.querySelector('[aria-label="${nameSafe}"]');
+        if (!el) {
+          const candidates = document.querySelectorAll('[role="${targetRole}"]');
+          for (const c of candidates) {
+            if (c.getAttribute('aria-label') === '${nameSafe}' || c.textContent?.trim() === '${nameSafe}') {
+              el = c; break;
+            }
+          }
+        }
+        if (!el) el = document.querySelector('[role="${targetRole}"]');
+        if (!el) return false;
+        el.focus();
+        el.click();
+        return true;
+      })()
+    `,
     returnByValue: true
   }, tabId, 10000)
+
+  await new Promise(r => setTimeout(r, 200))
+
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
+  await new Promise(r => setTimeout(r, 100))
+
+  await sendCdpCommand(userId, 'Input.insertText', { text }, tabId, 5000)
+
+  await new Promise(r => setTimeout(r, 200))
 }
 
 async function pressKey(userId: string, key: string): Promise<void> {
@@ -296,13 +345,15 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control the user's Chrome browser via CDP through the Felo extension.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome browser tab via CDP.
 
-Rules:
+RULES:
 - ALWAYS call browser_snapshot before any action and after every action
-- NEVER call task_complete without visual confirmation the task worked
-- If a ref fails, call browser_snapshot again for fresh refs
-- Do not attempt to log in — assume user is already logged in`
+- NEVER call task_complete without visual confirmation — you must see the post/form/item actually appear
+- For Twitter/X posting: navigate to https://x.com → snapshot → click the post composer textbox (role=textbox) → type the text → snapshot to verify text appeared → click the Post button → snapshot to confirm post was published
+- After clicking Post, wait and snapshot again — look for the composer to close or the post to appear in the feed
+- If a ref fails, snapshot again for fresh refs
+- Never try to log in`
 
 async function runAgentLoop(opts: {
   userId: string
