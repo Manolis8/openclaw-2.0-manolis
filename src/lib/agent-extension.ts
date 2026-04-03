@@ -12,6 +12,12 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nodeId: string }>>()
 
+async function enableDomains(userId: string): Promise<void> {
+  await sendCdpCommand(userId, 'Runtime.enable', {}, 1, 5000).catch(() => {})
+  await sendCdpCommand(userId, 'Page.enable', {}, 1, 5000).catch(() => {})
+  await sendCdpCommand(userId, 'Log.enable', {}, 1, 5000).catch(() => {})
+}
+
 async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<void> {
   const ws = extensionConnections.get(userId)
   if (!ws || ws.readyState !== 1) {
@@ -25,7 +31,8 @@ async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<vo
   if (targetId) {
     await sendCdpCommand(userId, 'Target.attachToTarget', { targetId, flatten: true }, 1, 10000)
   }
-  await new Promise(resolve => setTimeout(resolve, 1500))
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  await enableDomains(userId)
 }
 
 async function closeTab(userId: string): Promise<void> {
@@ -57,16 +64,16 @@ async function getPageUrl(userId: string): Promise<string> {
 }
 
 async function getAriaSnapshot(userId: string): Promise<string> {
+  const url = await getPageUrl(userId)
   try {
-    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, 1, 15000) as any
+    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, 1, 10000) as any
     const nodes = result?.nodes ?? []
-    const url = await getPageUrl(userId)
-    const lines = buildSnapshotWithRefs(nodes, userId, '')
-    return `URL: ${url}\n${lines || '(no interactive elements)'}`
-  } catch {
-    const url = await getPageUrl(userId)
-    return `URL: ${url}\n(no interactive elements)`
-  }
+    if (nodes.length > 0) {
+      const lines = buildSnapshotWithRefs(nodes, userId, '')
+      return `URL: ${url}\n${lines || '(no interactive elements)'}`
+    }
+  } catch {}
+  return `URL: ${url}\n(no interactive elements)`
 }
 
 const INTERACTIVE_ROLES = new Set([
@@ -105,16 +112,16 @@ function buildSnapshotWithRefs(
 }
 
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
+  const url = await getPageUrl(userId)
   try {
-    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, 1, 15000) as any
+    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, 1, 10000) as any
     const nodes = result?.nodes ?? []
-    const url = await getPageUrl(userId)
-    const snapshot = buildSnapshotWithRefs(nodes, userId, tabKey)
-    return `URL: ${url}\n${snapshot}`
-  } catch {
-    const url = await getPageUrl(userId)
-    return `URL: ${url}\n(no interactive elements)`
-  }
+    if (nodes.length > 0) {
+      const snapshot = buildSnapshotWithRefs(nodes, userId, tabKey)
+      return `URL: ${url}\n${snapshot}`
+    }
+  } catch {}
+  return `URL: ${url}\n(no interactive elements)`
 }
 
 async function clickRef(userId: string, tabKey: string, ref: string): Promise<void> {
