@@ -102,6 +102,22 @@ const INTERACTIVE_ROLES = new Set([
 
 type AXNode = { nodeId: string; role?: { value: string }; name?: { value: string }; ignored?: boolean }
 
+const SKIP_ROLES = new Set([
+  'none', 'generic', 'inlinetextbox', 'statictext', 'presentation',
+  'ignored', 'unknown', 'group', 'image', 'img', 'separator', 'region',
+  'main', 'navigation', 'banner', 'contentinfo', 'complementary',
+  'form', 'document', 'application', 'rootwebarea', 'webarea',
+  'tree', 'treegrid', 'rowgroup', 'row', 'gridcell', 'columnheader',
+  'rowheader', 'table', 'grid', 'list', 'listitem', 'article',
+  'dialog', 'alertdialog', 'paragraph', 'blockquote', 'emphasis',
+  'strong', 'mark', 'insertion', 'deletion', 'subscript', 'superscript',
+  'time', 'code', 'term', 'definition', 'note', 'tooltip',
+  'feed', 'figure', 'math', 'directory', 'log', 'marquee', 'status',
+  'timer', 'scrollbar', 'slider', 'spinbutton', 'progressbar',
+  'toolbar', 'menubar', 'menu', 'tablist', 'tabpanel',
+  'cell', 'columnheader', 'rowheader'
+])
+
 function buildSnapshotWithRefs(nodes: AXNode[], tabKey: string): string {
   const refs: Record<string, { role: string; name?: string; nodeId: string }> = {}
   const lines: string[] = []
@@ -111,7 +127,10 @@ function buildSnapshotWithRefs(nodes: AXNode[], tabKey: string): string {
     if (node.ignored) continue
     const role = (node.role?.value ?? '').toLowerCase().trim()
     const name = (node.name?.value ?? '').trim()
-    if (!role || role === 'none' || role === 'generic' || role === 'inlineTextBox' || role === 'staticText') continue
+
+    if (!role || SKIP_ROLES.has(role)) continue
+    if (!name && !INTERACTIVE_ROLES.has(role)) continue
+    if (name.length > 100) continue
 
     counter++
     const ref = `e${counter}`
@@ -442,26 +461,25 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_list_repos', description: 'List GitHub repos', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'github_list_issues', description: 'List GitHub issues', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' } }, required: ['owner', 'repo'] } } },
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
-  { type: 'function', function: { name: 'twitter_post', description: 'Special tool to post on Twitter/X. Use this instead of manual click+type for Twitter posts. Much more reliable.', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome browser tab.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control a real Chrome browser tab.
+
+You are given tasks in plain English. You figure out how to complete them by reading the page snapshot and interacting with the UI.
+
+HOW YOU WORK:
+- Call browser_snapshot to see the current page — it shows interactive elements with refs like e1, e2
+- Use the refs to click, type, and interact
+- After every action, call browser_snapshot to see what changed
+- Keep going until the task is done, then call task_complete
 
 RULES:
-- ALWAYS call browser_snapshot before any action and after every action
-- For Twitter/X posting use this EXACT sequence:
-  1. browser_navigate to https://x.com
-  2. browser_snapshot — wait for page to load
-  3. browser_wait 2000ms for page to fully render
-  4. browser_snapshot again
-  5. Use browser_click on the Post text composer (role=textbox)
-  6. browser_type the text into the composer ref
-  7. browser_snapshot to verify text is in composer
-  8. browser_click the Post button (role=button, name="Post")
-  9. browser_wait 3000ms
-  10. browser_snapshot — if composer is gone, call task_complete. If still there, click Post button again.
-- NEVER call task_complete if you are not sure the post was published
-- Never try to log in — assume user is already logged in`
+- Never assume an action worked — always snapshot after to verify
+- If you can't find an element, snapshot again — the page may have changed
+- If something fails twice, try a different approach
+- Never try to log in — the user is already logged in to all their accounts
+- Only call task_complete when you can see the result on the page
+- Only call task_failed after exhausting all approaches`
 
 async function runAgentLoop(opts: {
   userId: string
@@ -633,48 +651,6 @@ async function runAgentLoop(opts: {
             case 'github_create_issue': {
               if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
               result = `Created issue: ${args.title}`
-              break
-            }
-            case 'twitter_post': {
-              await opts.onProgress(`🐦 Posting to Twitter: "${args.text}"...`)
-
-              const typed = await focusAndTypeInTwitterComposer(opts.userId, args.text)
-              if (!typed) {
-                result = 'Could not find Twitter post composer. Make sure you are on x.com and the page is loaded.'
-                break
-              }
-
-              await opts.onProgress('🖱️ Clicking Post button...')
-              await new Promise(r => setTimeout(r, 500))
-
-              const clicked = await clickTwitterPostButton(opts.userId)
-              if (!clicked) {
-                result = 'Could not find Post button. Try browser_snapshot to see current state.'
-                break
-              }
-
-              await new Promise(r => setTimeout(r, 3000))
-
-              const verifyResult = await sendCdpCommand(opts.userId, 'Runtime.evaluate', {
-                expression: `
-                  (() => {
-                    const composer = document.querySelector('[data-testid="tweetTextarea_0"]');
-                    const text = composer ? (composer.textContent || '').trim() : '';
-                    return { composerGone: !composer || text === '', text };
-                  })()
-                `,
-                returnByValue: true
-              }, getTabId(opts.userId), 5000) as any
-
-              const { composerGone, text: remainingText } = verifyResult?.result?.value ?? {}
-              console.log(`[agent] after post: composerGone=${composerGone} remainingText="${remainingText}"`)
-
-              if (composerGone) {
-                await opts.onProgress('✅ Post published successfully!')
-                result = 'Post published successfully. Composer closed after posting.'
-              } else {
-                result = `Post may not have submitted. Composer still shows text: "${remainingText}". Try clicking Post button again with browser_click.`
-              }
               break
             }
             default:
