@@ -1,7 +1,5 @@
 import OpenAI from 'openai'
-import { chromium } from 'playwright'
-import type { Browser, Page } from 'playwright'
-import { getRelayServerInfo } from './relay-server.js'
+import { sendCdpCommand } from '../index.js'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
 import { supabase } from './supabase.js'
@@ -13,114 +11,203 @@ import * as github from './integrations/github.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
-const userBrowsers = new Map<string, Browser>()
+// ─── CDP-based browser control through extension relay ───
 
-async function getPageForUser(userId: string): Promise<Page> {
-  const relay = getRelayServerInfo(userId)
-  if (!relay) {
-    throw new Error('Extension not connected. Click the Felo badge ON on a Chrome tab first.')
-  }
-
-  // ws://127.0.0.1:{port}/cdp → http://127.0.0.1:{port}
-  const cdpUrl = relay.cdpWsUrl.replace('ws://', 'http://').replace('/cdp', '')
-  console.log(`[playwright] connecting to ${cdpUrl}`)
-
-  // Close stale connection if any
-  const old = userBrowsers.get(userId)
-  if (old) { try { await old.close() } catch {} userBrowsers.delete(userId) }
-
-  const browser = await chromium.connectOverCDP(cdpUrl, { timeout: 15_000 })
-  userBrowsers.set(userId, browser)
-  browser.on('disconnected', () => userBrowsers.delete(userId))
-
-  const contexts = browser.contexts()
-  if (!contexts.length) throw new Error('No browser context. Is a tab attached?')
-
-  const pages = contexts[0].pages()
-  if (!pages.length) throw new Error('No open tabs. Click the Felo extension badge ON on a Chrome tab.')
-
-  const page = pages.find(p => {
-    const u = p.url()
-    return u && u !== 'about:blank' && !u.startsWith('chrome://')
-  }) ?? pages[0]
-
-  console.log(`[playwright] connected to page: ${page.url()}`)
-  return page
+async function enableDomains(userId: string): Promise<void> {
+  await sendCdpCommand(userId, 'Runtime.enable', {}).catch(() => {})
+  await sendCdpCommand(userId, 'Page.enable', {}).catch(() => {})
+  await sendCdpCommand(userId, 'Accessibility.enable', {}).catch(() => {})
 }
 
-// ─── Snapshot / role-ref system ───
+async function navigateTo(userId: string, url: string): Promise<void> {
+  await sendCdpCommand(userId, 'Page.navigate', { url })
+  await waitForLoad(userId)
+}
 
-type RoleRef = { role: string; name?: string; nth?: number }
-type RoleRefMap = Record<string, RoleRef>
+async function waitForLoad(userId: string): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, 2000))
+}
+
+async function getAriaSnapshot(userId: string): Promise<string> {
+  const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}) as any
+  const nodes = result?.nodes ?? []
+
+  const frameResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: 'window.location.href',
+    returnByValue: true
+  }) as any
+  const url = frameResult?.result?.value ?? 'unknown'
+
+  const lines = buildSnapshot(nodes)
+  return `URL: ${url}\n${lines || '(no interactive elements)'}`
+}
+
+type AXNode = {
+  nodeId: string
+  role?: { value: string }
+  name?: { value: string }
+  childIds?: string[]
+  ignored?: boolean
+  properties?: Array<{ name: string; value: { value: unknown } }>
+}
+
+type RoleRef = { role: string; name?: string; nodeId: string }
+const sessionRefs = new Map<string, Record<string, RoleRef>>()
 
 const INTERACTIVE_ROLES = new Set([
-  'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox', 'listbox',
-  'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'searchbox',
-  'slider', 'spinbutton', 'switch', 'tab', 'treeitem'
+  'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
+  'listbox', 'menuitem', 'option', 'searchbox', 'slider', 'switch', 'tab'
 ])
 
-const tabRoleRefs = new Map<string, { refs: RoleRefMap; url: string }>()
-
-function buildRoleRefsFromSnapshot(ariaSnapshot: string): { snapshot: string; refs: RoleRefMap } {
-  const lines = ariaSnapshot.split('\n')
-  const refs: RoleRefMap = {}
-  const counts = new Map<string, number>()
-  const refsByKey = new Map<string, string[]>()
-  const out: string[] = []
+function buildSnapshot(nodes: AXNode[]): string {
+  const lines: string[] = []
   let counter = 0
 
-  for (const line of lines) {
-    const match = line.match(/^(\s*-\s*)(\w+)(?:\s+"([^"]*)")?(.*)$/)
-    if (!match) { out.push(line); continue }
-    const [, prefix, roleRaw, name, suffix] = match
-    const role = roleRaw.toLowerCase()
-    if (!INTERACTIVE_ROLES.has(role)) { out.push(line); continue }
+  for (const node of nodes) {
+    if (node.ignored) continue
+    const role = node.role?.value?.toLowerCase() ?? ''
+    const name = node.name?.value ?? ''
+    if (!role || role === 'none' || role === 'generic') continue
 
     counter++
     const ref = `e${counter}`
-    const key = `${role}:${name ?? ''}`
-    const nth = counts.get(key) ?? 0
-    counts.set(key, nth + 1)
-    const existing = refsByKey.get(key) ?? []
-    existing.push(ref)
-    refsByKey.set(key, existing)
-
-    refs[ref] = { role, name: name || undefined, nth }
-    let enhanced = `${prefix}${roleRaw}`
-    if (name) enhanced += ` "${name}"`
-    enhanced += ` [ref=${ref}]`
-    if (nth > 0) enhanced += ` [nth=${nth}]`
-    if (suffix) enhanced += suffix
-    out.push(enhanced)
+    let line = `- ${role}`
+    if (name) line += ` "${name}"`
+    if (INTERACTIVE_ROLES.has(role)) line += ` [ref=${ref}]`
+    lines.push(line)
   }
 
-  for (const [, refList] of refsByKey) {
-    if (refList.length <= 1) {
-      for (const r of refList) { if (refs[r]) delete refs[r].nth }
-    }
-  }
-
-  return { snapshot: out.join('\n') || '(no interactive elements)', refs }
+  return lines.join('\n')
 }
 
-async function snapshotPage(page: Page, tabKey: string): Promise<string> {
-  const ariaSnapshot = await page.locator(':root').ariaSnapshot({ timeout: 10_000 })
-  const url = page.url()
-  const { snapshot, refs } = buildRoleRefsFromSnapshot(ariaSnapshot)
-  tabRoleRefs.set(tabKey, { refs, url })
+function buildSnapshotWithRefs(
+  nodes: AXNode[],
+  userId: string,
+  tabKey: string
+): string {
+  const refs: Record<string, RoleRef> = {}
+  const lines: string[] = []
+  let counter = 0
+
+  for (const node of nodes) {
+    if (node.ignored) continue
+    const role = node.role?.value?.toLowerCase() ?? ''
+    const name = node.name?.value ?? ''
+    if (!role || role === 'none' || role === 'generic') continue
+
+    counter++
+    const ref = `e${counter}`
+    let line = `- ${role}`
+    if (name) line += ` "${name}"`
+
+    if (INTERACTIVE_ROLES.has(role)) {
+      line += ` [ref=${ref}]`
+      refs[ref] = { role, name: name || undefined, nodeId: node.nodeId }
+    }
+    lines.push(line)
+  }
+
+  sessionRefs.set(tabKey, refs)
+  return lines.join('\n') || '(no interactive elements)'
+}
+
+async function snapshotPage(userId: string, tabKey: string): Promise<string> {
+  const [axResult, urlResult] = await Promise.all([
+    sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}) as Promise<any>,
+    sendCdpCommand(userId, 'Runtime.evaluate', {
+      expression: 'window.location.href',
+      returnByValue: true
+    }) as Promise<any>
+  ])
+
+  const nodes: AXNode[] = axResult?.nodes ?? []
+  const url = urlResult?.result?.value ?? 'unknown'
+  const snapshot = buildSnapshotWithRefs(nodes, userId, tabKey)
   return `URL: ${url}\n${snapshot}`
 }
 
-function refLocator(page: Page, ref: string, tabKey: string) {
-  const stored = tabRoleRefs.get(tabKey)
-  if (!stored?.refs[ref]) {
-    throw new Error(`Unknown ref "${ref}". Call browser_snapshot first to get current refs.`)
+async function clickRef(userId: string, tabKey: string, ref: string): Promise<void> {
+  const refs = sessionRefs.get(tabKey)
+  const target = refs?.[ref]
+  if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
+
+  await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `
+      (() => {
+        const el = document.querySelector('[aria-label="${target.name?.replace(/"/g, '\\"')}"]')
+          || document.evaluate('//*[@role="${target.role}"]${target.name ? `[normalize-space()="${target.name}"]` : ''}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        if (el) { el.focus(); el.click(); return true; }
+        return false;
+      })()
+    `,
+    returnByValue: true
+  })
+}
+
+async function typeInRef(userId: string, tabKey: string, ref: string, text: string): Promise<void> {
+  const refs = sessionRefs.get(tabKey)
+  const target = refs?.[ref]
+  if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
+
+  await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `
+      (() => {
+        const el = document.querySelector('[aria-label="${target.name?.replace(/"/g, '\\"')}"]')
+          || document.evaluate('//*[@role="${target.role}"]${target.name ? `[normalize-space()="${target.name}"]` : ''}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        if (el) { el.focus(); return true; }
+        return false;
+      })()
+    `,
+    returnByValue: true
+  })
+
+  await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `
+      (() => {
+        const el = document.activeElement;
+        if (!el) return false;
+        if (el.isContentEditable) {
+          el.textContent = ${JSON.stringify(text)};
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${JSON.stringify(text)} }));
+        } else {
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+            || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+          if (nativeInputValueSetter) {
+            nativeInputValueSetter.call(el, ${JSON.stringify(text)});
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+        return true;
+      })()
+    `,
+    returnByValue: true
+  })
+}
+
+async function pressKey(userId: string, key: string): Promise<void> {
+  const keyMap: Record<string, { code: string; keyCode: number }> = {
+    'Enter': { code: 'Enter', keyCode: 13 },
+    'Tab': { code: 'Tab', keyCode: 9 },
+    'Escape': { code: 'Escape', keyCode: 27 },
+    'ArrowDown': { code: 'ArrowDown', keyCode: 40 },
+    'ArrowUp': { code: 'ArrowUp', keyCode: 38 },
   }
-  const { role, name, nth } = stored.refs[ref]
-  const locator = name
-    ? page.getByRole(role as any, { name, exact: true })
-    : page.getByRole(role as any)
-  return (nth !== undefined && nth > 0) ? locator.nth(nth) : locator
+  const k = keyMap[key] ?? { code: key, keyCode: 0 }
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
+    type: 'keyDown', key, code: k.code, keyCode: k.keyCode
+  })
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
+    type: 'keyUp', key, code: k.code, keyCode: k.keyCode
+  })
+}
+
+async function scrollPage(userId: string, direction: 'up' | 'down', amount = 300): Promise<void> {
+  const delta = direction === 'down' ? amount : -amount
+  await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `window.scrollBy(0, ${delta})`,
+    returnByValue: true
+  })
 }
 
 // ─── Tools ───
@@ -130,7 +217,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_snapshot',
-      description: 'Read the current page state. Returns all interactive elements with ref IDs like e1, e2. ALWAYS call this first before any action, and after every action to confirm what changed.',
+      description: 'Read the current page. Returns interactive elements with ref IDs. ALWAYS call first and after every action.',
       parameters: { type: 'object', properties: {}, required: [] }
     }
   },
@@ -138,37 +225,29 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_navigate',
-      description: 'Navigate the current tab to a URL.',
-      parameters: {
-        type: 'object',
-        properties: { url: { type: 'string', description: 'Full URL including https://' } },
-        required: ['url']
-      }
+      description: 'Navigate to a URL.',
+      parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
     }
   },
   {
     type: 'function',
     function: {
       name: 'browser_click',
-      description: 'Click an element by its ref from the last snapshot.',
-      parameters: {
-        type: 'object',
-        properties: { ref: { type: 'string', description: 'Ref like e1, e2 from snapshot' } },
-        required: ['ref']
-      }
+      description: 'Click an element by ref from the last snapshot.',
+      parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] }
     }
   },
   {
     type: 'function',
     function: {
       name: 'browser_type',
-      description: 'Type text into a textbox or input field.',
+      description: 'Type text into an input or textbox.',
       parameters: {
         type: 'object',
         properties: {
           ref: { type: 'string' },
           text: { type: 'string' },
-          submit: { type: 'boolean', description: 'Press Enter after typing' }
+          submit: { type: 'boolean' }
         },
         required: ['ref', 'text']
       }
@@ -178,24 +257,20 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_key',
-      description: 'Press a keyboard key. Examples: Enter, Tab, Escape, ArrowDown.',
-      parameters: {
-        type: 'object',
-        properties: { key: { type: 'string' } },
-        required: ['key']
-      }
+      description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.',
+      parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] }
     }
   },
   {
     type: 'function',
     function: {
       name: 'browser_scroll',
-      description: 'Scroll the page up or down.',
+      description: 'Scroll the page.',
       parameters: {
         type: 'object',
         properties: {
           direction: { type: 'string', enum: ['up', 'down'] },
-          amount: { type: 'number', description: 'Pixels to scroll, default 300' }
+          amount: { type: 'number' }
         },
         required: ['direction']
       }
@@ -205,66 +280,49 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'browser_wait',
-      description: 'Wait for milliseconds or for text to appear on page.',
-      parameters: {
-        type: 'object',
-        properties: {
-          ms: { type: 'number' },
-          text: { type: 'string' }
-        }
-      }
+      description: 'Wait milliseconds.',
+      parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] }
     }
   },
   {
     type: 'function',
     function: {
       name: 'task_complete',
-      description: 'Mark task as done. Only call after visual confirmation the action succeeded — post appeared, form submitted, item created.',
-      parameters: {
-        type: 'object',
-        properties: { summary: { type: 'string', description: 'What was accomplished' } },
-        required: ['summary']
-      }
+      description: 'Task done. Only call after visual confirmation.',
+      parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] }
     }
   },
   {
     type: 'function',
     function: {
       name: 'task_failed',
-      description: 'Mark task as failed after exhausting all approaches.',
-      parameters: {
-        type: 'object',
-        properties: { reason: { type: 'string' } },
-        required: ['reason']
-      }
+      description: 'Task failed.',
+      parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] }
     }
   },
-  // ── Integrations ──
-  { type: 'function', function: { name: 'gmail_list', description: 'List recent Gmail emails', parameters: { type: 'object', properties: { maxResults: { type: 'number' } } } } },
-  { type: 'function', function: { name: 'gmail_send', description: 'Send email via Gmail', parameters: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'subject', 'body'] } } },
-  { type: 'function', function: { name: 'gmail_read', description: 'Read a Gmail email by ID', parameters: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'] } } },
-  { type: 'function', function: { name: 'gmail_summarize', description: 'Summarize recent emails', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'gmail_list', description: 'List Gmail emails', parameters: { type: 'object', properties: { maxResults: { type: 'number' } } } } },
+  { type: 'function', function: { name: 'gmail_send', description: 'Send email', parameters: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'subject', 'body'] } } },
+  { type: 'function', function: { name: 'gmail_read', description: 'Read email', parameters: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'] } } },
+  { type: 'function', function: { name: 'gmail_summarize', description: 'Summarize emails', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'notion_create_page', description: 'Create Notion page', parameters: { type: 'object', properties: { parentId: { type: 'string' }, title: { type: 'string' }, content: { type: 'string' } }, required: ['parentId', 'title', 'content'] } } },
   { type: 'function', function: { name: 'notion_list_databases', description: 'List Notion databases', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'notion_query_database', description: 'Query Notion database', parameters: { type: 'object', properties: { databaseId: { type: 'string' } }, required: ['databaseId'] } } },
   { type: 'function', function: { name: 'slack_send', description: 'Send Slack message', parameters: { type: 'object', properties: { channel: { type: 'string' }, text: { type: 'string' } }, required: ['channel', 'text'] } } },
   { type: 'function', function: { name: 'slack_list_channels', description: 'List Slack channels', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'slack_read_messages', description: 'Read Slack messages', parameters: { type: 'object', properties: { channel: { type: 'string' }, limit: { type: 'number' } }, required: ['channel'] } } },
-  { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
   { type: 'function', function: { name: 'github_list_repos', description: 'List GitHub repos', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'github_list_issues', description: 'List GitHub issues', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' } }, required: ['owner', 'repo'] } } },
+  { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a Chrome browser.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control the user's real Chrome browser via CDP.
 
-IMPORTANT RULES:
-- ALWAYS call browser_snapshot before any action and after every action to see what changed
-- NEVER try to log in or create accounts — assume you are already logged in. If a page asks for login, check the current state first by taking a snapshot.
-- NEVER call task_complete just because you clicked something — wait for visual confirmation
-- If an element ref is stale, call browser_snapshot again to get fresh refs
-- If something fails twice, try a completely different approach
-- Do NOT attempt to login to any site — if login is required, report that login is needed and stop
-- For typing in contenteditable areas (like Twitter/X post box), click first then type`
+Rules:
+- ALWAYS call browser_snapshot before any action and after every action
+- NEVER call task_complete without visual confirmation the task worked
+- For Twitter/X posts: navigate to x.com, find the post textbox, click it, type text, click the Post button
+- If a ref fails, call browser_snapshot again for fresh refs
+- Do not attempt to log in — assume user is already logged in`
 
 // ─── Agent loop ───
 
@@ -272,7 +330,6 @@ async function runAgentLoop(opts: {
   userId: string
   taskId: string
   taskPrompt: string
-  page: Page
   tabKey: string
   onProgress: (msg: string) => Promise<void>
 }): Promise<{ success: boolean; summary: string }> {
@@ -280,6 +337,8 @@ async function runAgentLoop(opts: {
     { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user', content: opts.taskPrompt }
   ]
+
+  await enableDomains(opts.userId)
 
   const MAX_ITERATIONS = 20
   const deadline = Date.now() + 90_000
@@ -299,17 +358,9 @@ async function runAgentLoop(opts: {
 
       const msg = response.choices[0].message
       messages.push(msg)
-
-      if (!msg.tool_calls?.length) {
-        return { success: false, summary: 'Agent stopped unexpectedly' }
-      }
+      if (!msg.tool_calls?.length) return { success: false, summary: 'Agent stopped unexpectedly' }
 
       const toolResults: OpenAI.ChatCompletionToolMessageParam[] = []
-
-      // Only process if there are tool calls
-      if (!msg.tool_calls?.length) {
-        return { success: false, summary: 'Agent stopped unexpectedly' }
-      }
 
       for (const toolCall of msg.tool_calls as any[]) {
         const args = JSON.parse(toolCall.function.arguments || '{}')
@@ -317,81 +368,66 @@ async function runAgentLoop(opts: {
 
         try {
           switch (toolCall.function.name) {
-
             case 'browser_snapshot': {
               await opts.onProgress('📸 Reading page...')
-              result = await snapshotPage(opts.page, opts.tabKey)
+              result = await snapshotPage(opts.userId, opts.tabKey)
               break
             }
-
             case 'browser_navigate': {
               await opts.onProgress(`🌐 Navigating to ${args.url}...`)
-              await opts.page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: 20_000 })
-              await opts.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
-              result = await snapshotPage(opts.page, opts.tabKey)
-              result = `Navigated. Page is now:\n${result}`
+              await navigateTo(opts.userId, args.url)
+              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = `Navigated. Page:\n${result}`
               break
             }
-
             case 'browser_click': {
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
-              const locator = refLocator(opts.page, args.ref, opts.tabKey)
-              await locator.click({ timeout: 8000 })
-              await opts.page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {})
-              result = await snapshotPage(opts.page, opts.tabKey)
-              result = `Clicked. Page is now:\n${result}`
+              await clickRef(opts.userId, opts.tabKey, args.ref)
+              await new Promise(r => setTimeout(r, 500))
+              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = `Clicked. Page:\n${result}`
               break
             }
-
             case 'browser_type': {
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
-              const locator = refLocator(opts.page, args.ref, opts.tabKey)
-              await locator.fill(args.text, { timeout: 8000 })
-              if (args.submit) await locator.press('Enter')
-              result = await snapshotPage(opts.page, opts.tabKey)
-              result = `Typed. Page is now:\n${result}`
+              await typeInRef(opts.userId, opts.tabKey, args.ref, args.text)
+              if (args.submit) await pressKey(opts.userId, 'Enter')
+              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = `Typed. Page:\n${result}`
               break
             }
-
             case 'browser_key': {
               await opts.onProgress(`⌨️ Pressing ${args.key}...`)
-              await opts.page.keyboard.press(args.key)
+              await pressKey(opts.userId, args.key)
               result = `Pressed ${args.key}`
               break
             }
-
             case 'browser_scroll': {
-              await opts.page.mouse.wheel(0, args.direction === 'down' ? (args.amount ?? 300) : -(args.amount ?? 300))
+              await scrollPage(opts.userId, args.direction, args.amount)
               result = `Scrolled ${args.direction}`
               break
             }
-
             case 'browser_wait': {
-              if (args.ms) await opts.page.waitForTimeout(args.ms)
-              if (args.text) await opts.page.getByText(args.text).first().waitFor({ state: 'visible', timeout: 5000 })
+              await new Promise(r => setTimeout(r, args.ms || 1000))
               result = 'Done waiting'
               break
             }
-
             case 'task_complete': {
               await opts.onProgress(`✅ ${args.summary}`)
               return { success: true, summary: args.summary }
             }
-
             case 'task_failed': {
               if (attempt === 0) {
                 await opts.onProgress(`⚠️ Retrying: ${args.reason}`)
                 messages.length = 2
-                messages[1] = { role: 'user', content: `${opts.taskPrompt}\n\nFirst attempt failed: ${args.reason}. Try a different approach.` }
+                messages[1] = { role: 'user', content: `${opts.taskPrompt}\n\nFirst attempt failed: ${args.reason}. Try differently.` }
               } else {
                 await opts.onProgress(`❌ ${args.reason}`)
                 return { success: false, summary: args.reason }
               }
-              result = 'Retrying with different approach'
+              result = 'Retrying'
               break
             }
-
-            // ── Integrations ──
             case 'gmail_list': {
               if (!await isProviderConnected(opts.userId, 'gmail')) { result = 'Gmail not connected'; break }
               result = JSON.stringify(await gmail.listEmails(opts.userId, { maxResults: args.maxResults || 10 }), null, 2)
@@ -416,7 +452,7 @@ async function runAgentLoop(opts: {
             case 'notion_create_page': {
               if (!await isProviderConnected(opts.userId, 'notion')) { result = 'Notion not connected'; break }
               await notion.createPage(opts.userId, args.parentId, args.title, args.content)
-              result = `Created page: ${args.title}`
+              result = `Created: ${args.title}`
               break
             }
             case 'notion_list_databases': {
@@ -445,11 +481,6 @@ async function runAgentLoop(opts: {
               result = JSON.stringify(await slack.getMessages(opts.userId, args.channel, args.limit || 10), null, 2)
               break
             }
-            case 'github_create_issue': {
-              if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
-              result = `Created issue: ${args.title}`
-              break
-            }
             case 'github_list_repos': {
               if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
               result = JSON.stringify(await github.listRepos(opts.userId), null, 2)
@@ -460,7 +491,11 @@ async function runAgentLoop(opts: {
               result = JSON.stringify(await github.listIssues(opts.userId, args.owner, args.repo, args.state || 'open'), null, 2)
               break
             }
-
+            case 'github_create_issue': {
+              if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
+              result = `Created issue: ${args.title}`
+              break
+            }
             default:
               result = `Unknown tool: ${toolCall.function.name}`
           }
@@ -469,13 +504,7 @@ async function runAgentLoop(opts: {
           await opts.onProgress(`⚠️ ${result}`)
         }
 
-        // FIX: Each tool result must directly follow its tool_call in the messages array
-        // We already pushed the assistant message with tool_calls above, now push tool result
-        toolResults.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: result,
-        })
+        toolResults.push({ role: 'tool', tool_call_id: toolCall.id, content: result })
       }
 
       messages.push(...toolResults)
@@ -487,7 +516,7 @@ async function runAgentLoop(opts: {
 
 // ─── Entry point ───
 
-type StepLog = { step: number; description: string; action: string; success: boolean; errorMsg?: string }
+type StepLog = { step: number; description: string; action: string; success: boolean }
 
 export async function runAgentWithExtension(
   task: string,
@@ -496,7 +525,7 @@ export async function runAgentWithExtension(
   taskId?: string
 ): Promise<string> {
   const taskKey = taskId || `${userId}:${task.slice(0, 50)}`
-  if (runningTasks.has(taskKey)) throw new Error(`Task already running`)
+  if (runningTasks.has(taskKey)) throw new Error('Task already running')
   runningTasks.add(taskKey)
 
   const startTime = Date.now()
@@ -506,14 +535,12 @@ export async function runAgentWithExtension(
 
   try {
     await onStep('🔌 Connecting to your browser...')
-    const page = await getPageForUser(userId)
-    const tabKey = `${userId}:${Date.now()}`
 
+    const tabKey = `${userId}:${Date.now()}`
     const result = await runAgentLoop({
       userId,
       taskId: taskId || taskKey,
       taskPrompt: task,
-      page,
       tabKey,
       onProgress: async (msg) => {
         stepsLog.push({ step: stepsLog.length + 1, description: msg, action: msg, success: !msg.startsWith('⚠️') && !msg.startsWith('❌') })
@@ -534,7 +561,6 @@ export async function runAgentWithExtension(
 
   } finally {
     runningTasks.delete(taskKey)
-    
     try {
       await supabase.from('task_executions').insert({
         user_id: userId, task_id: taskId || null, task_prompt: task, plan: [],
