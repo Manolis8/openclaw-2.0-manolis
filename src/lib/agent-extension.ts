@@ -1,5 +1,5 @@
 import OpenAI from 'openai'
-import { sendCdpCommand } from '../index.js'
+import { sendExtensionMessage, extensionConnections } from '../index.js'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
 import { supabase } from './supabase.js'
@@ -10,17 +10,9 @@ import * as github from './integrations/github.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
-
-// ─── CDP-based browser control through extension relay ───
-
-async function enableDomains(userId: string): Promise<void> {
-  await sendCdpCommand(userId, 'Runtime.enable', {}).catch(() => {})
-  await sendCdpCommand(userId, 'Page.enable', {}).catch(() => {})
-  await sendCdpCommand(userId, 'Accessibility.enable', {}).catch(() => {})
-}
+const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nodeId: string }>>()
 
 async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<void> {
-  const { extensionConnections, sendExtensionMessage } = await import('../index.js')
   const ws = extensionConnections.get(userId)
   if (!ws || ws.readyState !== 1) {
     throw new Error('Extension not connected. Install the Felo extension and make sure it is connected.')
@@ -30,80 +22,45 @@ async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<vo
   await new Promise(resolve => setTimeout(resolve, 1500))
 }
 
-async function navigateTo(userId: string, url: string): Promise<void> {
-  await sendCdpCommand(userId, 'Page.navigate', { url })
-  await waitForLoad(userId)
+async function closeTab(userId: string): Promise<void> {
+  const ws = extensionConnections.get(userId)
+  if (!ws || ws.readyState !== 1) return
+
+  try {
+    await sendExtensionMessage(userId, 'closeCurrentTab', {}, 5000)
+  } catch {}
 }
 
-async function waitForLoad(userId: string): Promise<void> {
+async function navigateTo(userId: string, url: string): Promise<void> {
+  await sendExtensionMessage(userId, 'navigateTo', { url }, 20000)
   await new Promise(resolve => setTimeout(resolve, 2000))
 }
 
 async function getAriaSnapshot(userId: string): Promise<string> {
-  const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}) as any
+  const result = await sendExtensionMessage(userId, 'getAriaSnapshot', {}, 15000) as any
+  const url = result?.url ?? 'unknown'
   const nodes = result?.nodes ?? []
-
-  const frameResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: 'window.location.href',
-    returnByValue: true
-  }) as any
-  const url = frameResult?.result?.value ?? 'unknown'
-
-  const lines = buildSnapshot(nodes)
+  const lines = buildSnapshotWithRefs(nodes, userId, '')
   return `URL: ${url}\n${lines || '(no interactive elements)'}`
 }
-
-type AXNode = {
-  nodeId: string
-  role?: { value: string }
-  name?: { value: string }
-  childIds?: string[]
-  ignored?: boolean
-  properties?: Array<{ name: string; value: { value: unknown } }>
-}
-
-type RoleRef = { role: string; name?: string; nodeId: string }
-const sessionRefs = new Map<string, Record<string, RoleRef>>()
 
 const INTERACTIVE_ROLES = new Set([
   'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
   'listbox', 'menuitem', 'option', 'searchbox', 'slider', 'switch', 'tab'
 ])
 
-function buildSnapshot(nodes: AXNode[]): string {
-  const lines: string[] = []
-  let counter = 0
-
-  for (const node of nodes) {
-    if (node.ignored) continue
-    const role = node.role?.value?.toLowerCase() ?? ''
-    const name = node.name?.value ?? ''
-    if (!role || role === 'none' || role === 'generic') continue
-
-    counter++
-    const ref = `e${counter}`
-    let line = `- ${role}`
-    if (name) line += ` "${name}"`
-    if (INTERACTIVE_ROLES.has(role)) line += ` [ref=${ref}]`
-    lines.push(line)
-  }
-
-  return lines.join('\n')
-}
-
 function buildSnapshotWithRefs(
-  nodes: AXNode[],
+  nodes: Array<{ role?: string; name?: string; nodeId?: string }>,
   userId: string,
   tabKey: string
 ): string {
-  const refs: Record<string, RoleRef> = {}
+  const refs: Record<string, { role: string; name?: string; nodeId: string }> = {}
   const lines: string[] = []
   let counter = 0
 
   for (const node of nodes) {
-    if (node.ignored) continue
-    const role = node.role?.value?.toLowerCase() ?? ''
-    const name = node.name?.value ?? ''
+    const role = node.role?.toLowerCase() ?? ''
+    const name = node.name ?? ''
     if (!role || role === 'none' || role === 'generic') continue
 
     counter++
@@ -113,26 +70,19 @@ function buildSnapshotWithRefs(
 
     if (INTERACTIVE_ROLES.has(role)) {
       line += ` [ref=${ref}]`
-      refs[ref] = { role, name: name || undefined, nodeId: node.nodeId }
+      refs[ref] = { role, name: name || undefined, nodeId: node.nodeId ?? '' }
     }
     lines.push(line)
   }
 
-  sessionRefs.set(tabKey, refs)
+  if (tabKey) sessionRefs.set(tabKey, refs)
   return lines.join('\n') || '(no interactive elements)'
 }
 
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
-  const [axResult, urlResult] = await Promise.all([
-    sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}) as Promise<any>,
-    sendCdpCommand(userId, 'Runtime.evaluate', {
-      expression: 'window.location.href',
-      returnByValue: true
-    }) as Promise<any>
-  ])
-
-  const nodes: AXNode[] = axResult?.nodes ?? []
-  const url = urlResult?.result?.value ?? 'unknown'
+  const result = await sendExtensionMessage(userId, 'getAriaSnapshot', {}, 15000) as any
+  const url = result?.url ?? 'unknown'
+  const nodes = result?.nodes ?? []
   const snapshot = buildSnapshotWithRefs(nodes, userId, tabKey)
   return `URL: ${url}\n${snapshot}`
 }
@@ -142,17 +92,12 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `
-      (() => {
-        const el = document.querySelector('[aria-label="${target.name?.replace(/"/g, '\\"')}"]')
-          || document.evaluate('//*[@role="${target.role}"]${target.name ? `[normalize-space()="${target.name}"]` : ''}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-        if (el) { el.focus(); el.click(); return true; }
-        return false;
-      })()
-    `,
-    returnByValue: true
-  })
+  if (target.name) {
+    await sendExtensionMessage(userId, 'clickByText', { text: target.name }, 10000)
+  } else {
+    await sendExtensionMessage(userId, 'clickByRole', { role: target.role }, 10000)
+  }
+  await new Promise(resolve => setTimeout(resolve, 500))
 }
 
 async function typeInRef(userId: string, tabKey: string, ref: string, text: string): Promise<void> {
@@ -160,157 +105,31 @@ async function typeInRef(userId: string, tabKey: string, ref: string, text: stri
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `
-      (() => {
-        const el = document.querySelector('[aria-label="${target.name?.replace(/"/g, '\\"')}"]')
-          || document.evaluate('//*[@role="${target.role}"]${target.name ? `[normalize-space()="${target.name}"]` : ''}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-        if (el) { el.focus(); return true; }
-        return false;
-      })()
-    `,
-    returnByValue: true
-  })
-
-  await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `
-      (() => {
-        const el = document.activeElement;
-        if (!el) return false;
-        if (el.isContentEditable) {
-          el.textContent = ${JSON.stringify(text)};
-          el.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${JSON.stringify(text)} }));
-        } else {
-          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
-            || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-          if (nativeInputValueSetter) {
-            nativeInputValueSetter.call(el, ${JSON.stringify(text)});
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-        }
-        return true;
-      })()
-    `,
-    returnByValue: true
-  })
+  if (target.name) {
+    await sendExtensionMessage(userId, 'typeIntoByText', { text: target.name, value: text }, 10000)
+  } else {
+    await sendExtensionMessage(userId, 'typeIntoByRole', { role: target.role, value: text }, 10000)
+  }
 }
 
 async function pressKey(userId: string, key: string): Promise<void> {
-  const keyMap: Record<string, { code: string; keyCode: number }> = {
-    'Enter': { code: 'Enter', keyCode: 13 },
-    'Tab': { code: 'Tab', keyCode: 9 },
-    'Escape': { code: 'Escape', keyCode: 27 },
-    'ArrowDown': { code: 'ArrowDown', keyCode: 40 },
-    'ArrowUp': { code: 'ArrowUp', keyCode: 38 },
-  }
-  const k = keyMap[key] ?? { code: key, keyCode: 0 }
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
-    type: 'keyDown', key, code: k.code, keyCode: k.keyCode
-  })
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
-    type: 'keyUp', key, code: k.code, keyCode: k.keyCode
-  })
+  await sendExtensionMessage(userId, 'pressKey', { key }, 5000)
 }
 
 async function scrollPage(userId: string, direction: 'up' | 'down', amount = 300): Promise<void> {
-  const delta = direction === 'down' ? amount : -amount
-  await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `window.scrollBy(0, ${delta})`,
-    returnByValue: true
-  })
+  await sendExtensionMessage(userId, 'scrollPage', { direction, amount }, 5000)
 }
 
-// ─── Tools ───
-
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'browser_snapshot',
-      description: 'Read the current page. Returns interactive elements with ref IDs. ALWAYS call first and after every action.',
-      parameters: { type: 'object', properties: {}, required: [] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_navigate',
-      description: 'Navigate to a URL.',
-      parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_click',
-      description: 'Click an element by ref from the last snapshot.',
-      parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_type',
-      description: 'Type text into an input or textbox.',
-      parameters: {
-        type: 'object',
-        properties: {
-          ref: { type: 'string' },
-          text: { type: 'string' },
-          submit: { type: 'boolean' }
-        },
-        required: ['ref', 'text']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_key',
-      description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.',
-      parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_scroll',
-      description: 'Scroll the page.',
-      parameters: {
-        type: 'object',
-        properties: {
-          direction: { type: 'string', enum: ['up', 'down'] },
-          amount: { type: 'number' }
-        },
-        required: ['direction']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_wait',
-      description: 'Wait milliseconds.',
-      parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'task_complete',
-      description: 'Task done. Only call after visual confirmation.',
-      parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'task_failed',
-      description: 'Task failed.',
-      parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] }
-    }
-  },
+  { type: 'function', function: { name: 'browser_snapshot', description: 'Read the current page. Returns interactive elements with ref IDs. ALWAYS call first and after every action.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'browser_navigate', description: 'Navigate to a URL.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
+  { type: 'function', function: { name: 'browser_click', description: 'Click an element by ref from the last snapshot.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] } } },
+  { type: 'function', function: { name: 'browser_type', description: 'Type text into an input or textbox.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
+  { type: 'function', function: { name: 'browser_key', description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
+  { type: 'function', function: { name: 'browser_scroll', description: 'Scroll the page.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
+  { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
+  { type: 'function', function: { name: 'task_complete', description: 'Task done. Only call after visual confirmation.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
+  { type: 'function', function: { name: 'task_failed', description: 'Task failed.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] } } },
   { type: 'function', function: { name: 'gmail_list', description: 'List Gmail emails', parameters: { type: 'object', properties: { maxResults: { type: 'number' } } } } },
   { type: 'function', function: { name: 'gmail_send', description: 'Send email', parameters: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'subject', 'body'] } } },
   { type: 'function', function: { name: 'gmail_read', description: 'Read email', parameters: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'] } } },
@@ -326,16 +145,13 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control the user's real Chrome browser via CDP.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control the user's Chrome browser via the Felo extension.
 
 Rules:
 - ALWAYS call browser_snapshot before any action and after every action
 - NEVER call task_complete without visual confirmation the task worked
-- For Twitter/X posts: navigate to x.com, find the post textbox, click it, type text, click the Post button
 - If a ref fails, call browser_snapshot again for fresh refs
 - Do not attempt to log in — assume user is already logged in`
-
-// ─── Agent loop ───
 
 async function runAgentLoop(opts: {
   userId: string
@@ -348,8 +164,6 @@ async function runAgentLoop(opts: {
     { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user', content: opts.taskPrompt }
   ]
-
-  await enableDomains(opts.userId)
 
   const MAX_ITERATIONS = 20
   const deadline = Date.now() + 90_000
@@ -392,9 +206,8 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_click': {
-              await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
+              await opts.onProgress(`����️ Clicking ${args.ref}...`)
               await clickRef(opts.userId, opts.tabKey, args.ref)
-              await new Promise(r => setTimeout(r, 500))
               result = await snapshotPage(opts.userId, opts.tabKey)
               result = `Clicked. Page:\n${result}`
               break
@@ -525,8 +338,6 @@ async function runAgentLoop(opts: {
   return { success: false, summary: 'Exceeded max iterations' }
 }
 
-// ─── Entry point ───
-
 type StepLog = { step: number; description: string; action: string; success: boolean }
 
 export async function runAgentWithExtension(
@@ -574,6 +385,7 @@ export async function runAgentWithExtension(
 
   } finally {
     runningTasks.delete(taskKey)
+    await closeTab(userId)
     try {
       await supabase.from('task_executions').insert({
         user_id: userId, task_id: taskId || null, task_prompt: task, plan: [],
