@@ -19,6 +19,17 @@ async function enableDomains(userId: string): Promise<void> {
   await sendCdpCommand(userId, 'Accessibility.enable', {}).catch(() => {})
 }
 
+async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<void> {
+  const { extensionConnections, sendExtensionMessage } = await import('../index.js')
+  const ws = extensionConnections.get(userId)
+  if (!ws || ws.readyState !== 1) {
+    throw new Error('Extension not connected. Install the Felo extension and make sure it is connected.')
+  }
+
+  await sendExtensionMessage(userId, 'createAndAttachTab', { url }, 15000)
+  await new Promise(resolve => setTimeout(resolve, 1500))
+}
+
 async function navigateTo(userId: string, url: string): Promise<void> {
   await sendCdpCommand(userId, 'Page.navigate', { url })
   await waitForLoad(userId)
@@ -534,7 +545,9 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('🔌 Connecting to your browser...')
+    await onStep('🔌 Opening a new browser tab...')
+    await openAndAttachTab(userId, 'about:blank')
+    await onStep('✅ Tab ready. Starting task...')
 
     const tabKey = `${userId}:${Date.now()}`
     const result = await runAgentLoop({
