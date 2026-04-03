@@ -151,6 +151,8 @@ wss.on('connection', async (ws, req) => {
       if (msg.method === 'forwardCDPEvent') {
         console.log(`CDP event from ${userId}: ${msg.params?.method}`)
         handleExtensionEvent(userId, msg.params?.method, msg.params?.params)
+      } else {
+        console.log(`Extension message from ${userId}: method=${msg.method} id=${msg.id} hasResult=${msg.result !== undefined} hasError=${msg.error !== undefined}`)
       }
     } catch (err) {
       console.error('Extension message error:', err)

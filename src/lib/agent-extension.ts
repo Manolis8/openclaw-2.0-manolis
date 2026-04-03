@@ -25,27 +25,26 @@ async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<nu
     throw new Error('Extension not connected. Make sure the Felo extension is installed and connected.')
   }
 
-  console.log(`[agent] sending createAndAttachTab to extension for user ${userId}`)
+  console.log(`[agent] sending createAndAttachTab for user ${userId}`)
 
-  const { pendingCdpCommands } = await import('../index.js')
-  let cmdId: number
-  {
-    const mod = await import('../index.js')
-    cmdId = mod.cdpCommandId ? mod.cdpCommandId++ : Math.floor(Math.random() * 100000)
+  try {
+    const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url }, 20000) as any
+    console.log(`[agent] createAndAttachTab result:`, JSON.stringify(result))
+
+    const tabId = result?.tabId
+    if (!tabId || typeof tabId !== 'number') {
+      throw new Error(`Extension returned invalid tabId: ${JSON.stringify(result)}`)
+    }
+
+    userTabIds.set(userId, tabId)
+    console.log(`[agent] tab ${tabId} ready for user ${userId}`)
+    await new Promise(r => setTimeout(r, 1500))
+    return tabId
+
+  } catch (err) {
+    console.error(`[agent] createAndAttachTab failed:`, err)
+    throw new Error(`Failed to open browser tab: ${err instanceof Error ? err.message : String(err)}`)
   }
-
-  const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url }, 20000) as any
-  console.log(`[agent] createAndAttachTab response:`, JSON.stringify(result))
-
-  const tabId = result?.tabId
-  if (!tabId || typeof tabId !== 'number') {
-    throw new Error(`Extension did not return a valid tabId. Got: ${JSON.stringify(result)}`)
-  }
-
-  userTabIds.set(userId, tabId)
-  console.log(`[agent] tab ${tabId} opened and attached for user ${userId}`)
-  await new Promise(r => setTimeout(r, 1500))
-  return tabId
 }
 
 async function closeTab(userId: string): Promise<void> {
