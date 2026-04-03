@@ -7,40 +7,32 @@ import * as gmail from './integrations/gmail.js'
 import * as notion from './integrations/notion.js'
 import * as slack from './integrations/slack.js'
 import * as github from './integrations/github.js'
+import { formatAriaSnapshot, type RawAXNode } from '../browser/cdp.js'
+import { buildRoleSnapshotFromAriaSnapshot } from '../browser/pw-role-snapshot.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
-const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nodeId: string }>>()
 const userTabIds = new Map<string, number>()
 
-async function enableDomains(userId: string): Promise<void> {
-  await sendCdpCommand(userId, 'Runtime.enable', {}, 1, 5000).catch(() => {})
-  await sendCdpCommand(userId, 'Page.enable', {}, 1, 5000).catch(() => {})
-  await sendCdpCommand(userId, 'Log.enable', {}, 1, 5000).catch(() => {})
-}
+const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nodeId: string }>>()
 
 async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<number> {
   const ws = extensionConnections.get(userId)
   if (!ws || ws.readyState !== 1) {
     throw new Error('Extension not connected. Make sure the Felo extension is installed and connected.')
   }
-
   console.log(`[agent] sending createAndAttachTab for user ${userId}`)
-
   try {
     const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url }, 20000) as any
     console.log(`[agent] createAndAttachTab result:`, JSON.stringify(result))
-
     const tabId = result?.tabId
     if (!tabId || typeof tabId !== 'number') {
       throw new Error(`Extension returned invalid tabId: ${JSON.stringify(result)}`)
     }
-
     userTabIds.set(userId, tabId)
     console.log(`[agent] tab ${tabId} ready for user ${userId}`)
     await new Promise(r => setTimeout(r, 1500))
     return tabId
-
   } catch (err) {
     console.error(`[agent] createAndAttachTab failed:`, err)
     throw new Error(`Failed to open browser tab: ${err instanceof Error ? err.message : String(err)}`)
@@ -49,121 +41,76 @@ async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<nu
 
 async function closeTab(userId: string): Promise<void> {
   const tabId = userTabIds.get(userId)
+  userTabIds.delete(userId)
   if (!tabId) return
   try {
-    await sendCdpCommand(userId, 'Target.closeTarget', { targetId: `tab-${tabId}` }, tabId, 5000)
+    await sendExtensionMessage(userId, 'closeTab', { tabId }, 5000)
   } catch {}
-  userTabIds.delete(userId)
 }
 
 function getTabId(userId: string): number {
   const tabId = userTabIds.get(userId)
-  if (!tabId) throw new Error(`No tab opened for user ${userId}`)
+  if (!tabId) throw new Error(`No tab open for user ${userId}`)
   return tabId
 }
 
-async function navigateTo(userId: string, url: string): Promise<void> {
+async function cdp(userId: string, method: string, params: object = {}): Promise<any> {
   const tabId = getTabId(userId)
-  await sendCdpCommand(userId, 'Page.navigate', { url }, tabId, 20000)
-  await new Promise(resolve => setTimeout(resolve, 2500))
+  return sendCdpCommand(userId, method, params, tabId, 15000)
+}
+
+async function navigateTo(userId: string, url: string): Promise<void> {
+  await cdp(userId, 'Page.navigate', { url })
+  await new Promise(r => setTimeout(r, 2500))
 }
 
 async function getPageUrl(userId: string): Promise<string> {
-  const tabId = getTabId(userId)
   try {
-    const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+    const result = await cdp(userId, 'Runtime.evaluate', {
       expression: 'window.location.href',
       returnByValue: true
-    }, tabId, 5000) as any
+    })
     return result?.result?.value ?? 'unknown'
   } catch {
     return 'unknown'
   }
 }
 
-async function getAriaSnapshot(userId: string): Promise<string> {
-  const tabId = getTabId(userId)
-  const url = await getPageUrl(userId)
-  try {
-    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, tabId, 10000) as any
-    const nodes = result?.nodes ?? []
-    if (nodes.length > 0) {
-      const lines = buildSnapshotWithRefs(nodes, '')
-      return `URL: ${url}\n${lines || '(no interactive elements)'}`
-    }
-  } catch {}
-  return `URL: ${url}\n(no interactive elements)`
-}
-
-const INTERACTIVE_ROLES = new Set([
-  'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
-  'listbox', 'menuitem', 'option', 'searchbox', 'slider', 'switch', 'tab'
-])
-
-type AXNode = { nodeId: string; role?: { value: string }; name?: { value: string }; ignored?: boolean }
-
-const SKIP_ROLES = new Set([
-  'none', 'generic', 'inlinetextbox', 'statictext', 'presentation',
-  'ignored', 'unknown', 'group', 'image', 'img', 'separator', 'region',
-  'main', 'navigation', 'banner', 'contentinfo', 'complementary',
-  'form', 'document', 'application', 'rootwebarea', 'webarea',
-  'tree', 'treegrid', 'rowgroup', 'row', 'gridcell', 'columnheader',
-  'rowheader', 'table', 'grid', 'list', 'listitem', 'article',
-  'dialog', 'alertdialog', 'paragraph', 'blockquote', 'emphasis',
-  'strong', 'mark', 'insertion', 'deletion', 'subscript', 'superscript',
-  'time', 'code', 'term', 'definition', 'note', 'tooltip',
-  'feed', 'figure', 'math', 'directory', 'log', 'marquee', 'status',
-  'timer', 'scrollbar', 'slider', 'spinbutton', 'progressbar',
-  'toolbar', 'menubar', 'menu', 'tablist', 'tabpanel',
-  'cell', 'columnheader', 'rowheader'
-])
-
-function buildSnapshotWithRefs(nodes: AXNode[], tabKey: string): string {
-  const refs: Record<string, { role: string; name?: string; nodeId: string }> = {}
-  const lines: string[] = []
-  let counter = 0
-
-  for (const node of nodes) {
-    if (node.ignored) continue
-    const role = (node.role?.value ?? '').toLowerCase().trim()
-    const name = (node.name?.value ?? '').trim()
-
-    if (!role || SKIP_ROLES.has(role)) continue
-    if (!name && !INTERACTIVE_ROLES.has(role)) continue
-    if (name.length > 100) continue
-
-    counter++
-    const ref = `e${counter}`
-    let line = `- ${role}`
-    if (name) line += ` "${name}"`
-
-    if (INTERACTIVE_ROLES.has(role)) {
-      line += ` [ref=${ref}]`
-      refs[ref] = { role, name: name || undefined, nodeId: node.nodeId }
-    }
-    lines.push(line)
-  }
-
-  sessionRefs.set(tabKey, refs)
-  return lines.join('\n') || '(no interactive elements)'
-}
-
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
-  const tabId = getTabId(userId)
-  const url = await getPageUrl(userId)
-  try {
-    const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, tabId, 10000) as any
-    const nodes = result?.nodes ?? []
-    if (nodes.length > 0) {
-      const snapshot = buildSnapshotWithRefs(nodes, tabKey)
-      return `URL: ${url}\n${snapshot}`
-    }
-  } catch {}
-  return `URL: ${url}\n(no interactive elements)`
+  const [axResult, url] = await Promise.all([
+    cdp(userId, 'Accessibility.getFullAXTree', {}),
+    getPageUrl(userId)
+  ])
+
+  const rawNodes: RawAXNode[] = axResult?.nodes ?? []
+
+  const ariaNodes = formatAriaSnapshot(rawNodes, 500)
+
+  const ariaText = ariaNodes
+    .map(n => {
+      const indent = '  '.repeat(n.depth)
+      let line = `${indent}- ${n.role}`
+      if (n.name) line += ` "${n.name}"`
+      if (n.value) line += `: ${n.value}`
+      return line
+    })
+    .join('\n')
+
+  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(ariaText, { interactive: true })
+
+  sessionRefs.set(tabKey, Object.fromEntries(
+    Object.entries(refs).map(([ref, data]) => [ref, {
+      role: data.role,
+      name: data.name,
+      nodeId: ''
+    }])
+  ))
+
+  const text = snapshot || '(no interactive elements)'
+  return `URL: ${url}\n${text}`
 }
 
 async function clickRef(userId: string, tabKey: string, ref: string): Promise<void> {
-  const tabId = getTabId(userId)
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
@@ -171,24 +118,24 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
   const nameSafe = (target.name ?? '').replace(/"/g, '\\"')
   const targetRole = target.role
 
-  const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+  const result = await cdp(userId, 'Runtime.evaluate', {
     expression: `
       (() => {
         let el = document.querySelector('[aria-label="${nameSafe}"]');
         if (!el) {
-          const all = document.querySelectorAll('[role="${targetRole}"]');
-          for (const c of all) {
-            if (c.getAttribute('aria-label') === '${nameSafe}') { el = c; break; }
+          for (const c of document.querySelectorAll('[role="${targetRole}"]')) {
+            if (c.getAttribute('aria-label') === '${nameSafe}' || c.textContent?.trim() === '${nameSafe}') {
+              el = c; break;
+            }
           }
         }
-        if (!el && '${nameSafe}' === 'Post') {
+        if (!el && '${nameSafe}'.toLowerCase() === 'post') {
           el = document.querySelector('[data-testid="tweetButtonInline"]')
             || document.querySelector('[data-testid="tweetButton"]');
         }
         if (!el) {
           const tag = '${targetRole}' === 'link' ? 'a' : 'button';
-          const all = document.querySelectorAll(tag);
-          for (const c of all) {
+          for (const c of document.querySelectorAll(tag)) {
             if (c.textContent?.trim() === '${nameSafe}' || c.getAttribute('aria-label') === '${nameSafe}') {
               el = c; break;
             }
@@ -197,27 +144,24 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
         if (!el) el = document.querySelector('[role="${targetRole}"]');
         if (!el) return 'not_found';
         el.scrollIntoView({ block: 'center' });
-        el.focus();
+        ['mousedown','mouseup','click'].forEach(t =>
+          el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true }))
+        );
         el.click();
-        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
         return el.getAttribute('data-testid') || el.getAttribute('aria-label') || el.tagName;
       })()
     `,
     returnByValue: true
-  }, tabId, 10000) as any
+  }) as any
 
   if (result?.result?.value === 'not_found') {
     throw new Error(`Could not find element for ref "${ref}" (${target.role} "${target.name}"). Take a new snapshot.`)
   }
-
   console.log(`[agent] clicked: ${result?.result?.value}`)
   await new Promise(r => setTimeout(r, 300))
 }
 
 async function typeInRef(userId: string, tabKey: string, ref: string, text: string): Promise<void> {
-  const tabId = getTabId(userId)
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
@@ -225,233 +169,62 @@ async function typeInRef(userId: string, tabKey: string, ref: string, text: stri
   const nameSafe = (target.name ?? '').replace(/"/g, '\\"')
   const targetRole = target.role
 
-  await sendCdpCommand(userId, 'Runtime.evaluate', {
+  await cdp(userId, 'Runtime.evaluate', {
     expression: `
       (() => {
         let el = document.querySelector('[aria-label="${nameSafe}"]');
         if (!el) el = document.querySelector('[role="${targetRole}"]');
         if (!el) return false;
-        el.focus();
-        el.click();
-        return true;
+        el.focus(); el.click(); return true;
       })()
     `,
     returnByValue: true
-  }, tabId, 10000)
+  })
   await new Promise(r => setTimeout(r, 200))
 
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
+  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 })
+  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 })
   await new Promise(r => setTimeout(r, 100))
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', keyCode: 8 }, tabId, 5000)
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', keyCode: 8 }, tabId, 5000)
+  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', keyCode: 8 })
+  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', keyCode: 8 })
   await new Promise(r => setTimeout(r, 100))
 
-  await sendCdpCommand(userId, 'Input.insertText', { text }, tabId, 5000)
+  await cdp(userId, 'Input.insertText', { text })
   await new Promise(r => setTimeout(r, 300))
 }
 
 async function pressKey(userId: string, key: string): Promise<void> {
-  const tabId = getTabId(userId)
   const keyMap: Record<string, { code: string; keyCode: number }> = {
-    'Enter': { code: 'Enter', keyCode: 13 },
-    'Tab': { code: 'Tab', keyCode: 9 },
-    'Escape': { code: 'Escape', keyCode: 27 },
+    'Enter':     { code: 'Enter',     keyCode: 13 },
+    'Tab':       { code: 'Tab',       keyCode: 9  },
+    'Escape':    { code: 'Escape',    keyCode: 27 },
     'ArrowDown': { code: 'ArrowDown', keyCode: 40 },
-    'ArrowUp': { code: 'ArrowUp', keyCode: 38 },
+    'ArrowUp':   { code: 'ArrowUp',   keyCode: 38 },
   }
   const k = keyMap[key] ?? { code: key, keyCode: 0 }
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
-    type: 'keyDown', key, code: k.code, keyCode: k.keyCode
-  }, tabId, 5000)
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', {
-    type: 'keyUp', key, code: k.code, keyCode: k.keyCode
-  }, tabId, 5000)
+  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key, code: k.code, keyCode: k.keyCode })
+  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyUp',   key, code: k.code, keyCode: k.keyCode })
 }
 
 async function scrollPage(userId: string, direction: 'up' | 'down', amount = 300): Promise<void> {
-  const tabId = getTabId(userId)
   const delta = direction === 'down' ? amount : -amount
-  await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `window.scrollBy(0, ${delta})`,
-    returnByValue: true
-  }, tabId, 5000)
-}
-
-async function clickTwitterPostButton(userId: string): Promise<boolean> {
-  const tabId = getTabId(userId)
-  const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `
-      (() => {
-        const selectors = [
-          '[data-testid="tweetButtonInline"]',
-          '[data-testid="tweetButton"]',
-          'button[data-testid="tweetButtonInline"]',
-          'div[data-testid="tweetButtonInline"]',
-        ];
-        for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (el) {
-            el.scrollIntoView({ block: 'center' });
-            ['mouseenter','mouseover','mousemove','mousedown','mouseup','click'].forEach(type => {
-              el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-            });
-            el.click();
-            return 'clicked:' + sel;
-          }
-        }
-        const buttons = Array.from(document.querySelectorAll('button'));
-        for (const btn of buttons) {
-          const label = btn.getAttribute('aria-label') || btn.textContent?.trim() || '';
-          if ((label === 'Post' || label === 'Tweet') && !btn.disabled) {
-            btn.scrollIntoView({ block: 'center' });
-            ['mousedown','mouseup','click'].forEach(type => {
-              btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-            });
-            btn.click();
-            return 'clicked:button-text-' + label;
-          }
-        }
-        return 'not_found';
-      })()
-    `,
-    returnByValue: true
-  }, tabId, 10000) as any
-  const val = result?.result?.value ?? 'not_found'
-  console.log(`[agent] clickTwitterPostButton: ${val}`)
-  return val !== 'not_found'
-}
-
-async function focusAndTypeInTwitterComposer(userId: string, text: string): Promise<boolean> {
-  const tabId = getTabId(userId)
-  const focusResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `
-      (() => {
-        const selectors = [
-          '[data-testid="tweetTextarea_0"]',
-          'div[contenteditable="true"][aria-label]',
-          'div[role="textbox"]',
-          '[data-testid="tweetTextarea_0_label"]',
-        ];
-        for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (el) {
-            el.focus();
-            el.click();
-            return 'found:' + sel;
-          }
-        }
-        return 'not_found';
-      })()
-    `,
-    returnByValue: true
-  }, tabId, 10000) as any
-  console.log(`[agent] focusComposer: ${focusResult?.result?.value}`)
-  if (focusResult?.result?.value === 'not_found') return false
-
-  await new Promise(r => setTimeout(r, 300))
-
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
-  await new Promise(r => setTimeout(r, 100))
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', keyCode: 8 }, tabId, 5000)
-  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', keyCode: 8 }, tabId, 5000)
-  await new Promise(r => setTimeout(r, 100))
-
-  await sendCdpCommand(userId, 'Input.insertText', { text }, tabId, 5000)
-  await new Promise(r => setTimeout(r, 500))
-
-  const verifyResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
-    expression: `
-      (() => {
-        const el = document.querySelector('[data-testid="tweetTextarea_0"]')
-          || document.querySelector('div[role="textbox"]');
-        return el ? (el.textContent || el.innerText || '').trim() : '';
-      })()
-    `,
-    returnByValue: true
-  }, tabId, 5000) as any
-  console.log(`[agent] composer text after type: "${verifyResult?.result?.value}"`)
-  return true
+  await cdp(userId, 'Runtime.evaluate', { expression: `window.scrollBy(0, ${delta})`, returnByValue: true })
 }
 
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'browser_snapshot',
-      description: 'Read the current page. Returns interactive elements with ref IDs. ALWAYS call first and after every action.',
-      parameters: { type: 'object', properties: {}, required: [] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_navigate',
-      description: 'Navigate to a URL.',
-      parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_click',
-      description: 'Click an element by ref from the last snapshot.',
-      parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_type',
-      description: 'Type text into an input or textbox.',
-      parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_key',
-      description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.',
-      parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_scroll',
-      description: 'Scroll the page.',
-      parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'browser_wait',
-      description: 'Wait milliseconds.',
-      parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'task_complete',
-      description: 'Task done. Only call after visual confirmation.',
-      parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'task_failed',
-      description: 'Task failed.',
-      parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] }
-    }
-  },
+  { type: 'function', function: { name: 'browser_snapshot', description: 'Read the current page. Returns interactive elements with refs like e1, e2. ALWAYS call first and after every action.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'browser_navigate', description: 'Navigate to a URL.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
+  { type: 'function', function: { name: 'browser_click', description: 'Click element by ref from last snapshot.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] } } },
+  { type: 'function', function: { name: 'browser_type', description: 'Type text into a ref.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
+  { type: 'function', function: { name: 'browser_key', description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
+  { type: 'function', function: { name: 'browser_scroll', description: 'Scroll page up or down.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
+  { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
+  { type: 'function', function: { name: 'task_complete', description: 'Call only after visual confirmation task succeeded.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
+  { type: 'function', function: { name: 'task_failed', description: 'Call when task cannot be completed.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] } } },
   { type: 'function', function: { name: 'gmail_list', description: 'List Gmail emails', parameters: { type: 'object', properties: { maxResults: { type: 'number' } } } } },
   { type: 'function', function: { name: 'gmail_send', description: 'Send email', parameters: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'subject', 'body'] } } },
-  { type: 'function', function: { name: 'gmail_read', description: 'Read email', parameters: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'] } } },
-  { type: 'function', function: { name: 'gmail_summarize', description: 'Summarize emails', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'gmail_read', description: 'Read email by ID', parameters: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'] } } },
+  { type: 'function', function: { name: 'gmail_summarize', description: 'Summarize recent emails', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'notion_create_page', description: 'Create Notion page', parameters: { type: 'object', properties: { parentId: { type: 'string' }, title: { type: 'string' }, content: { type: 'string' } }, required: ['parentId', 'title', 'content'] } } },
   { type: 'function', function: { name: 'notion_list_databases', description: 'List Notion databases', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'notion_query_database', description: 'Query Notion database', parameters: { type: 'object', properties: { databaseId: { type: 'string' } }, required: ['databaseId'] } } },
@@ -463,13 +236,11 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent. You control a real Chrome browser tab.
-
-You are given tasks in plain English. You figure out how to complete them by reading the page snapshot and interacting with the UI.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome tab.
 
 HOW YOU WORK:
-- Call browser_snapshot to see the current page — it shows interactive elements with refs like e1, e2
-- Use the refs to click, type, and interact
+- Call browser_snapshot to see the page — it shows interactive elements with refs like e1, e2
+- Use refs to click, type, and interact
 - After every action, call browser_snapshot to see what changed
 - Keep going until the task is done, then call task_complete
 
@@ -477,7 +248,7 @@ RULES:
 - Never assume an action worked — always snapshot after to verify
 - If you can't find an element, snapshot again — the page may have changed
 - If something fails twice, try a different approach
-- Never try to log in — the user is already logged in to all their accounts
+- Never try to log in — the user is already logged in
 - Only call task_complete when you can see the result on the page
 - Only call task_failed after exhausting all approaches`
 
@@ -492,7 +263,6 @@ async function runAgentLoop(opts: {
   const deadline = Date.now() + 90_000
 
   for (let attempt = 0; attempt < 2; attempt++) {
-    // Fresh message history for each attempt
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: attempt === 0
@@ -665,22 +435,11 @@ async function runAgentLoop(opts: {
       }
 
       messages.push(...toolResults)
-
-      // Break inner loop if agent called task_failed — outer loop handles retry
       if (shouldRetry) break
     }
 
-    if (!shouldRetry) {
-      // Inner loop exhausted without task_complete or task_failed
-      return { success: false, summary: 'Exceeded max iterations' }
-    }
-
-    if (attempt >= 1) {
-      // Second attempt also failed
-      return { success: false, summary: retryReason }
-    }
-
-    // Continue to next attempt
+    if (!shouldRetry) return { success: false, summary: 'Exceeded max iterations' }
+    if (attempt >= 1) return { success: false, summary: retryReason }
     await opts.onProgress(`🔄 Retrying task...`)
   }
 
@@ -705,7 +464,7 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('🔌 Opening a new browser tab...')
+    await onStep('🔌 Opening browser tab...')
     await openAndAttachTab(userId, 'about:blank')
     await onStep('✅ Tab ready. Starting task...')
 
