@@ -149,7 +149,7 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const nameSafe = (target.name ?? '').replace(/`/g, '\\`').replace(/\\/g, '\\\\')
+  const nameSafe = (target.name ?? '').replace(/"/g, '\\"')
   const targetRole = target.role
 
   const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
@@ -157,26 +157,33 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
       (() => {
         let el = document.querySelector('[aria-label="${nameSafe}"]');
         if (!el) {
-          const candidates = document.querySelectorAll('[role="${targetRole}"]');
-          for (const c of candidates) {
-            if (c.textContent?.trim() === '${nameSafe}' || c.getAttribute('aria-label') === '${nameSafe}') {
-              el = c; break;
-            }
+          const all = document.querySelectorAll('[role="${targetRole}"]');
+          for (const c of all) {
+            if (c.getAttribute('aria-label') === '${nameSafe}') { el = c; break; }
           }
         }
-        if (!el) el = document.querySelector('[role="${targetRole}"]');
-        if (!el && ('${targetRole}' === 'button' || '${targetRole}' === 'link')) {
-          const all = document.querySelectorAll('${targetRole === 'link' ? 'a' : 'button'}');
+        if (!el && '${nameSafe}' === 'Post') {
+          el = document.querySelector('[data-testid="tweetButtonInline"]')
+            || document.querySelector('[data-testid="tweetButton"]');
+        }
+        if (!el) {
+          const tag = '${targetRole}' === 'link' ? 'a' : 'button';
+          const all = document.querySelectorAll(tag);
           for (const c of all) {
             if (c.textContent?.trim() === '${nameSafe}' || c.getAttribute('aria-label') === '${nameSafe}') {
               el = c; break;
             }
           }
         }
+        if (!el) el = document.querySelector('[role="${targetRole}"]');
         if (!el) return 'not_found';
+        el.scrollIntoView({ block: 'center' });
         el.focus();
         el.click();
-        return 'clicked';
+        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        return el.getAttribute('data-testid') || el.getAttribute('aria-label') || el.tagName;
       })()
     `,
     returnByValue: true
@@ -185,6 +192,8 @@ async function clickRef(userId: string, tabKey: string, ref: string): Promise<vo
   if (result?.result?.value === 'not_found') {
     throw new Error(`Could not find element for ref "${ref}" (${target.role} "${target.name}"). Take a new snapshot.`)
   }
+
+  console.log(`[agent] clicked: ${result?.result?.value}`)
   await new Promise(r => setTimeout(r, 300))
 }
 
@@ -194,21 +203,13 @@ async function typeInRef(userId: string, tabKey: string, ref: string, text: stri
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const nameSafe = (target.name ?? '').replace(/`/g, '\\`').replace(/\\/g, '\\\\')
+  const nameSafe = (target.name ?? '').replace(/"/g, '\\"')
   const targetRole = target.role
 
   await sendCdpCommand(userId, 'Runtime.evaluate', {
     expression: `
       (() => {
         let el = document.querySelector('[aria-label="${nameSafe}"]');
-        if (!el) {
-          const candidates = document.querySelectorAll('[role="${targetRole}"]');
-          for (const c of candidates) {
-            if (c.getAttribute('aria-label') === '${nameSafe}' || c.textContent?.trim() === '${nameSafe}') {
-              el = c; break;
-            }
-          }
-        }
         if (!el) el = document.querySelector('[role="${targetRole}"]');
         if (!el) return false;
         el.focus();
@@ -218,16 +219,17 @@ async function typeInRef(userId: string, tabKey: string, ref: string, text: stri
     `,
     returnByValue: true
   }, tabId, 10000)
-
   await new Promise(r => setTimeout(r, 200))
 
   await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
   await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
   await new Promise(r => setTimeout(r, 100))
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', keyCode: 8 }, tabId, 5000)
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', keyCode: 8 }, tabId, 5000)
+  await new Promise(r => setTimeout(r, 100))
 
   await sendCdpCommand(userId, 'Input.insertText', { text }, tabId, 5000)
-
-  await new Promise(r => setTimeout(r, 200))
+  await new Promise(r => setTimeout(r, 300))
 }
 
 async function pressKey(userId: string, key: string): Promise<void> {
@@ -345,14 +347,20 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome browser tab via CDP.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome browser tab.
 
 RULES:
 - ALWAYS call browser_snapshot before any action and after every action
-- NEVER call task_complete without visual confirmation — you must see the post/form/item actually appear
-- For Twitter/X posting: navigate to https://x.com → snapshot → click the post composer textbox (role=textbox) → type the text → snapshot to verify text appeared → click the Post button → snapshot to confirm post was published
-- After clicking Post, wait and snapshot again — look for the composer to close or the post to appear in the feed
-- If a ref fails, snapshot again for fresh refs
+- For Twitter/X posting:
+  1. Navigate to https://x.com
+  2. Snapshot — find the post composer (role=textbox, name contains "Post")
+  3. Click the textbox
+  4. Type the text
+  5. Snapshot to verify the text appeared in the composer
+  6. Click the Post button (look for role=button name="Post" or data-testid="tweetButtonInline")
+  7. Wait 2000ms then snapshot — if composer is gone or post appears in feed, call task_complete
+  8. If the composer is still there with text in it, the post was NOT submitted — try clicking Post again
+- NEVER call task_complete if the composer still shows — only when confirmed gone or post visible
 - Never try to log in`
 
 async function runAgentLoop(opts: {
