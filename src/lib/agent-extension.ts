@@ -259,6 +259,103 @@ async function scrollPage(userId: string, direction: 'up' | 'down', amount = 300
   }, tabId, 5000)
 }
 
+async function clickTwitterPostButton(userId: string): Promise<boolean> {
+  const tabId = getTabId(userId)
+  const result = await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `
+      (() => {
+        const selectors = [
+          '[data-testid="tweetButtonInline"]',
+          '[data-testid="tweetButton"]',
+          'button[data-testid="tweetButtonInline"]',
+          'div[data-testid="tweetButtonInline"]',
+        ];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            el.scrollIntoView({ block: 'center' });
+            ['mouseenter','mouseover','mousemove','mousedown','mouseup','click'].forEach(type => {
+              el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            });
+            el.click();
+            return 'clicked:' + sel;
+          }
+        }
+        const buttons = Array.from(document.querySelectorAll('button'));
+        for (const btn of buttons) {
+          const label = btn.getAttribute('aria-label') || btn.textContent?.trim() || '';
+          if ((label === 'Post' || label === 'Tweet') && !btn.disabled) {
+            btn.scrollIntoView({ block: 'center' });
+            ['mousedown','mouseup','click'].forEach(type => {
+              btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            });
+            btn.click();
+            return 'clicked:button-text-' + label;
+          }
+        }
+        return 'not_found';
+      })()
+    `,
+    returnByValue: true
+  }, tabId, 10000) as any
+  const val = result?.result?.value ?? 'not_found'
+  console.log(`[agent] clickTwitterPostButton: ${val}`)
+  return val !== 'not_found'
+}
+
+async function focusAndTypeInTwitterComposer(userId: string, text: string): Promise<boolean> {
+  const tabId = getTabId(userId)
+  const focusResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `
+      (() => {
+        const selectors = [
+          '[data-testid="tweetTextarea_0"]',
+          'div[contenteditable="true"][aria-label]',
+          'div[role="textbox"]',
+          '[data-testid="tweetTextarea_0_label"]',
+        ];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            el.focus();
+            el.click();
+            return 'found:' + sel;
+          }
+        }
+        return 'not_found';
+      })()
+    `,
+    returnByValue: true
+  }, tabId, 10000) as any
+  console.log(`[agent] focusComposer: ${focusResult?.result?.value}`)
+  if (focusResult?.result?.value === 'not_found') return false
+
+  await new Promise(r => setTimeout(r, 300))
+
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 }, tabId, 5000)
+  await new Promise(r => setTimeout(r, 100))
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', keyCode: 8 }, tabId, 5000)
+  await sendCdpCommand(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', keyCode: 8 }, tabId, 5000)
+  await new Promise(r => setTimeout(r, 100))
+
+  await sendCdpCommand(userId, 'Input.insertText', { text }, tabId, 5000)
+  await new Promise(r => setTimeout(r, 500))
+
+  const verifyResult = await sendCdpCommand(userId, 'Runtime.evaluate', {
+    expression: `
+      (() => {
+        const el = document.querySelector('[data-testid="tweetTextarea_0"]')
+          || document.querySelector('div[role="textbox"]');
+        return el ? (el.textContent || el.innerText || '').trim() : '';
+      })()
+    `,
+    returnByValue: true
+  }, tabId, 5000) as any
+  console.log(`[agent] composer text after type: "${verifyResult?.result?.value}"`)
+  return true
+}
+
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
@@ -345,23 +442,26 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_list_repos', description: 'List GitHub repos', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'github_list_issues', description: 'List GitHub issues', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' } }, required: ['owner', 'repo'] } } },
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
+  { type: 'function', function: { name: 'twitter_post', description: 'Special tool to post on Twitter/X. Use this instead of manual click+type for Twitter posts. Much more reliable.', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
 ]
 
 const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome browser tab.
 
 RULES:
 - ALWAYS call browser_snapshot before any action and after every action
-- For Twitter/X posting:
-  1. Navigate to https://x.com
-  2. Snapshot — find the post composer (role=textbox, name contains "Post")
-  3. Click the textbox
-  4. Type the text
-  5. Snapshot to verify the text appeared in the composer
-  6. Click the Post button (look for role=button name="Post" or data-testid="tweetButtonInline")
-  7. Wait 2000ms then snapshot — if composer is gone or post appears in feed, call task_complete
-  8. If the composer is still there with text in it, the post was NOT submitted — try clicking Post again
-- NEVER call task_complete if the composer still shows — only when confirmed gone or post visible
-- Never try to log in`
+- For Twitter/X posting use this EXACT sequence:
+  1. browser_navigate to https://x.com
+  2. browser_snapshot — wait for page to load
+  3. browser_wait 2000ms for page to fully render
+  4. browser_snapshot again
+  5. Use browser_click on the Post text composer (role=textbox)
+  6. browser_type the text into the composer ref
+  7. browser_snapshot to verify text is in composer
+  8. browser_click the Post button (role=button, name="Post")
+  9. browser_wait 3000ms
+  10. browser_snapshot — if composer is gone, call task_complete. If still there, click Post button again.
+- NEVER call task_complete if you are not sure the post was published
+- Never try to log in — assume user is already logged in`
 
 async function runAgentLoop(opts: {
   userId: string
@@ -533,6 +633,48 @@ async function runAgentLoop(opts: {
             case 'github_create_issue': {
               if (!await isProviderConnected(opts.userId, 'github')) { result = 'GitHub not connected'; break }
               result = `Created issue: ${args.title}`
+              break
+            }
+            case 'twitter_post': {
+              await opts.onProgress(`🐦 Posting to Twitter: "${args.text}"...`)
+
+              const typed = await focusAndTypeInTwitterComposer(opts.userId, args.text)
+              if (!typed) {
+                result = 'Could not find Twitter post composer. Make sure you are on x.com and the page is loaded.'
+                break
+              }
+
+              await opts.onProgress('🖱️ Clicking Post button...')
+              await new Promise(r => setTimeout(r, 500))
+
+              const clicked = await clickTwitterPostButton(opts.userId)
+              if (!clicked) {
+                result = 'Could not find Post button. Try browser_snapshot to see current state.'
+                break
+              }
+
+              await new Promise(r => setTimeout(r, 3000))
+
+              const verifyResult = await sendCdpCommand(opts.userId, 'Runtime.evaluate', {
+                expression: `
+                  (() => {
+                    const composer = document.querySelector('[data-testid="tweetTextarea_0"]');
+                    const text = composer ? (composer.textContent || '').trim() : '';
+                    return { composerGone: !composer || text === '', text };
+                  })()
+                `,
+                returnByValue: true
+              }, getTabId(opts.userId), 5000) as any
+
+              const { composerGone, text: remainingText } = verifyResult?.result?.value ?? {}
+              console.log(`[agent] after post: composerGone=${composerGone} remainingText="${remainingText}"`)
+
+              if (composerGone) {
+                await opts.onProgress('✅ Post published successfully!')
+                result = 'Post published successfully. Composer closed after posting.'
+              } else {
+                result = `Post may not have submitted. Composer still shows text: "${remainingText}". Try clicking Post button again with browser_click.`
+              }
               break
             }
             default:
