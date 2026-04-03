@@ -7,7 +7,7 @@ import * as gmail from './integrations/gmail.js'
 import * as notion from './integrations/notion.js'
 import * as slack from './integrations/slack.js'
 import * as github from './integrations/github.js'
-import { formatAriaSnapshot, type RawAXNode } from '../browser/cdp.js'
+import { formatAriaSnapshot, type RawAXNode } from '../browser/cdp-snapshot.js'
 import { buildRoleSnapshotFromAriaSnapshot } from '../browser/pw-role-snapshot.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
