@@ -88,7 +88,7 @@ async function getAriaSnapshot(userId: string): Promise<string> {
     const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, tabId, 10000) as any
     const nodes = result?.nodes ?? []
     if (nodes.length > 0) {
-      const lines = buildSnapshotWithRefs(nodes, userId, '')
+      const lines = buildSnapshotWithRefs(nodes, '')
       return `URL: ${url}\n${lines || '(no interactive elements)'}`
     }
   } catch {}
@@ -100,19 +100,18 @@ const INTERACTIVE_ROLES = new Set([
   'listbox', 'menuitem', 'option', 'searchbox', 'slider', 'switch', 'tab'
 ])
 
-function buildSnapshotWithRefs(
-  nodes: Array<{ role?: string; name?: string; nodeId?: string }>,
-  userId: string,
-  tabKey: string
-): string {
+type AXNode = { nodeId: string; role?: { value: string }; name?: { value: string }; ignored?: boolean }
+
+function buildSnapshotWithRefs(nodes: AXNode[], tabKey: string): string {
   const refs: Record<string, { role: string; name?: string; nodeId: string }> = {}
   const lines: string[] = []
   let counter = 0
 
   for (const node of nodes) {
-    const role = node.role?.toLowerCase() ?? ''
-    const name = node.name ?? ''
-    if (!role || role === 'none' || role === 'generic') continue
+    if (node.ignored) continue
+    const role = (node.role?.value ?? '').toLowerCase().trim()
+    const name = (node.name?.value ?? '').trim()
+    if (!role || role === 'none' || role === 'generic' || role === 'inlineTextBox' || role === 'staticText') continue
 
     counter++
     const ref = `e${counter}`
@@ -121,12 +120,12 @@ function buildSnapshotWithRefs(
 
     if (INTERACTIVE_ROLES.has(role)) {
       line += ` [ref=${ref}]`
-      refs[ref] = { role, name: name || undefined, nodeId: node.nodeId ?? '' }
+      refs[ref] = { role, name: name || undefined, nodeId: node.nodeId }
     }
     lines.push(line)
   }
 
-  if (tabKey) sessionRefs.set(tabKey, refs)
+  sessionRefs.set(tabKey, refs)
   return lines.join('\n') || '(no interactive elements)'
 }
 
@@ -137,7 +136,7 @@ async function snapshotPage(userId: string, tabKey: string): Promise<string> {
     const result = await sendCdpCommand(userId, 'Accessibility.getFullAXTree', {}, tabId, 10000) as any
     const nodes = result?.nodes ?? []
     if (nodes.length > 0) {
-      const snapshot = buildSnapshotWithRefs(nodes, userId, tabKey)
+      const snapshot = buildSnapshotWithRefs(nodes, tabKey)
       return `URL: ${url}\n${snapshot}`
     }
   } catch {}
@@ -312,16 +311,23 @@ async function runAgentLoop(opts: {
   tabKey: string
   onProgress: (msg: string) => Promise<void>
 }): Promise<{ success: boolean; summary: string }> {
-  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: opts.taskPrompt }
-  ]
-
   const MAX_ITERATIONS = 20
   const deadline = Date.now() + 90_000
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    // Fresh message history for each attempt
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: attempt === 0
+        ? opts.taskPrompt
+        : `${opts.taskPrompt}\n\nNote: first attempt failed. Try a different approach.`
+      }
+    ]
+
     let iterations = 0
+    let shouldRetry = false
+    let retryReason = ''
+
     while (iterations < MAX_ITERATIONS && Date.now() < deadline) {
       iterations++
 
@@ -360,6 +366,7 @@ async function runAgentLoop(opts: {
             case 'browser_click': {
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
               await clickRef(opts.userId, opts.tabKey, args.ref)
+              await new Promise(r => setTimeout(r, 500))
               result = await snapshotPage(opts.userId, opts.tabKey)
               result = `Clicked. Page:\n${result}`
               break
@@ -368,6 +375,7 @@ async function runAgentLoop(opts: {
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
               await typeInRef(opts.userId, opts.tabKey, args.ref, args.text)
               if (args.submit) await pressKey(opts.userId, 'Enter')
+              await new Promise(r => setTimeout(r, 300))
               result = await snapshotPage(opts.userId, opts.tabKey)
               result = `Typed. Page:\n${result}`
               break
@@ -375,6 +383,7 @@ async function runAgentLoop(opts: {
             case 'browser_key': {
               await opts.onProgress(`⌨️ Pressing ${args.key}...`)
               await pressKey(opts.userId, args.key)
+              await new Promise(r => setTimeout(r, 300))
               result = `Pressed ${args.key}`
               break
             }
@@ -384,7 +393,7 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_wait': {
-              await new Promise(r => setTimeout(r, args.ms || 1000))
+              await new Promise(r => setTimeout(r, Math.min(args.ms || 1000, 10000)))
               result = 'Done waiting'
               break
             }
@@ -393,15 +402,10 @@ async function runAgentLoop(opts: {
               return { success: true, summary: args.summary }
             }
             case 'task_failed': {
-              if (attempt === 0) {
-                await opts.onProgress(`⚠️ Retrying: ${args.reason}`)
-                messages.length = 2
-                messages[1] = { role: 'user', content: `${opts.taskPrompt}\n\nFirst attempt failed: ${args.reason}. Try differently.` }
-              } else {
-                await opts.onProgress(`❌ ${args.reason}`)
-                return { success: false, summary: args.reason }
-              }
-              result = 'Retrying'
+              await opts.onProgress(`⚠️ Attempt ${attempt + 1} failed: ${args.reason}`)
+              shouldRetry = true
+              retryReason = args.reason
+              result = 'Noted'
               break
             }
             case 'gmail_list': {
@@ -484,10 +488,26 @@ async function runAgentLoop(opts: {
       }
 
       messages.push(...toolResults)
+
+      // Break inner loop if agent called task_failed — outer loop handles retry
+      if (shouldRetry) break
     }
+
+    if (!shouldRetry) {
+      // Inner loop exhausted without task_complete or task_failed
+      return { success: false, summary: 'Exceeded max iterations' }
+    }
+
+    if (attempt >= 1) {
+      // Second attempt also failed
+      return { success: false, summary: retryReason }
+    }
+
+    // Continue to next attempt
+    await opts.onProgress(`🔄 Retrying task...`)
   }
 
-  return { success: false, summary: 'Exceeded max iterations' }
+  return { success: false, summary: 'Exceeded max attempts' }
 }
 
 type StepLog = { step: number; description: string; action: string; success: boolean }
