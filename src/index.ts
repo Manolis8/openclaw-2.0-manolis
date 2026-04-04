@@ -7,7 +7,7 @@ import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { connectionsRouter } from './routes/connections.js'
 import { oauthRouter } from './routes/oauth.js'
-import { setExtensionBridge, startRelayServer, stopRelayServer, handleExtensionEvent } from './lib/relay-server.js'
+import { ensureChromeExtensionRelayServer, stopChromeExtensionRelayServer } from './browser/extension-relay.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -118,11 +118,13 @@ wss.on('connection', async (ws, req) => {
   pendingCdpCommands.set(userId, new Map())
   console.log(`✅ Extension connected: ${userId} (total: ${extensionConnections.size})`)
 
-  // Start per-user CDP relay server for Playwright connections
-  startRelayServer(userId).then((info) => {
-    console.log(`📡 CDP relay ready for ${userId}: ${info.cdpWsUrl}`)
+  // Start OpenClaw extension relay for this user
+  const relayPort = 18792
+  const cdpUrl = `http://127.0.0.1:${relayPort}`
+  ensureChromeExtensionRelayServer({ cdpUrl }).then((relay) => {
+    console.log(`📡 Extension relay ready: ${relay.cdpWsUrl}`)
   }).catch((err) => {
-    console.error(`Failed to start CDP relay for ${userId}:`, err)
+    console.error(`Failed to start extension relay:`, err)
   })
 
   // Drain any queued tasks for this user
@@ -150,7 +152,7 @@ wss.on('connection', async (ws, req) => {
       }
       if (msg.method === 'forwardCDPEvent') {
         console.log(`CDP event from ${userId}: ${msg.params?.method}`)
-        handleExtensionEvent(userId, msg.params?.method, msg.params?.params)
+        // CDP events forwarded through extension relay automatically
       } else {
         console.log(`Extension message from ${userId}: method=${msg.method} id=${msg.id} hasResult=${msg.result !== undefined} hasError=${msg.error !== undefined}`)
       }
@@ -165,7 +167,6 @@ wss.on('connection', async (ws, req) => {
       extensionConnections.delete(userId)
       pendingCdpCommands.delete(userId)
     }
-    stopRelayServer(userId)
     console.log(`Extension disconnected: ${userId} (total: ${extensionConnections.size})`)
   })
 
@@ -173,11 +174,6 @@ wss.on('connection', async (ws, req) => {
 })
 
 export let cdpCommandId = 1
-setExtensionBridge({
-  getConnection: (userId) => extensionConnections.get(userId),
-  getPending: (userId) => pendingCdpCommands.get(userId),
-  getNextId: () => cdpCommandId++
-})
 export async function sendCdpCommand(
   userId: string,
   method: string,

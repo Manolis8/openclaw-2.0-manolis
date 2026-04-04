@@ -1,5 +1,5 @@
 import OpenAI from 'openai'
-import { sendCdpCommand, sendExtensionMessage, extensionConnections } from '../index.js'
+import { chromium } from 'playwright-core'
 import { isProviderConnected } from './api-caller.js'
 import { createMessage } from './scheduler.js'
 import { supabase } from './supabase.js'
@@ -7,208 +7,135 @@ import * as gmail from './integrations/gmail.js'
 import * as notion from './integrations/notion.js'
 import * as slack from './integrations/slack.js'
 import * as github from './integrations/github.js'
-import { formatAriaSnapshot, type RawAXNode } from '../browser/cdp-snapshot.js'
-import { buildRoleSnapshotFromAriaSnapshot } from '../browser/pw-role-snapshot.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
-const userTabIds = new Map<string, number>()
 
-const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nodeId: string }>>()
+const RELAY_CDP_URL = 'http://127.0.0.1:18792'
 
-async function openAndAttachTab(userId: string, url = 'about:blank'): Promise<number> {
-  const ws = extensionConnections.get(userId)
-  if (!ws || ws.readyState !== 1) {
-    throw new Error('Extension not connected. Make sure the Felo extension is installed and connected.')
-  }
-  console.log(`[agent] sending createAndAttachTab for user ${userId}`)
+const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
+
+async function getPage(targetId?: string) {
+  const browser = await chromium.connectOverCDP(RELAY_CDP_URL)
+  const pages = browser.contexts().flatMap(c => c.pages())
+  if (!pages.length) throw new Error('No pages available. Make sure a tab is open in Chrome.')
+  if (!targetId) return { browser, page: pages[0] }
+  const found = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
+  return { browser, page: found }
+}
+
+async function snapshotPage(tabKey: string, targetId?: string): Promise<string> {
+  const { browser, page } = await getPage(targetId)
   try {
-    const result = await sendExtensionMessage(userId, 'createAndAttachTab', { url }, 20000) as any
-    console.log(`[agent] createAndAttachTab result:`, JSON.stringify(result))
-    const tabId = result?.tabId
-    if (!tabId || typeof tabId !== 'number') {
-      throw new Error(`Extension returned invalid tabId: ${JSON.stringify(result)}`)
+    const url = page.url()
+
+    const ariaSnapshotRaw = await (page.locator(':root') as any).ariaSnapshot()
+    const ariaText = String(ariaSnapshotRaw ?? '')
+
+    const refs: Record<string, { role: string; name?: string; nth?: number }> = {}
+    const INTERACTIVE = new Set([
+      'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
+      'listbox', 'menuitem', 'option', 'searchbox', 'slider', 'switch', 'tab',
+      'menuitemcheckbox', 'menuitemradio', 'treeitem', 'spinbutton'
+    ])
+
+    let counter = 0
+    const lines = ariaText.split('\n')
+    const outLines: string[] = []
+    const roleCounts = new Map<string, number>()
+
+    for (const line of lines) {
+      const match = line.match(/^(\s*)-\s+(\w+)(?:\s+"([^"]*)")?(.*)$/)
+      if (!match) { outLines.push(line); continue }
+      const [, indent, role, name, rest] = match
+      const roleLower = role.toLowerCase()
+
+      if (INTERACTIVE.has(roleLower)) {
+        counter++
+        const ref = `e${counter}`
+        const key = `${roleLower}:${name ?? ''}`
+        const nth = roleCounts.get(key) ?? 0
+        roleCounts.set(key, nth + 1)
+        refs[ref] = { role: roleLower, name: name || undefined, nth: nth > 0 ? nth : undefined }
+        const refTag = nth > 0 ? ` [ref=${ref}] [nth=${nth}]` : ` [ref=${ref}]`
+        outLines.push(`${indent}- ${role}${name ? ` "${name}"` : ''}${refTag}${rest}`)
+      } else {
+        outLines.push(line)
+      }
     }
-    userTabIds.set(userId, tabId)
-    console.log(`[agent] tab ${tabId} ready for user ${userId}`)
-    await new Promise(r => setTimeout(r, 1500))
-    return tabId
-  } catch (err) {
-    console.error(`[agent] createAndAttachTab failed:`, err)
-    throw new Error(`Failed to open browser tab: ${err instanceof Error ? err.message : String(err)}`)
+
+    sessionRefs.set(tabKey, refs)
+    console.log(`[snapshot] url=${url} refs=${Object.keys(refs).length}`)
+    return `URL: ${url}\n${outLines.join('\n') || '(no elements)'}`
+  } finally {
+    await browser.close()
   }
 }
 
-async function closeTab(userId: string): Promise<void> {
-  const tabId = userTabIds.get(userId)
-  userTabIds.delete(userId)
-  if (!tabId) return
+async function navigateTo(url: string, targetId?: string): Promise<void> {
+  const { browser, page } = await getPage(targetId)
   try {
-    await sendExtensionMessage(userId, 'closeTab', { tabId }, 5000)
-  } catch {}
-}
-
-function getTabId(userId: string): number {
-  const tabId = userTabIds.get(userId)
-  if (!tabId) throw new Error(`No tab open for user ${userId}`)
-  return tabId
-}
-
-async function cdp(userId: string, method: string, params: object = {}): Promise<any> {
-  const tabId = getTabId(userId)
-  return sendCdpCommand(userId, method, params, tabId, 15000)
-}
-
-async function navigateTo(userId: string, url: string): Promise<void> {
-  await cdp(userId, 'Page.navigate', { url })
-  await new Promise(r => setTimeout(r, 2500))
-}
-
-async function getPageUrl(userId: string): Promise<string> {
-  try {
-    const result = await cdp(userId, 'Runtime.evaluate', {
-      expression: 'window.location.href',
-      returnByValue: true
-    })
-    return result?.result?.value ?? 'unknown'
-  } catch {
-    return 'unknown'
+    await page.goto(url, { timeout: 30000 })
+    await page.waitForLoadState('domcontentloaded').catch(() => {})
+    await new Promise(r => setTimeout(r, 1000))
+  } finally {
+    await browser.close()
   }
 }
 
-async function snapshotPage(userId: string, tabKey: string): Promise<string> {
-  const [axResult, url] = await Promise.all([
-    cdp(userId, 'Accessibility.getFullAXTree', {}),
-    getPageUrl(userId)
-  ])
-
-  const rawNodes: RawAXNode[] = axResult?.nodes ?? []
-
-  const ariaNodes = formatAriaSnapshot(rawNodes, 500)
-
-  const ariaText = ariaNodes
-    .map(n => {
-      const indent = '  '.repeat(n.depth)
-      let line = `${indent}- ${n.role}`
-      if (n.name) line += ` "${n.name}"`
-      if (n.value) line += `: ${n.value}`
-      return line
-    })
-    .join('\n')
-
-  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(ariaText, { interactive: true })
-
-  sessionRefs.set(tabKey, Object.fromEntries(
-    Object.entries(refs).map(([ref, data]) => [ref, {
-      role: data.role,
-      name: data.name,
-      nodeId: ''
-    }])
-  ))
-
-  const text = snapshot || '(no interactive elements)'
-  return `URL: ${url}\n${text}`
-}
-
-async function clickRef(userId: string, tabKey: string, ref: string): Promise<void> {
+async function clickRef(tabKey: string, ref: string, targetId?: string): Promise<void> {
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const nameSafe = (target.name ?? '').replace(/"/g, '\\"')
-  const targetRole = target.role
-
-  const result = await cdp(userId, 'Runtime.evaluate', {
-    expression: `
-      (() => {
-        let el = document.querySelector('[aria-label="${nameSafe}"]');
-        if (!el) {
-          for (const c of document.querySelectorAll('[role="${targetRole}"]')) {
-            if (c.getAttribute('aria-label') === '${nameSafe}' || c.textContent?.trim() === '${nameSafe}') {
-              el = c; break;
-            }
-          }
-        }
-        if (!el && '${nameSafe}'.toLowerCase() === 'post') {
-          el = document.querySelector('[data-testid="tweetButtonInline"]')
-            || document.querySelector('[data-testid="tweetButton"]');
-        }
-        if (!el) {
-          const tag = '${targetRole}' === 'link' ? 'a' : 'button';
-          for (const c of document.querySelectorAll(tag)) {
-            if (c.textContent?.trim() === '${nameSafe}' || c.getAttribute('aria-label') === '${nameSafe}') {
-              el = c; break;
-            }
-          }
-        }
-        if (!el) el = document.querySelector('[role="${targetRole}"]');
-        if (!el) return 'not_found';
-        el.scrollIntoView({ block: 'center' });
-        ['mousedown','mouseup','click'].forEach(t =>
-          el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true }))
-        );
-        el.click();
-        return el.getAttribute('data-testid') || el.getAttribute('aria-label') || el.tagName;
-      })()
-    `,
-    returnByValue: true
-  }) as any
-
-  if (result?.result?.value === 'not_found') {
-    throw new Error(`Could not find element for ref "${ref}" (${target.role} "${target.name}"). Take a new snapshot.`)
+  const { browser, page } = await getPage(targetId)
+  try {
+    const role = target.role as any
+    const locator = target.name
+      ? page.getByRole(role, { name: target.name, exact: true })
+      : page.getByRole(role)
+    const resolved = target.nth !== undefined ? locator.nth(target.nth) : locator
+    await resolved.click({ timeout: 8000 })
+  } finally {
+    await browser.close()
   }
-  console.log(`[agent] clicked: ${result?.result?.value}`)
-  await new Promise(r => setTimeout(r, 300))
 }
 
-async function typeInRef(userId: string, tabKey: string, ref: string, text: string): Promise<void> {
+async function typeInRef(tabKey: string, ref: string, text: string, targetId?: string): Promise<void> {
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const nameSafe = (target.name ?? '').replace(/"/g, '\\"')
-  const targetRole = target.role
-
-  await cdp(userId, 'Runtime.evaluate', {
-    expression: `
-      (() => {
-        let el = document.querySelector('[aria-label="${nameSafe}"]');
-        if (!el) el = document.querySelector('[role="${targetRole}"]');
-        if (!el) return false;
-        el.focus(); el.click(); return true;
-      })()
-    `,
-    returnByValue: true
-  })
-  await new Promise(r => setTimeout(r, 200))
-
-  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 })
-  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', keyCode: 65, modifiers: 8 })
-  await new Promise(r => setTimeout(r, 100))
-  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', keyCode: 8 })
-  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', keyCode: 8 })
-  await new Promise(r => setTimeout(r, 100))
-
-  await cdp(userId, 'Input.insertText', { text })
-  await new Promise(r => setTimeout(r, 300))
-}
-
-async function pressKey(userId: string, key: string): Promise<void> {
-  const keyMap: Record<string, { code: string; keyCode: number }> = {
-    'Enter':     { code: 'Enter',     keyCode: 13 },
-    'Tab':       { code: 'Tab',       keyCode: 9  },
-    'Escape':    { code: 'Escape',    keyCode: 27 },
-    'ArrowDown': { code: 'ArrowDown', keyCode: 40 },
-    'ArrowUp':   { code: 'ArrowUp',   keyCode: 38 },
+  const { browser, page } = await getPage(targetId)
+  try {
+    const role = target.role as any
+    const locator = target.name
+      ? page.getByRole(role, { name: target.name, exact: true })
+      : page.getByRole(role)
+    const resolved = target.nth !== undefined ? locator.nth(target.nth) : locator
+    await resolved.fill(text, { timeout: 8000 })
+  } finally {
+    await browser.close()
   }
-  const k = keyMap[key] ?? { code: key, keyCode: 0 }
-  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyDown', key, code: k.code, keyCode: k.keyCode })
-  await cdp(userId, 'Input.dispatchKeyEvent', { type: 'keyUp',   key, code: k.code, keyCode: k.keyCode })
 }
 
-async function scrollPage(userId: string, direction: 'up' | 'down', amount = 300): Promise<void> {
-  const delta = direction === 'down' ? amount : -amount
-  await cdp(userId, 'Runtime.evaluate', { expression: `window.scrollBy(0, ${delta})`, returnByValue: true })
+async function pressKey(key: string, targetId?: string): Promise<void> {
+  const { browser, page } = await getPage(targetId)
+  try {
+    await page.keyboard.press(key)
+  } finally {
+    await browser.close()
+  }
+}
+
+async function scrollPage(direction: 'up' | 'down', amount = 300, targetId?: string): Promise<void> {
+  const { browser, page } = await getPage(targetId)
+  try {
+    const delta = direction === 'down' ? amount : -amount
+    await page.evaluate(`window.scrollBy(0, ${delta})`)
+  } finally {
+    await browser.close()
+  }
 }
 
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
@@ -236,7 +163,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome tab.
+const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome tab via Playwright.
 
 HOW YOU WORK:
 - Call browser_snapshot to see the page — it shows interactive elements with refs like e1, e2
@@ -300,42 +227,42 @@ async function runAgentLoop(opts: {
           switch (toolCall.function.name) {
             case 'browser_snapshot': {
               await opts.onProgress('📸 Reading page...')
-              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = await snapshotPage(opts.tabKey)
               break
             }
             case 'browser_navigate': {
               await opts.onProgress(`🌐 Navigating to ${args.url}...`)
-              await navigateTo(opts.userId, args.url)
-              result = await snapshotPage(opts.userId, opts.tabKey)
+              await navigateTo(args.url)
+              result = await snapshotPage(opts.tabKey)
               result = `Navigated. Page:\n${result}`
               break
             }
             case 'browser_click': {
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
-              await clickRef(opts.userId, opts.tabKey, args.ref)
+              await clickRef(opts.tabKey, args.ref)
               await new Promise(r => setTimeout(r, 500))
-              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = await snapshotPage(opts.tabKey)
               result = `Clicked. Page:\n${result}`
               break
             }
             case 'browser_type': {
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
-              await typeInRef(opts.userId, opts.tabKey, args.ref, args.text)
-              if (args.submit) await pressKey(opts.userId, 'Enter')
+              await typeInRef(opts.tabKey, args.ref, args.text)
+              if (args.submit) await pressKey('Enter')
               await new Promise(r => setTimeout(r, 300))
-              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = await snapshotPage(opts.tabKey)
               result = `Typed. Page:\n${result}`
               break
             }
             case 'browser_key': {
               await opts.onProgress(`⌨️ Pressing ${args.key}...`)
-              await pressKey(opts.userId, args.key)
+              await pressKey(args.key)
               await new Promise(r => setTimeout(r, 300))
               result = `Pressed ${args.key}`
               break
             }
             case 'browser_scroll': {
-              await scrollPage(opts.userId, args.direction, args.amount)
+              await scrollPage(args.direction, args.amount)
               result = `Scrolled ${args.direction}`
               break
             }
@@ -464,9 +391,14 @@ export async function runAgentWithExtension(
   let resultSummary = ''
 
   try {
-    await onStep('🔌 Opening browser tab...')
-    await openAndAttachTab(userId, 'about:blank')
-    await onStep('✅ Tab ready. Starting task...')
+    await onStep('🔌 Connecting to browser...')
+
+    const browser = await chromium.connectOverCDP(RELAY_CDP_URL)
+    const pages = browser.contexts().flatMap(c => c.pages())
+    await browser.close()
+    if (!pages.length) throw new Error('No tabs found. Open a tab in Chrome first.')
+
+    await onStep('✅ Connected. Starting task...')
 
     const tabKey = `${userId}:${Date.now()}`
     const result = await runAgentLoop({
@@ -493,7 +425,6 @@ export async function runAgentWithExtension(
 
   } finally {
     runningTasks.delete(taskKey)
-    await closeTab(userId)
     try {
       await supabase.from('task_executions').insert({
         user_id: userId, task_id: taskId || null, task_prompt: task, plan: [],

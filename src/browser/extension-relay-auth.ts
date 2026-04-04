@@ -1,8 +1,4 @@
 import { createHmac } from "node:crypto";
-import { loadConfig } from "../config/config.js";
-import { normalizeSecretInputString, resolveSecretInputRef } from "../config/types.secrets.js";
-import { secretRefKey } from "../secrets/ref-contract.js";
-import { resolveSecretRefValues } from "../secrets/resolve.js";
 
 const RELAY_TOKEN_CONTEXT = "openclaw-extension-relay-v1";
 const DEFAULT_RELAY_PROBE_TIMEOUT_MS = 500;
@@ -21,46 +17,7 @@ function trimToUndefined(value: unknown): string | undefined {
 }
 
 async function resolveGatewayAuthToken(): Promise<string | null> {
-  const envToken =
-    process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || process.env.CLAWDBOT_GATEWAY_TOKEN?.trim();
-  if (envToken) {
-    return envToken;
-  }
-  try {
-    const cfg = loadConfig();
-    const tokenRef = resolveSecretInputRef({
-      value: cfg.gateway?.auth?.token,
-      defaults: cfg.secrets?.defaults,
-    }).ref;
-    if (tokenRef) {
-      const refLabel = `${tokenRef.source}:${tokenRef.provider}:${tokenRef.id}`;
-      try {
-        const resolved = await resolveSecretRefValues([tokenRef], {
-          config: cfg,
-          env: process.env,
-        });
-        const resolvedToken = trimToUndefined(resolved.get(secretRefKey(tokenRef)));
-        if (resolvedToken) {
-          return resolvedToken;
-        }
-      } catch {
-        // handled below
-      }
-      throw new SecretRefUnavailableError(
-        `extension relay requires a resolved gateway token, but gateway.auth.token SecretRef is unavailable (${refLabel}). Set OPENCLAW_GATEWAY_TOKEN or resolve your secret provider.`,
-      );
-    }
-    const configToken = normalizeSecretInputString(cfg.gateway?.auth?.token);
-    if (configToken) {
-      return configToken;
-    }
-  } catch (err) {
-    if (err instanceof SecretRefUnavailableError) {
-      throw err;
-    }
-    // ignore config read failures; caller can fallback to per-process random token
-  }
-  return null;
+  return process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || null
 }
 
 function deriveRelayAuthToken(gatewayToken: string, port: number): string {

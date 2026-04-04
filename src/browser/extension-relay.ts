@@ -3,13 +3,20 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
-import { isLoopbackAddress, isLoopbackHost } from "../gateway/net.js";
-import { rawDataToString } from "../infra/ws.js";
 import {
   probeAuthenticatedOpenClawRelay,
   resolveRelayAcceptedTokensForPort,
   resolveRelayAuthTokenForPort,
 } from "./extension-relay-auth.js";
+
+function isLoopbackHost(host: string): boolean {
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1'
+}
+
+function isLoopbackAddress(addr: string | undefined): boolean {
+  if (!addr) return true
+  return isLoopbackAddress(addr) || addr.startsWith('::ffff:127.')
+}
 
 type CdpCommand = {
   id: number;
@@ -753,7 +760,7 @@ export async function ensureChromeExtensionRelayServer(opts: {
         }
         let parsed: ExtensionMessage | null = null;
         try {
-          parsed = JSON.parse(rawDataToString(data)) as ExtensionMessage;
+          parsed = JSON.parse(typeof data === 'string' ? data : Buffer.isBuffer(data) ? data.toString('utf8') : '') as ExtensionMessage;
         } catch {
           return;
         }
@@ -887,7 +894,7 @@ export async function ensureChromeExtensionRelayServer(opts: {
       ws.on("message", async (data) => {
         let cmd: CdpCommand | null = null;
         try {
-          cmd = JSON.parse(rawDataToString(data)) as CdpCommand;
+          cmd = JSON.parse(typeof data === 'string' ? data : Buffer.isBuffer(data) ? data.toString('utf8') : '') as CdpCommand;
         } catch {
           return;
         }
