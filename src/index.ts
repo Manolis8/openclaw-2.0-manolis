@@ -5,7 +5,6 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { createClient } from '@supabase/supabase-js'
 import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
-import { connectionsRouter } from './routes/connections.js'
 import { oauthRouter } from './routes/oauth.js'
 import { ensureChromeExtensionRelayServer, stopChromeExtensionRelayServer } from './browser/extension-relay.js'
 
@@ -65,7 +64,6 @@ app.get('/api/extension-status/:userId', (req, res) => {
 
 app.use('/api', tasksRouter)
 app.use('/api', messagesRouter)
-app.use('/api', connectionsRouter)
 app.use('/api', oauthRouter)
 
 const server = createServer(app)
