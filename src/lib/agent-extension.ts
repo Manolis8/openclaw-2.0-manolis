@@ -398,45 +398,29 @@ export async function runAgentWithExtension(
   const stepsLog: StepLog[] = []
   let status: 'success' | 'error' = 'success'
   let resultSummary = ''
+  let newTabId: number | null = null
 
   try {
     await onStep('🔌 Connecting to browser...')
 
     const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
 
-    const relayRes = await fetch(`${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`, {
+    const relayRes = await fetch(`${RELAY_BASE}/json/version`, {
       headers: { 'x-openclaw-relay-token': token }
     }).catch(() => null)
+    if (!relayRes?.ok) throw new Error('Extension not connected. Make sure the Felo extension badge is ON.')
 
-    if (!relayRes?.ok) throw new Error('Extension not connected. Make sure the Felo extension is installed and the badge is ON.')
+    await onStep('🌐 Opening new tab...')
 
-    const relayJson = await relayRes.json() as any
+    const { sendExtensionMessage } = await import('../index.js')
+    const tabResult = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 60000) as any
+    newTabId = tabResult?.tabId
+    if (!newTabId) throw new Error('Extension did not return a tab.')
+    console.log(`[agent] tab ${newTabId} opened and attached`)
 
-    if (!relayJson.webSocketDebuggerUrl) {
-      await onStep('🌐 Opening new tab...')
-      const { sendExtensionMessage } = await import('../index.js')
-      sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 30000).catch(() => {})
-      
-      let wsUrl: string | null = null
-      for (let i = 0; i < 60; i++) {
-        await new Promise(r => setTimeout(r, 500))
-        try {
-          const check = await fetch(`${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`, {
-            headers: { 'x-openclaw-relay-token': token }
-          })
-          const checkJson = await check.json() as any
-          if (checkJson.webSocketDebuggerUrl) {
-            wsUrl = checkJson.webSocketDebuggerUrl
-            break
-          }
-        } catch {}
-      }
-      
-      if (!wsUrl) throw new Error('Failed to open tab. Please click the extension badge on a Chrome tab manually.')
-      await onStep('✅ Tab ready. Starting task...')
-    } else {
-      await onStep('✅ Connected. Starting task...')
-    }
+    await new Promise(r => setTimeout(r, 3000))
+
+    await onStep('✅ Tab ready. Starting task...')
 
     const tabKey = `${userId}:${Date.now()}`
     const result = await runAgentLoop({
