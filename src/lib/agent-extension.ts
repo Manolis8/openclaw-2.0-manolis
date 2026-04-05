@@ -11,30 +11,42 @@ import * as github from './integrations/github.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
-const RELAY_BASE = 'http://127.0.0.1:18792'
+async function deriveRelayToken(gatewayToken: string, port: number): Promise<string> {
+  const enc = new TextEncoder()
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(gatewayToken),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`openclaw-extension-relay-v1:${port}`))
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
 
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
 
-async function getPage(targetId?: string) {
+async function getPage() {
   const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
-  const cdpUrl = `${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`
-  
-  const res = await fetch(cdpUrl, {
-    headers: { 'x-openclaw-relay-token': token }
+  const relayPort = 18792
+
+  const relayToken = await deriveRelayToken(token, relayPort)
+  const res = await fetch(`http://127.0.0.1:${relayPort}/json/version`, {
+    headers: { 'x-openclaw-relay-token': relayToken }
   })
   const json = await res.json() as any
   const wsUrl = json.webSocketDebuggerUrl
-  if (!wsUrl) throw new Error('No WebSocket URL from relay. Is a tab attached?')
-  
+  if (!wsUrl) throw new Error('No tab attached.')
+
   const browser = await chromium.connectOverCDP(wsUrl)
   const pages = browser.contexts().flatMap(c => c.pages())
-  if (!pages.length) throw new Error('No pages available. Make sure a tab is open in Chrome.')
-  const found = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
-  return { browser, page: found }
+  const page = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
+  if (!page) throw new Error('No pages found.')
+  return { browser, page }
 }
 
-async function snapshotPage(tabKey: string, targetId?: string): Promise<string> {
-  const { browser, page } = await getPage(targetId)
+async function snapshotPage(tabKey: string): Promise<string> {
+  const { browser, page } = await getPage()
   try {
     const url = page.url()
 
@@ -81,8 +93,8 @@ async function snapshotPage(tabKey: string, targetId?: string): Promise<string> 
   }
 }
 
-async function navigateTo(url: string, targetId?: string): Promise<void> {
-  const { browser, page } = await getPage(targetId)
+async function navigateTo(url: string): Promise<void> {
+  const { browser, page } = await getPage()
   try {
     await page.goto(url, { timeout: 30000 })
     await page.waitForLoadState('domcontentloaded').catch(() => {})
@@ -92,12 +104,12 @@ async function navigateTo(url: string, targetId?: string): Promise<void> {
   }
 }
 
-async function clickRef(tabKey: string, ref: string, targetId?: string): Promise<void> {
+async function clickRef(tabKey: string, ref: string): Promise<void> {
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const { browser, page } = await getPage(targetId)
+  const { browser, page } = await getPage()
   try {
     const role = target.role as any
     const locator = target.name
@@ -110,12 +122,12 @@ async function clickRef(tabKey: string, ref: string, targetId?: string): Promise
   }
 }
 
-async function typeInRef(tabKey: string, ref: string, text: string, targetId?: string): Promise<void> {
+async function typeInRef(tabKey: string, ref: string, text: string): Promise<void> {
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const { browser, page } = await getPage(targetId)
+  const { browser, page } = await getPage()
   try {
     const role = target.role as any
     const locator = target.name
@@ -128,8 +140,8 @@ async function typeInRef(tabKey: string, ref: string, text: string, targetId?: s
   }
 }
 
-async function pressKey(key: string, targetId?: string): Promise<void> {
-  const { browser, page } = await getPage(targetId)
+async function pressKey(key: string): Promise<void> {
+  const { browser, page } = await getPage()
   try {
     await page.keyboard.press(key)
   } finally {
@@ -137,8 +149,8 @@ async function pressKey(key: string, targetId?: string): Promise<void> {
   }
 }
 
-async function scrollPage(direction: 'up' | 'down', amount = 300, targetId?: string): Promise<void> {
-  const { browser, page } = await getPage(targetId)
+async function scrollPage(direction: 'up' | 'down', amount = 300): Promise<void> {
+  const { browser, page } = await getPage()
   try {
     const delta = direction === 'down' ? amount : -amount
     await page.evaluate(`window.scrollBy(0, ${delta})`)
@@ -398,29 +410,25 @@ export async function runAgentWithExtension(
   const stepsLog: StepLog[] = []
   let status: 'success' | 'error' = 'success'
   let resultSummary = ''
-  let newTabId: number | null = null
 
   try {
     await onStep('🔌 Connecting to browser...')
 
     const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+    const relayPort = 18792
+    const relayToken = await deriveRelayToken(token, relayPort)
+    const relayUrl = `http://127.0.0.1:${relayPort}`
 
-    const relayRes = await fetch(`${RELAY_BASE}/json/version`, {
-      headers: { 'x-openclaw-relay-token': token }
+    const relayRes = await fetch(`${relayUrl}/json/version`, {
+      headers: { 'x-openclaw-relay-token': relayToken }
     }).catch(() => null)
-    if (!relayRes?.ok) throw new Error('Extension not connected. Make sure the Felo extension badge is ON.')
 
-    await onStep('🌐 Opening new tab...')
+    if (!relayRes?.ok) throw new Error('Extension not connected. Click the extension badge on a Chrome tab first.')
 
-    const { sendExtensionMessage } = await import('../index.js')
-    const tabResult = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 60000) as any
-    newTabId = tabResult?.tabId
-    if (!newTabId) throw new Error('Extension did not return a tab.')
-    console.log(`[agent] tab ${newTabId} opened and attached`)
+    const relayJson = await relayRes.json() as any
+    if (!relayJson.webSocketDebuggerUrl) throw new Error('No tab attached. Click the extension badge ON on a Chrome tab first, then run the task.')
 
-    await new Promise(r => setTimeout(r, 3000))
-
-    await onStep('✅ Tab ready. Starting task...')
+    await onStep('✅ Connected. Starting task...')
 
     const tabKey = `${userId}:${Date.now()}`
     const result = await runAgentLoop({
