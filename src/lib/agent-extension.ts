@@ -406,12 +406,37 @@ export async function runAgentWithExtension(
 
     const relayRes = await fetch(`${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`, {
       headers: { 'x-openclaw-relay-token': token }
-    })
-    if (!relayRes.ok) throw new Error('Extension relay not reachable. Make sure the Felo extension is connected.')
-    const relayJson = await relayRes.json() as any
-    if (!relayJson.webSocketDebuggerUrl) throw new Error('No tab attached. Click the extension badge on a Chrome tab first.')
+    }).catch(() => null)
 
-    await onStep('✅ Connected. Starting task...')
+    if (!relayRes?.ok) throw new Error('Extension not connected. Make sure the Felo extension is installed and the badge is ON.')
+
+    const relayJson = await relayRes.json() as any
+
+    if (!relayJson.webSocketDebuggerUrl) {
+      await onStep('🌐 Opening new tab...')
+      const { sendExtensionMessage } = await import('../index.js')
+      sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 30000).catch(() => {})
+      
+      let wsUrl: string | null = null
+      for (let i = 0; i < 15; i++) {
+        await new Promise(r => setTimeout(r, 1000))
+        try {
+          const check = await fetch(`${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`, {
+            headers: { 'x-openclaw-relay-token': token }
+          })
+          const checkJson = await check.json() as any
+          if (checkJson.webSocketDebuggerUrl) {
+            wsUrl = checkJson.webSocketDebuggerUrl
+            break
+          }
+        } catch {}
+      }
+      
+      if (!wsUrl) throw new Error('Failed to open tab. Please click the extension badge on a Chrome tab manually.')
+      await onStep('✅ Tab ready. Starting task...')
+    } else {
+      await onStep('✅ Connected. Starting task...')
+    }
 
     const tabKey = `${userId}:${Date.now()}`
     const result = await runAgentLoop({
