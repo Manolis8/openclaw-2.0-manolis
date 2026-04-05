@@ -418,8 +418,8 @@ export async function runAgentWithExtension(
       sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 30000).catch(() => {})
       
       let wsUrl: string | null = null
-      for (let i = 0; i < 15; i++) {
-        await new Promise(r => setTimeout(r, 1000))
+      for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 500))
         try {
           const check = await fetch(`${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`, {
             headers: { 'x-openclaw-relay-token': token }
