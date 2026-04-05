@@ -398,23 +398,28 @@ export async function runAgentWithExtension(
   const stepsLog: StepLog[] = []
   let status: 'success' | 'error' = 'success'
   let resultSummary = ''
+  let newTabId: number | null = null
 
   try {
     await onStep('🔌 Connecting to browser...')
 
     const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
-    const res = await fetch(`${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`, {
+
+    const relayRes = await fetch(`${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`, {
       headers: { 'x-openclaw-relay-token': token }
     })
-    if (!res.ok) throw new Error('Extension relay not reachable. Make sure extension is connected.')
-    const json = await res.json() as any
-    if (!json.webSocketDebuggerUrl) throw new Error('No tab attached. Click the extension badge on a Chrome tab first.')
-    const browser = await chromium.connectOverCDP(json.webSocketDebuggerUrl)
-    const pages = browser.contexts().flatMap(c => c.pages())
-    await browser.close()
-    if (!pages.length) throw new Error('No tabs found.')
+    if (!relayRes.ok) throw new Error('Extension relay not reachable. Make sure the Felo extension is connected.')
 
-    await onStep('✅ Connected. Starting task...')
+    await onStep('🌐 Opening new tab...')
+    const { sendExtensionMessage } = await import('../index.js')
+    const tabResult = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 20000) as any
+    newTabId = tabResult?.tabId
+    if (!newTabId) throw new Error('Failed to open new tab via extension.')
+    console.log(`[agent] opened tab ${newTabId}`)
+
+    await new Promise(r => setTimeout(r, 2000))
+
+    await onStep('✅ Tab ready. Starting task...')
 
     const tabKey = `${userId}:${Date.now()}`
     const result = await runAgentLoop({
@@ -441,6 +446,16 @@ export async function runAgentWithExtension(
 
   } finally {
     runningTasks.delete(taskKey)
+
+    if (newTabId) {
+      await new Promise(r => setTimeout(r, 3000))
+      try {
+        const { sendExtensionMessage: sendMsg } = await import('../index.js')
+        await sendMsg(userId, 'closeTab', { tabId: newTabId }, 5000)
+        console.log(`[agent] closed tab ${newTabId}`)
+      } catch {}
+    }
+
     try {
       await supabase.from('task_executions').insert({
         user_id: userId, task_id: taskId || null, task_prompt: task, plan: [],
