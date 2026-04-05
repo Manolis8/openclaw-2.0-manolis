@@ -11,20 +11,24 @@ import * as github from './integrations/github.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
-const RELAY_CDP_URL = 'http://127.0.0.1:18792'
-const RELAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+const RELAY_BASE = 'http://127.0.0.1:18792'
 
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
 
 async function getPage(targetId?: string) {
-  const browser = await chromium.connectOverCDP(RELAY_CDP_URL, {
-    headers: {
-      'x-openclaw-relay-token': RELAY_TOKEN
-    }
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+  const cdpUrl = `${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`
+  
+  const res = await fetch(cdpUrl, {
+    headers: { 'x-openclaw-relay-token': token }
   })
+  const json = await res.json() as any
+  const wsUrl = json.webSocketDebuggerUrl
+  if (!wsUrl) throw new Error('No WebSocket URL from relay. Is a tab attached?')
+  
+  const browser = await chromium.connectOverCDP(wsUrl)
   const pages = browser.contexts().flatMap(c => c.pages())
   if (!pages.length) throw new Error('No pages available. Make sure a tab is open in Chrome.')
-  if (!targetId) return { browser, page: pages[0] }
   const found = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
   return { browser, page: found }
 }
@@ -398,10 +402,17 @@ export async function runAgentWithExtension(
   try {
     await onStep('🔌 Connecting to browser...')
 
-    const browser = await chromium.connectOverCDP(RELAY_CDP_URL)
+    const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+    const res = await fetch(`${RELAY_BASE}/json/version?token=${encodeURIComponent(token)}`, {
+      headers: { 'x-openclaw-relay-token': token }
+    })
+    if (!res.ok) throw new Error('Extension relay not reachable. Make sure extension is connected.')
+    const json = await res.json() as any
+    if (!json.webSocketDebuggerUrl) throw new Error('No tab attached. Click the extension badge on a Chrome tab first.')
+    const browser = await chromium.connectOverCDP(json.webSocketDebuggerUrl)
     const pages = browser.contexts().flatMap(c => c.pages())
     await browser.close()
-    if (!pages.length) throw new Error('No tabs found. Open a tab in Chrome first.')
+    if (!pages.length) throw new Error('No tabs found.')
 
     await onStep('✅ Connected. Starting task...')
 
