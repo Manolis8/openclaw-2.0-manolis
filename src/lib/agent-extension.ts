@@ -12,11 +12,16 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
 const RELAY_CDP_URL = 'http://127.0.0.1:18792'
+const RELAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || ''
 
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
 
 async function getPage(targetId?: string) {
-  const browser = await chromium.connectOverCDP(RELAY_CDP_URL)
+  const browser = await chromium.connectOverCDP(RELAY_CDP_URL, {
+    headers: {
+      'x-openclaw-relay-token': RELAY_TOKEN
+    }
+  })
   const pages = browser.contexts().flatMap(c => c.pages())
   if (!pages.length) throw new Error('No pages available. Make sure a tab is open in Chrome.')
   if (!targetId) return { browser, page: pages[0] }
