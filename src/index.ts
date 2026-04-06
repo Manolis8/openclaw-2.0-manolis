@@ -3,18 +3,26 @@ import express from 'express'
 import { createServer } from 'http'
 import { WebSocketServer, WebSocket } from 'ws'
 import { createClient } from '@supabase/supabase-js'
+import { createHmac } from 'node:crypto'
 import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { oauthRouter } from './routes/oauth.js'
-import { ensureChromeExtensionRelayServer, stopChromeExtensionRelayServer } from './browser/extension-relay.js'
+import { ensureChromeExtensionRelayServer } from './browser/extension-relay.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
+const RELAY_PORT = 18792
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_KEY!
 )
+
+function deriveRelayToken(gatewayToken: string, port: number): string {
+  return createHmac('sha256', gatewayToken)
+    .update(`openclaw-extension-relay-v1:${port}`)
+    .digest('hex')
+}
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*')
@@ -35,7 +43,6 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date() })
 })
 
-// Generate a permanent API key for a user
 app.post('/api/generate-key', async (req, res) => {
   const { userId } = req.body
   if (!userId) return res.status(400).json({ error: 'Missing userId' })
@@ -47,7 +54,6 @@ app.post('/api/generate-key', async (req, res) => {
   res.json({ key })
 })
 
-// Get existing API key for a user
 app.get('/api/get-key/:userId', async (req, res) => {
   const { data } = await supabase
     .from('api_keys')
@@ -57,7 +63,6 @@ app.get('/api/get-key/:userId', async (req, res) => {
   res.json({ key: data?.key || null })
 })
 
-// Extension connection status
 app.get('/api/extension-status/:userId', (req, res) => {
   res.json({ connected: isExtensionConnected(req.params.userId) })
 })
@@ -71,6 +76,8 @@ const wss = new WebSocketServer({ noServer: true })
 
 export const extensionConnections = new Map<string, WebSocket>()
 export const pendingCdpCommands = new Map<string, Map<number, { resolve: (v: any) => void, reject: (e: Error) => void }>>()
+
+const relayBridges = new Map<string, WebSocket>()
 
 server.on('upgrade', (request, socket, head) => {
   console.log('🔌 WebSocket upgrade:', request.url?.slice(0, 80))
@@ -92,13 +99,12 @@ wss.on('connection', async (ws, req) => {
 
   let userId: string
   try {
-    console.log('Looking up API key:', token.slice(0, 15) + '...')
     const { data, error } = await supabase
       .from('api_keys')
       .select('user_id')
       .eq('key', token)
       .single()
-    if (error || !data) throw new Error('Key not found: ' + error?.message)
+    if (error || !data) throw new Error('Key not found')
     userId = data.user_id
     console.log(`✅ API key valid for user: ${userId}`)
   } catch (err) {
@@ -116,16 +122,40 @@ wss.on('connection', async (ws, req) => {
   pendingCdpCommands.set(userId, new Map())
   console.log(`✅ Extension connected: ${userId} (total: ${extensionConnections.size})`)
 
-  // Start OpenClaw extension relay for this user
-  const relayPort = 18792
-  const cdpUrl = `http://127.0.0.1:${relayPort}`
-  ensureChromeExtensionRelayServer({ cdpUrl }).then((relay) => {
+  const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+  const relayToken = deriveRelayToken(gatewayToken, RELAY_PORT)
+
+  try {
+    const relay = await ensureChromeExtensionRelayServer({ cdpUrl: `http://127.0.0.1:${RELAY_PORT}` })
     console.log(`📡 Extension relay ready: ${relay.cdpWsUrl}`)
-  }).catch((err) => {
+  } catch (err) {
     console.error(`Failed to start extension relay:`, err)
+  }
+
+  const relayExtUrl = `ws://127.0.0.1:${RELAY_PORT}/extension?token=${encodeURIComponent(relayToken)}`
+  const relayWs = new WebSocket(relayExtUrl)
+  relayBridges.set(userId, relayWs)
+
+  relayWs.on('open', () => {
+    console.log(`🌉 Relay bridge open for ${userId}`)
   })
 
-  // Drain any queued tasks for this user
+  relayWs.on('error', (err) => {
+    console.error(`Relay bridge error for ${userId}:`, err.message)
+  })
+
+  relayWs.on('close', () => {
+    console.log(`Relay bridge closed for ${userId}`)
+    relayBridges.delete(userId)
+  })
+
+  relayWs.on('message', (data) => {
+    const text = data instanceof Buffer ? data.toString() : String(data)
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(text)
+    }
+  })
+
   drainQueueForUser(userId)
 
   ws.send(JSON.stringify({ method: 'connected', params: { userId } }))
@@ -135,9 +165,12 @@ wss.on('connection', async (ws, req) => {
   }, 25000)
 
   ws.on('message', (data) => {
+    const text = data instanceof Buffer ? data.toString() : String(data)
     try {
-      const msg = JSON.parse(String(data))
+      const msg = JSON.parse(text)
+
       if (msg.method === 'pong') return
+
       if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
         const userPending = pendingCdpCommands.get(userId)
         const pending = userPending?.get(msg.id)
@@ -145,14 +178,16 @@ wss.on('connection', async (ws, req) => {
           userPending!.delete(msg.id)
           if (msg.error) pending.reject(new Error(String(msg.error)))
           else pending.resolve(msg.result)
+          return
         }
-        return
       }
+
+      if (relayWs.readyState === WebSocket.OPEN) {
+        relayWs.send(text)
+      }
+
       if (msg.method === 'forwardCDPEvent') {
         console.log(`CDP event from ${userId}: ${msg.params?.method}`)
-        // CDP events forwarded through extension relay automatically
-      } else {
-        console.log(`Extension message from ${userId}: method=${msg.method} id=${msg.id} hasResult=${msg.result !== undefined} hasError=${msg.error !== undefined}`)
       }
     } catch (err) {
       console.error('Extension message error:', err)
@@ -165,6 +200,11 @@ wss.on('connection', async (ws, req) => {
       extensionConnections.delete(userId)
       pendingCdpCommands.delete(userId)
     }
+    const bridge = relayBridges.get(userId)
+    if (bridge) {
+      bridge.close()
+      relayBridges.delete(userId)
+    }
     console.log(`Extension disconnected: ${userId} (total: ${extensionConnections.size})`)
   })
 
@@ -172,6 +212,7 @@ wss.on('connection', async (ws, req) => {
 })
 
 export let cdpCommandId = 1
+
 export async function sendCdpCommand(
   userId: string,
   method: string,
@@ -193,11 +234,7 @@ export async function sendCdpCommand(
       resolve: (v) => { clearTimeout(timer); resolve(v) },
       reject: (e) => { clearTimeout(timer); reject(e) }
     })
-    ws.send(JSON.stringify({
-      id,
-      method: 'forwardCDPCommand',
-      params: { method, params, tabId }
-    }))
+    ws.send(JSON.stringify({ id, method: 'forwardCDPCommand', params: { method, params, tabId } }))
   })
 }
 
@@ -208,9 +245,7 @@ export async function sendExtensionMessage(
   timeoutMs = 10000
 ): Promise<any> {
   const ws = extensionConnections.get(userId)
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    throw new Error('Extension not connected for this user')
-  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('Extension not connected for this user')
   const id = cdpCommandId++
   const userPending = pendingCdpCommands.get(userId) || new Map()
   pendingCdpCommands.set(userId, userPending)
@@ -247,10 +282,7 @@ async function drainQueueForUser(userId: string) {
 
   const { runTaskInBackground } = await import('./routes/tasks.js')
   for (const task of queuedTasks) {
-    await supabase
-      .from('tasks')
-      .update({ status: 'running' })
-      .eq('id', task.id)
+    await supabase.from('tasks').update({ status: 'running' }).eq('id', task.id)
     runTaskInBackground(task.id, task.prompt, userId)
   }
 }
@@ -258,8 +290,6 @@ async function drainQueueForUser(userId: string) {
 server.listen(PORT, async () => {
   console.log(`✅ Felo backend running on port ${PORT}`)
   console.log(`✅ Supabase URL: ${process.env.SUPABASE_URL}`)
-
-  // Load all recurring scheduled tasks on startup
   const { loadScheduledTasks } = await import('./lib/scheduler.js')
   const { runTaskInBackground } = await import('./routes/tasks.js')
   await loadScheduledTasks(runTaskInBackground)
