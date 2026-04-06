@@ -12,10 +12,9 @@ import {
 function isLoopbackHost(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1'
 }
-
 function isLoopbackAddress(addr: string | undefined): boolean {
   if (!addr) return true
-  return isLoopbackAddress(addr) || addr.startsWith('::ffff:127.')
+  return addr === '127.0.0.1' || addr === '::1' || addr === 'localhost' || addr.startsWith('::ffff:127.')
 }
 
 type CdpCommand = {
