@@ -11,10 +11,29 @@ import * as github from './integrations/github.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
+async function deriveRelayToken(gatewayToken: string, port: number): Promise<string> {
+  const enc = new TextEncoder()
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(gatewayToken),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`openclaw-extension-relay-v1:${port}`))
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
 
 async function getPage() {
-  const browser = await chromium.connectOverCDP('ws://127.0.0.1:18792/cdp')
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+  const relayToken = await deriveRelayToken(token, 18792)
+  const browser = await chromium.connectOverCDP('ws://127.0.0.1:18792/cdp', {
+    headers: {
+      'x-openclaw-relay-token': relayToken
+    }
+  })
   const pages = browser.contexts().flatMap(c => c.pages())
   if (!pages.length) throw new Error('No pages found in browser.')
   const page = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
