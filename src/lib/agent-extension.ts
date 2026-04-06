@@ -11,37 +11,13 @@ import * as github from './integrations/github.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
-async function deriveRelayToken(gatewayToken: string, port: number): Promise<string> {
-  const enc = new TextEncoder()
-  const key = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(gatewayToken),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  )
-  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`openclaw-extension-relay-v1:${port}`))
-  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('')
-}
-
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
 
 async function getPage() {
-  const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
-  const relayPort = 18792
-
-  const relayToken = await deriveRelayToken(token, relayPort)
-  const res = await fetch(`http://127.0.0.1:${relayPort}/json/version`, {
-    headers: { 'x-openclaw-relay-token': relayToken }
-  })
-  const json = await res.json() as any
-  const wsUrl = json.webSocketDebuggerUrl
-  if (!wsUrl) throw new Error('No tab attached.')
-
-  const browser = await chromium.connectOverCDP(wsUrl)
+  const browser = await chromium.connectOverCDP('ws://127.0.0.1:18792/cdp')
   const pages = browser.contexts().flatMap(c => c.pages())
+  if (!pages.length) throw new Error('No pages found in browser.')
   const page = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
-  if (!page) throw new Error('No pages found.')
   return { browser, page }
 }
 
@@ -410,25 +386,29 @@ export async function runAgentWithExtension(
   const stepsLog: StepLog[] = []
   let status: 'success' | 'error' = 'success'
   let resultSummary = ''
+  let newTabId: number | null = null
 
   try {
     await onStep('🔌 Connecting to browser...')
 
-    const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
-    const relayPort = 18792
-    const relayToken = await deriveRelayToken(token, relayPort)
-    const relayUrl = `http://127.0.0.1:${relayPort}`
+    const { sendExtensionMessage } = await import('../index.js')
 
-    const relayRes = await fetch(`${relayUrl}/json/version`, {
-      headers: { 'x-openclaw-relay-token': relayToken }
-    }).catch(() => null)
+    await onStep('🌐 Opening new browser tab...')
+    console.log(`[agent] sending createAndAttachTab for ${userId}`)
 
-    if (!relayRes?.ok) throw new Error('Extension not connected. Click the extension badge on a Chrome tab first.')
+    const tabResult = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 60000) as any
+    console.log(`[agent] createAndAttachTab result:`, JSON.stringify(tabResult))
 
-    const relayJson = await relayRes.json() as any
-    if (!relayJson.webSocketDebuggerUrl) throw new Error('No tab attached. Click the extension badge ON on a Chrome tab first, then run the task.')
+    newTabId = tabResult?.tabId ?? null
+    if (!newTabId) throw new Error('Extension did not return a tab ID.')
 
-    await onStep('✅ Connected. Starting task...')
+    console.log(`[agent] tab ${newTabId} ready, waiting for relay...`)
+    await new Promise(r => setTimeout(r, 2000))
+
+    const wsUrl = 'ws://127.0.0.1:18792/cdp'
+    console.log(`[agent] connecting Playwright to ${wsUrl}`)
+
+    await onStep('✅ Tab ready. Starting task...')
 
     const tabKey = `${userId}:${Date.now()}`
     const result = await runAgentLoop({
@@ -456,12 +436,16 @@ export async function runAgentWithExtension(
   } finally {
     runningTasks.delete(taskKey)
 
-    await new Promise(r => setTimeout(r, 3000))
-    try {
-      const { browser, page } = await getPage()
-      await page.goto('about:blank')
-      await browser.close()
-    } catch {}
+    if (newTabId) {
+      await new Promise(r => setTimeout(r, 3000))
+      try {
+        const { sendExtensionMessage: closeMsg } = await import('../index.js')
+        await closeMsg(userId, 'closeTab', { tabId: newTabId }, 5000)
+        console.log(`[agent] closed tab ${newTabId}`)
+      } catch (err) {
+        console.error('[agent] closeTab error:', err)
+      }
+    }
 
     try {
       await supabase.from('task_executions').insert({
