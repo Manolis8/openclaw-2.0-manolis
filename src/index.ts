@@ -187,6 +187,7 @@ wss.on('connection', async (ws, req) => {
 
       if (msg.method === 'pong') return
 
+      // Handle CDP responses for pending commands
       if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
         const userPending = pendingCdpCommands.get(userId)
         const pending = userPending?.get(msg.id)
@@ -198,15 +199,13 @@ wss.on('connection', async (ws, req) => {
         }
       }
 
+      // Forward everything else to relay bridge once
       if (relayWs.readyState === WebSocket.OPEN) {
         relayWs.send(text)
       }
 
       if (msg.method === 'forwardCDPEvent') {
         console.log(`CDP event from ${userId}: ${msg.params?.method}`)
-        if (relayWs.readyState === WebSocket.OPEN) {
-          relayWs.send(text)
-        }
       }
     } catch (err) {
       console.error('Extension message error:', err)
