@@ -132,6 +132,14 @@ wss.on('connection', async (ws, req) => {
     console.error(`Failed to start extension relay:`, err)
   }
 
+  // Close existing relay bridge for this user if one exists
+  const existingBridge = relayBridges.get(userId)
+  if (existingBridge) {
+    existingBridge.close()
+    relayBridges.delete(userId)
+    await new Promise(r => setTimeout(r, 500))
+  }
+
   const relayExtUrl = `ws://127.0.0.1:${RELAY_PORT}/extension?token=${encodeURIComponent(relayToken)}`
   const relayWs = new WebSocket(relayExtUrl)
   relayBridges.set(userId, relayWs)
