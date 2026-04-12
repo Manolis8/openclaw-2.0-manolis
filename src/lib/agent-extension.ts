@@ -7,6 +7,7 @@ import * as gmail from './integrations/gmail.js'
 import * as notion from './integrations/notion.js'
 import * as slack from './integrations/slack.js'
 import * as github from './integrations/github.js'
+import { getRelayPortForUser } from '../index.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
@@ -26,10 +27,11 @@ async function deriveRelayToken(gatewayToken: string, port: number): Promise<str
 
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
 
-async function getPage() {
+async function getPage(userId: string) {
+  const port = getRelayPortForUser(userId)
   const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
-  const relayToken = await deriveRelayToken(token, 18792)
-  const browser = await chromium.connectOverCDP('ws://127.0.0.1:18792/cdp', {
+  const relayToken = await deriveRelayToken(token, port)
+  const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${port}/cdp`, {
     headers: {
       'x-openclaw-relay-token': relayToken
     }
@@ -40,8 +42,13 @@ async function getPage() {
   return { browser, page }
 }
 
+async function getUserIdFromTabKey(tabKey: string): string {
+  return tabKey.split(':')[0]
+}
+
 async function snapshotPage(tabKey: string): Promise<string> {
-  const { browser, page } = await getPage()
+  const userId = await getUserIdFromTabKey(tabKey)
+  const { browser, page } = await getPage(userId)
   try {
     const url = page.url()
 
@@ -88,8 +95,8 @@ async function snapshotPage(tabKey: string): Promise<string> {
   }
 }
 
-async function navigateTo(url: string): Promise<void> {
-  const { browser, page } = await getPage()
+async function navigateTo(url: string, userId: string): Promise<void> {
+  const { browser, page } = await getPage(userId)
   try {
     await page.goto(url, { timeout: 30000 })
     await page.waitForLoadState('domcontentloaded').catch(() => {})
@@ -99,12 +106,12 @@ async function navigateTo(url: string): Promise<void> {
   }
 }
 
-async function clickRef(tabKey: string, ref: string): Promise<void> {
+async function clickRef(tabKey: string, ref: string, userId: string): Promise<void> {
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const { browser, page } = await getPage()
+  const { browser, page } = await getPage(userId)
   try {
     const role = target.role as any
     const locator = target.name
@@ -117,12 +124,12 @@ async function clickRef(tabKey: string, ref: string): Promise<void> {
   }
 }
 
-async function typeInRef(tabKey: string, ref: string, text: string): Promise<void> {
+async function typeInRef(tabKey: string, ref: string, text: string, userId: string): Promise<void> {
   const refs = sessionRefs.get(tabKey)
   const target = refs?.[ref]
   if (!target) throw new Error(`Unknown ref "${ref}". Call browser_snapshot first.`)
 
-  const { browser, page } = await getPage()
+  const { browser, page } = await getPage(userId)
   try {
     const role = target.role as any
     const locator = target.name
@@ -135,8 +142,8 @@ async function typeInRef(tabKey: string, ref: string, text: string): Promise<voi
   }
 }
 
-async function pressKey(key: string): Promise<void> {
-  const { browser, page } = await getPage()
+async function pressKey(key: string, userId: string): Promise<void> {
+  const { browser, page } = await getPage(userId)
   try {
     await page.keyboard.press(key)
   } finally {
@@ -144,8 +151,8 @@ async function pressKey(key: string): Promise<void> {
   }
 }
 
-async function scrollPage(direction: 'up' | 'down', amount = 300): Promise<void> {
-  const { browser, page } = await getPage()
+async function scrollPage(direction: 'up' | 'down', amount = 300, userId: string): Promise<void> {
+  const { browser, page } = await getPage(userId)
   try {
     const delta = direction === 'down' ? amount : -amount
     await page.evaluate(`window.scrollBy(0, ${delta})`)
@@ -248,14 +255,14 @@ async function runAgentLoop(opts: {
             }
             case 'browser_navigate': {
               await opts.onProgress(`🌐 Navigating to ${args.url}...`)
-              await navigateTo(args.url)
+              await navigateTo(args.url, opts.userId)
               result = await snapshotPage(opts.tabKey)
               result = `Navigated. Page:\n${result}`
               break
             }
             case 'browser_click': {
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
-              await clickRef(opts.tabKey, args.ref)
+              await clickRef(opts.tabKey, args.ref, opts.userId)
               await new Promise(r => setTimeout(r, 500))
               result = await snapshotPage(opts.tabKey)
               result = `Clicked. Page:\n${result}`
@@ -263,8 +270,8 @@ async function runAgentLoop(opts: {
             }
             case 'browser_type': {
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
-              await typeInRef(opts.tabKey, args.ref, args.text)
-              if (args.submit) await pressKey('Enter')
+              await typeInRef(opts.tabKey, args.ref, args.text, opts.userId)
+              if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 300))
               result = await snapshotPage(opts.tabKey)
               result = `Typed. Page:\n${result}`
@@ -272,13 +279,13 @@ async function runAgentLoop(opts: {
             }
             case 'browser_key': {
               await opts.onProgress(`⌨️ Pressing ${args.key}...`)
-              await pressKey(args.key)
+              await pressKey(args.key, opts.userId)
               await new Promise(r => setTimeout(r, 300))
               result = `Pressed ${args.key}`
               break
             }
             case 'browser_scroll': {
-              await scrollPage(args.direction, args.amount)
+              await scrollPage(args.direction, args.amount, opts.userId)
               result = `Scrolled ${args.direction}`
               break
             }
@@ -424,7 +431,8 @@ export async function runAgentWithExtension(
     console.log(`[agent] tab ${newTabId} ready, waiting for relay...`)
     await new Promise(r => setTimeout(r, 2000))
 
-    const wsUrl = 'ws://127.0.0.1:18792/cdp'
+    const relayPort = getRelayPortForUser(userId)
+    const wsUrl = `ws://127.0.0.1:${relayPort}/cdp`
     console.log(`[agent] connecting Playwright to ${wsUrl}`)
 
     await onStep('✅ Tab ready. Starting task...')

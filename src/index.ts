@@ -19,7 +19,31 @@ process.on('unhandledRejection', (reason) => {
 
 const app = express()
 const PORT = process.env.PORT || 3001
-const RELAY_PORT = 18792
+const BASE_RELAY_PORT = 18792
+const userRelayPorts = new Map<string, number>()
+const usedPorts = new Set<number>()
+
+function getRelayPortForUser(userId: string): number {
+  if (userRelayPorts.has(userId)) return userRelayPorts.get(userId)!
+  for (let port = BASE_RELAY_PORT; port < BASE_RELAY_PORT + 100; port++) {
+    if (!usedPorts.has(port)) {
+      usedPorts.add(port)
+      userRelayPorts.set(userId, port)
+      return port
+    }
+  }
+  throw new Error('No relay ports available')
+}
+
+function freeRelayPort(userId: string) {
+  const port = userRelayPorts.get(userId)
+  if (port) {
+    usedPorts.delete(port)
+    userRelayPorts.delete(userId)
+  }
+}
+
+export { getRelayPortForUser, freeRelayPort, BASE_RELAY_PORT }
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -131,10 +155,11 @@ wss.on('connection', async (ws, req) => {
   console.log(`✅ Extension connected: ${userId} (total: ${extensionConnections.size})`)
 
   const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || ''
-  const relayToken = deriveRelayToken(gatewayToken, RELAY_PORT)
+  const relayPort = getRelayPortForUser(userId)
+  const relayToken = deriveRelayToken(gatewayToken, relayPort)
 
   try {
-    const relay = await ensureChromeExtensionRelayServer({ cdpUrl: `http://127.0.0.1:${RELAY_PORT}` })
+    const relay = await ensureChromeExtensionRelayServer({ cdpUrl: `http://127.0.0.1:${relayPort}` })
     console.log(`📡 Extension relay ready: ${relay.cdpWsUrl}`)
   } catch (err) {
     console.error(`Failed to start extension relay:`, err)
@@ -148,7 +173,7 @@ wss.on('connection', async (ws, req) => {
     await new Promise(r => setTimeout(r, 500))
   }
 
-  const relayExtUrl = `ws://127.0.0.1:${RELAY_PORT}/extension?token=${encodeURIComponent(relayToken)}`
+  const relayExtUrl = `ws://127.0.0.1:${relayPort}/extension?token=${encodeURIComponent(relayToken)}`
   const relayWs = new WebSocket(relayExtUrl)
   relayBridges.set(userId, relayWs)
 
@@ -223,6 +248,7 @@ wss.on('connection', async (ws, req) => {
       bridge.close()
       relayBridges.delete(userId)
     }
+    freeRelayPort(userId)
     console.log(`Extension disconnected: ${userId} (total: ${extensionConnections.size})`)
   })
 
