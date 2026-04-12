@@ -9,6 +9,14 @@ import { messagesRouter } from './routes/messages.js'
 import { oauthRouter } from './routes/oauth.js'
 import { ensureChromeExtensionRelayServer } from './browser/extension-relay.js'
 
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (recovered):', err.message)
+})
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (recovered):', reason)
+})
+
 const app = express()
 const PORT = process.env.PORT || 3001
 const RELAY_PORT = 18792
