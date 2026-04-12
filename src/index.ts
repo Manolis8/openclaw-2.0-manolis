@@ -188,6 +188,9 @@ wss.on('connection', async (ws, req) => {
 
       if (msg.method === 'forwardCDPEvent') {
         console.log(`CDP event from ${userId}: ${msg.params?.method}`)
+        if (relayWs.readyState === WebSocket.OPEN) {
+          relayWs.send(text)
+        }
       }
     } catch (err) {
       console.error('Extension message error:', err)
