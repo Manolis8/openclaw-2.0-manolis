@@ -4,6 +4,12 @@ import { isExtensionConnected, extensionConnections } from '../index.js'
 import { runAgentWithExtension } from '../lib/agent-extension.js'
 import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
 
+function sanitizeString(input: unknown, maxLength = 100): string | null {
+  if (typeof input !== 'string') return null
+  const trimmed = input.trim().replace(/\0/g, '')
+  return trimmed.length > 0 && trimmed.length <= maxLength ? trimmed : null
+}
+
 export const tasksRouter = Router()
 
 const runningTasksPerUser = new Map<string, boolean>()
@@ -73,12 +79,14 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
 }
 
 tasksRouter.post('/create-task', async (req, res) => {
-  const { prompt, userId, useApiMode } = req.body
+  const { prompt: rawPrompt, userId: rawUserId, useApiMode } = req.body
+  const prompt = sanitizeString(rawPrompt, 2000)
+  const userId = sanitizeString(rawUserId, 100)
+  if (!prompt || !userId) {
+    return res.status(400).json({ error: 'Missing or invalid prompt or userId' })
+  }
   console.log(`Create task: userId=${userId}, extensionConnected=${isExtensionConnected(userId)}`)
   console.log(`All connected extensions: ${[...extensionConnections.keys()].join(', ')}`)
-  if (!prompt || !userId) {
-    return res.status(400).json({ error: 'Missing prompt or userId' })
-  }
   const { data, error } = await supabase
     .from('tasks')
     .insert({ user_id: userId, prompt, output: '', status: 'running' })
@@ -103,8 +111,9 @@ tasksRouter.get('/tasks/:userId', async (req, res) => {
 })
 
 tasksRouter.post('/refresh-token', async (req, res) => {
-  const { refreshToken } = req.body
-  if (!refreshToken) return res.status(400).json({ error: 'Missing refresh token' })
+  const { refreshToken: rawToken } = req.body
+  const refreshToken = sanitizeString(rawToken, 2000)
+  if (!refreshToken) return res.status(400).json({ error: 'Missing or invalid refresh token' })
   try {
     const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken })
     if (error || !data.session) throw new Error('Refresh failed')
@@ -115,9 +124,12 @@ tasksRouter.post('/refresh-token', async (req, res) => {
 })
 
 tasksRouter.post('/create-scheduled-task', async (req, res) => {
-  const { prompt, userId, scheduleText } = req.body
+  const { prompt: rawPrompt, userId: rawUserId, scheduleText: rawSchedule } = req.body
+  const prompt = sanitizeString(rawPrompt, 2000)
+  const userId = sanitizeString(rawUserId, 100)
+  const scheduleText = sanitizeString(rawSchedule, 100)
   if (!prompt || !userId || !scheduleText) {
-    return res.status(400).json({ error: 'Missing prompt, userId, or scheduleText' })
+    return res.status(400).json({ error: 'Missing or invalid prompt, userId, or scheduleText' })
   }
 
   const parsed = await parseSchedule(scheduleText)

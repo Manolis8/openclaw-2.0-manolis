@@ -4,6 +4,8 @@ import { createServer } from 'http'
 import { WebSocketServer, WebSocket } from 'ws'
 import { createClient } from '@supabase/supabase-js'
 import { createHmac } from 'node:crypto'
+import helmet from 'helmet'
+import rateLimit from 'express-rate-limit'
 import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { oauthRouter } from './routes/oauth.js'
@@ -23,6 +25,22 @@ const BASE_RELAY_PORT = 18792
 const userRelayPorts = new Map<string, number>()
 const usedPorts = new Set<number>()
 const activeTaskTimeouts = new Map<string, NodeJS.Timeout>()
+
+const generalRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' }
+})
+
+const generateKeyRateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many key generation requests, please try again later' }
+})
 
 function getRelayPortForUser(userId: string): number {
   if (userRelayPorts.has(userId)) return userRelayPorts.get(userId)!
@@ -76,15 +94,27 @@ function deriveRelayToken(gatewayToken: string, port: number): string {
     .digest('hex')
 }
 
+const allowedOrigins = [
+  'https://unclawned.com',
+  'https://www.unclawned.com',
+  'https://felo-automations-hub.vercel.app'
+]
+
+app.use(helmet())
+app.use(generalRateLimiter)
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*')
+  const origin = req.headers.origin
+  if (origin && allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin)
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
   if (req.method === 'OPTIONS') { res.sendStatus(200); return }
   next()
 })
 
-app.use(express.json())
+app.use(express.json({ limit: '10kb' }))
 
 app.use((req, _res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.path}`)
@@ -95,13 +125,15 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date() })
 })
 
-app.post('/api/generate-key', async (req, res) => {
+app.post('/api/generate-key', generateKeyRateLimiter, async (req, res) => {
   const { userId } = req.body
-  if (!userId) return res.status(400).json({ error: 'Missing userId' })
+  if (!userId || typeof userId !== 'string') return res.status(400).json({ error: 'Missing userId' })
+  const sanitizedUserId = userId.trim().replace(/\0/g, '')
+  if (!sanitizedUserId || sanitizedUserId.length > 100) return res.status(400).json({ error: 'Invalid userId' })
   const key = 'felo_' + [...Array(40)].map(() => Math.random().toString(36)[2]).join('')
   const { error } = await supabase
     .from('api_keys')
-    .upsert({ user_id: userId, key }, { onConflict: 'user_id' })
+    .upsert({ user_id: sanitizedUserId, key }, { onConflict: 'user_id' })
   if (error) return res.status(500).json({ error: 'Failed to generate key' })
   res.json({ key })
 })
@@ -131,6 +163,22 @@ export const pendingCdpCommands = new Map<string, Map<number, { resolve: (v: any
 
 const relayBridges = new Map<string, WebSocket>()
 
+const wsConnectionsPerIp = new Map<string, { count: number, windowStart: number }>()
+const WS_MAX_CONNECTIONS = 10
+const WS_WINDOW_MS = 60 * 1000
+
+function checkWsRateLimit(ip: string): boolean {
+  const now = Date.now()
+  const record = wsConnectionsPerIp.get(ip)
+  if (!record || now - record.windowStart > WS_WINDOW_MS) {
+    wsConnectionsPerIp.set(ip, { count: 1, windowStart: now })
+    return true
+  }
+  if (record.count >= WS_MAX_CONNECTIONS) return false
+  record.count++
+  return true
+}
+
 server.on('upgrade', (request, socket, head) => {
   console.log('🔌 WebSocket upgrade:', request.url?.slice(0, 80))
   const url = new URL(request.url || '', 'http://localhost')
@@ -144,6 +192,13 @@ server.on('upgrade', (request, socket, head) => {
 })
 
 wss.on('connection', async (ws, req) => {
+  const clientIp = req.socket.remoteAddress || 'unknown'
+  if (!checkWsRateLimit(clientIp)) {
+    console.log(`WS rate limit exceeded for IP: ${clientIp}`)
+    ws.close(1008, 'Rate limit exceeded')
+    return
+  }
+
   const url = new URL(req.url || '', 'http://localhost')
   const token = url.searchParams.get('token')
 

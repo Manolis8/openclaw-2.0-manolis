@@ -3,6 +3,12 @@ import { createClient } from '@supabase/supabase-js'
 import { OAUTH_CONFIG, OAuthProvider } from '../lib/oauth-config.js'
 import { encrypt, decrypt } from '../lib/encryption.js'
 
+function sanitizeString(input: unknown, maxLength = 100): string | null {
+  if (typeof input !== 'string') return null
+  const trimmed = input.trim().replace(/\0/g, '')
+  return trimmed.length > 0 && trimmed.length <= maxLength ? trimmed : null
+}
+
 export const oauthRouter = Router()
 
 const supabase = createClient(
@@ -13,7 +19,8 @@ const supabase = createClient(
 // Step 1 — redirect user to provider OAuth page
 oauthRouter.get('/oauth/:provider/connect', (req, res) => {
   const provider = req.params.provider as OAuthProvider
-  const { userId } = req.query
+  const rawUserId = req.query.userId
+  const userId = sanitizeString(rawUserId, 100)
 
   if (!userId || !OAUTH_CONFIG[provider]) {
     return res.status(400).json({ error: 'Invalid provider or missing userId' })
