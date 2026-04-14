@@ -214,3 +214,30 @@ tasksRouter.get('/executions/:userId', async (req, res) => {
   if (error) return res.status(500).json({ error: error.message })
   res.json(data || [])
 })
+
+const ADMIN_USER_ID = '177794f8-f295-4154-a5ff-1db38eed28b1'
+
+tasksRouter.get('/admin/stats', async (req, res) => {
+  const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, '')
+  if (authHeader !== ADMIN_USER_ID) {
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+
+  const [[users], [tasks], [feedback], [proWaitlist], [proInterest], [referrals]] = await Promise.all([
+    supabase.from('users').select('id', { count: 'exact', head: true }),
+    supabase.from('tasks').select('id', { count: 'exact', head: true }),
+    supabase.from('feedback').select('*'),
+    supabase.from('pro_waitlist').select('id', { count: 'exact', head: true }),
+    supabase.from('pro_interest').select('id', { count: 'exact', head: true }),
+    supabase.from('referrals').select('id', { count: 'exact', head: true })
+  ])
+
+  res.json({
+    totalUsers: users.count || 0,
+    totalTasks: tasks.count || 0,
+    feedback: feedback.data || [],
+    proWaitlistCount: proWaitlist.count || 0,
+    proInterestCount: proInterest.count || 0,
+    referralCount: referrals.count || 0
+  })
+})
