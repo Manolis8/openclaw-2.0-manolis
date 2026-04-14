@@ -208,7 +208,16 @@ IMPORTANT URL RULES:
 - "Google" = https://google.com  
 - "YouTube" = https://youtube.com
 - "Gmail" = https://mail.google.com
-- Never navigate to a plain word — always use a full https:// URL`
+- Never navigate to a plain word — always use a full https:// URL
+
+RELIABILITY RULES:
+- If a page takes too long to load, take a snapshot anyway and work with what you have
+- If you click something and nothing happens after a snapshot, try a different approach
+- If you see a cookie consent or popup blocking the page, dismiss it first before doing anything else
+- If you cannot complete the task after 2 attempts, call task_failed with a clear reason why
+- Never get stuck in a loop doing the same action repeatedly
+- If you see a login page, do NOT try to log in — tell the user they need to be logged in to that site first
+- Always call task_complete or task_failed — never leave a task hanging`
 
 async function runAgentLoop(opts: {
   userId: string

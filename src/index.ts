@@ -22,6 +22,7 @@ const PORT = process.env.PORT || 3001
 const BASE_RELAY_PORT = 18792
 const userRelayPorts = new Map<string, number>()
 const usedPorts = new Set<number>()
+const activeTaskTimeouts = new Map<string, NodeJS.Timeout>()
 
 function getRelayPortForUser(userId: string): number {
   if (userRelayPorts.has(userId)) return userRelayPorts.get(userId)!
@@ -40,6 +41,25 @@ function freeRelayPort(userId: string) {
   if (port) {
     usedPorts.delete(port)
     userRelayPorts.delete(userId)
+  }
+}
+
+function setTaskTimeout(taskId: string, userId: string) {
+  const timer = setTimeout(async () => {
+    activeTaskTimeouts.delete(taskId)
+    await supabase.from('tasks').update({
+      status: 'error',
+      output: '⏱️ Task timed out. The task took too long to complete. Please try again with a simpler request.'
+    }).eq('id', taskId).eq('status', 'running')
+  }, 180_000) // 3 minutes
+  activeTaskTimeouts.set(taskId, timer)
+}
+
+function clearTaskTimeout(taskId: string) {
+  const timer = activeTaskTimeouts.get(taskId)
+  if (timer) {
+    clearTimeout(timer)
+    activeTaskTimeouts.delete(taskId)
   }
 }
 
@@ -327,7 +347,12 @@ async function drainQueueForUser(userId: string) {
   const { runTaskInBackground } = await import('./routes/tasks.js')
   for (const task of queuedTasks) {
     await supabase.from('tasks').update({ status: 'running' }).eq('id', task.id)
-    runTaskInBackground(task.id, task.prompt, userId)
+    setTaskTimeout(task.id, userId)
+    runTaskInBackground(task.id, task.prompt, userId).then(() => {
+      clearTaskTimeout(task.id)
+    }).catch(() => {
+      clearTaskTimeout(task.id)
+    })
   }
 }
 

@@ -6,6 +6,8 @@ import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../l
 
 export const tasksRouter = Router()
 
+const runningTasksPerUser = new Map<string, boolean>()
+
 async function appendOutput(taskId: string, line: string) {
   const { data } = await supabase
     .from('tasks')
@@ -24,14 +26,32 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
   console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)
 
+  // Only 1 task at a time per user
+  if (runningTasksPerUser.get(userId)) {
+    await supabase.from('tasks').update({
+      status: 'error',
+      output: '⚠️ You already have a task running. Please wait for it to finish before starting a new one.'
+    }).eq('id', taskId)
+    return
+  }
+  runningTasksPerUser.set(userId, true)
+
+  const TASK_TIMEOUT_MS = 120_000 // 2 minutes
+
   // Always use cloud browser (agent-extension.ts) for reliability
   // The agent-extension.ts uses aria-snapshot which is more reliable than CSS selectors
   await appendOutput(taskId, '☁️ Starting browser agent...\n')
   try {
-    const result = await runAgentWithExtension(prompt, userId, async (step) => {
+    const taskPromise = runAgentWithExtension(prompt, userId, async (step) => {
       console.log(`[${taskId}] ${step}`)
       await appendOutput(taskId, step + '\n')
     }, taskId)
+
+    const timeoutPromise = new Promise<string>((_, reject) =>
+      setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
+    )
+
+    const result = await Promise.race([taskPromise, timeoutPromise])
     const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
     await supabase.from('tasks').update({
       status: 'done',
@@ -47,6 +67,8 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
     }).eq('id', taskId)
 
     await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
+  } finally {
+    runningTasksPerUser.delete(userId)
   }
 }
 
