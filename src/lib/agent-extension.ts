@@ -200,7 +200,15 @@ RULES:
 - If something fails twice, try a different approach
 - Never try to log in — the user is already logged in
 - Only call task_complete when you can see the result on the page
-- Only call task_failed after exhausting all approaches`
+- Only call task_failed after exhausting all approaches
+
+IMPORTANT URL RULES:
+- Always use full URLs with https:// prefix
+- "X" or "Twitter" = https://x.com
+- "Google" = https://google.com  
+- "YouTube" = https://youtube.com
+- "Gmail" = https://mail.google.com
+- Never navigate to a plain word — always use a full https:// URL`
 
 async function runAgentLoop(opts: {
   userId: string
