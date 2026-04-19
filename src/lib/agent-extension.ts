@@ -480,14 +480,31 @@ export async function runAgentWithExtension(
   } finally {
     runningTasks.delete(taskKey)
 
-    if (newTabId && !keepTabOpen) {
-      await new Promise(r => setTimeout(r, 3000))
+    const tabId = newTabId
+
+    // Always detach debugger so browser is no longer controlled
+    try {
+      if (tabId) {
+        const { sendCdpCommand: disableDebugger } = await import('../index.js')
+        await disableDebugger(userId, 'Debugger.disable', {}, tabId)
+        const { sendExtensionMessage: detachMsg } = await import('../index.js')
+        await detachMsg(userId, 'detachTab', { tabId })
+      }
+    } catch {
+      // ignore
+    }
+
+    // Only close tab if keepTabOpen is false
+    if (!keepTabOpen) {
       try {
-        const { sendExtensionMessage: closeMsg } = await import('../index.js')
-        await closeMsg(userId, 'closeTab', { tabId: newTabId }, 5000)
-        console.log(`[agent] closed tab ${newTabId}`)
-      } catch (err) {
-        console.error('[agent] closeTab error:', err)
+        if (tabId) {
+          await new Promise(r => setTimeout(r, 1000))
+          const { sendExtensionMessage: closeMsg } = await import('../index.js')
+          await closeMsg(userId, 'closeTab', { tabId })
+          console.log(`[agent] closed tab ${tabId}`)
+        }
+      } catch {
+        // ignore
       }
     }
 
