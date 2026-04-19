@@ -208,66 +208,78 @@ function trimMessages(messages: any[]): any[] {
   return [systemMessage, ...trimmed]
 }
 
-const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent.
+const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent running inside the user's real Chrome browser.
 
-CRITICAL RULES TO SAVE TOKENS:
-- Keep your responses extremely concise
-- Never repeat what you already know
-- After a snapshot, only mention elements you plan to interact with
-- Never describe the full page — just what matters for the task
-- Maximum 3 retry attempts per element then try a different approach
-- If a cookie/consent popup appears, dismiss it FIRST before anything else using browser_click
+## Core Workflow — ALWAYS follow this exactly
+1. Call browser_snapshot to see the page and get element refs (e1, e2, e3...)
+2. Use refs to interact — NEVER invent or guess refs
+3. After every action call browser_snapshot to verify what changed
+4. Repeat until done then call task_complete
 
-COOKIE POPUP RULE — HIGHEST PRIORITY:
-When you see 'cookie', 'onetrust', 'consent', 'banner' blocking clicks:
-- IMMEDIATELY call browser_dismiss_cookie tool
-- Do NOT try to find and click cookie buttons manually
-- After dismissing, take a snapshot and continue the task
-- Never click elements outside the viewport — scroll first using browser_scroll
+## Error Messages Tell You What To Do
+When you see an error, read it carefully — it tells you exactly what to do next:
+- "blocked by an overlay" → call browser_dismiss_cookie immediately
+- "outside the viewport" → call browser_scroll direction=down amount=300 then re-snapshot
+- "matched multiple elements" → re-snapshot and use a different ref
+- "not found or not visible" → re-snapshot and use a fresh ref
+- "no longer exists" → re-snapshot and get fresh refs
+Never retry the same action that just failed — always do what the error message says first.
 
-TOKEN SAVING RULES:
-- For Google searches: navigate directly to the URL with search query instead of typing in the search box. Example: navigate to https://www.google.com/search?q=your+search+query
-- Never read more than 3 search results
-- After finding the answer stop immediately — do not keep browsing
-- Keep all your responses under 100 words
-- Never explain what you are about to do — just do it
-- Never summarize what you already did — just report the final answer
+## Cookie and Popup Rule — HIGHEST PRIORITY
+The moment you see any cookie banner, consent popup, or overlay blocking clicks:
+1. Call browser_dismiss_cookie — never try to click cookie buttons manually
+2. Wait for it to confirm dismissal
+3. Re-snapshot and continue
 
-VIEWPORT RULE:
-- Before clicking ANY element, always call browser_scroll down first if the element might be below the fold
-- Never click 'Skip to main content' buttons — they are invisible helper elements, ignore them completely
-- If an element is outside viewport after scrolling, take a new snapshot and find a visible alternative
+## Snapshot Rules
+- Refs become invalid after every navigation — always re-snapshot after navigating
+- If you take more than 2 snapshots in a row without acting — you must click, scroll, navigate, or call task_failed
+- Never use the same ref after a page change
 
-HOW YOU WORK:
-- Call browser_snapshot to see the page — it shows interactive elements with refs like e1, e2
-- Use refs to click, type, and interact
-- After every action, call browser_snapshot to see what changed
-- Keep going until the task is done, then call task_complete
+## Google Search Rule
+Never go to google.com and type in the search box.
+Always navigate directly: https://www.google.com/search?q=search+terms+here
 
-RULES:
-- Never assume an action worked — always snapshot after to verify
-- If you can't find an element, snapshot again — the page may have changed
-- If something fails twice, try a different approach
-- Never try to log in — the user is already logged in
-- Only call task_complete when you can see the result on the page
-- Only call task_failed after exhausting all approaches
+## Strict Rules
+- Never click "Skip to main content" — it is invisible, ignore it always
+- Never try to log in — call task_failed if you see a login page
+- Maximum 2 attempts on any single element — then try a completely different approach
+- Always end with task_complete or task_failed — never leave a task hanging
+- Keep all responses under 50 words — never explain what you are about to do
 
-IMPORTANT URL RULES:
-- Always use full URLs with https:// prefix
-- "X" or "Twitter" = https://x.com
-- "Google" = https://google.com  
-- "YouTube" = https://youtube.com
-- "Gmail" = https://mail.google.com
-- Never navigate to a plain word — always use a full https:// URL
+## Multi-Step Tasks
+For tasks requiring multiple websites:
+1. Complete each site fully before moving to next
+2. After each site note what you found in one sentence
+3. At end combine all findings into final answer then call task_complete`
 
-RELIABILITY RULES:
-- If a page takes too long to load, take a snapshot anyway and work with what you have
-- If you click something and nothing happens after a snapshot, try a different approach
-- If you see a cookie consent or popup blocking the page, dismiss it first before doing anything else
-- If you cannot complete the task after 2 attempts, call task_failed with a clear reason why
-- Never get stuck in a loop doing the same action repeatedly
-- If you see a login page, do NOT try to log in — tell the user they need to be logged in to that site first
-- Always call task_complete or task_failed — never leave a task hanging`
+function toAIFriendlyError(error: unknown, ref: string): string {
+  const message = error instanceof Error ? error.message : String(error)
+
+  if (message.includes('strict mode violation')) {
+    const countMatch = message.match(/resolved to (\d+) elements/)
+    const count = countMatch ? countMatch[1] : 'multiple'
+    return `Ref "${ref}" matched ${count} elements. Call browser_snapshot again to get fresh refs and use a more specific one.`
+  }
+
+  if (message.includes('intercepts pointer events') || message.includes('not receive pointer events')) {
+    return `Element "${ref}" is blocked by an overlay (cookie popup or modal). Call browser_dismiss_cookie immediately, then re-snapshot and continue.`
+  }
+
+  if (message.includes('outside of the viewport') || message.includes('element is outside')) {
+    return `Element "${ref}" is outside the viewport. Call browser_scroll with direction="down" amount=300, then re-snapshot and try again.`
+  }
+
+  if ((message.includes('Timeout') || message.includes('timeout')) && message.includes('waiting')) {
+    return `Element "${ref}" not found or not visible (timeout). Call browser_snapshot to see current page elements and use a fresh ref.`
+  }
+
+  if (message.includes('not found') || message.includes('Unknown ref')) {
+    return `Ref "${ref}" no longer exists. The page may have changed. Call browser_snapshot to get fresh refs.`
+  }
+
+  return `Error on "${ref}": ${message}. Call browser_snapshot to see current page state.`
+}
 
 async function runAgentLoop(opts: {
   userId: string
@@ -320,10 +332,10 @@ async function runAgentLoop(opts: {
           switch (toolCall.function.name) {
             case 'browser_snapshot': {
               consecutiveSnapshots++
-              if (consecutiveSnapshots > 3) {
+              if (consecutiveSnapshots >= 3) {
                 await opts.onProgress('📸 Reading page...')
                 result = await snapshotPage(opts.tabKey)
-                result += '\n\nWARNING: You have taken too many snapshots in a row. You MUST now either click something, navigate somewhere, or call task_complete/task_failed. Do not take another snapshot.'
+                result += '\n\nWARNING: ' + consecutiveSnapshots + ' snapshots in a row. You MUST now act: click something, scroll, navigate, dismiss a cookie popup, or call task_failed. Do NOT snapshot again.'
                 break
               }
               await opts.onProgress('📸 Reading page...')
@@ -331,6 +343,7 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_navigate': {
+              consecutiveSnapshots = 0
               await opts.onProgress(`🌐 Navigating to ${args.url}...`)
               await navigateTo(args.url, opts.userId)
               result = await snapshotPage(opts.tabKey)
@@ -338,6 +351,7 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_click': {
+              consecutiveSnapshots = 0
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
               await clickRef(opts.tabKey, args.ref, opts.userId)
               await new Promise(r => setTimeout(r, 500))
@@ -346,6 +360,7 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_type': {
+              consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
               await typeInRef(opts.tabKey, args.ref, args.text, opts.userId)
               if (args.submit) await pressKey('Enter', opts.userId)
@@ -355,6 +370,7 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_key': {
+              consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Pressing ${args.key}...`)
               await pressKey(args.key, opts.userId)
               await new Promise(r => setTimeout(r, 300))
@@ -362,11 +378,13 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_scroll': {
+              consecutiveSnapshots = 0
               await scrollPage(args.direction, args.amount, opts.userId)
               result = `Scrolled ${args.direction}`
               break
             }
             case 'browser_dismiss_cookie': {
+              consecutiveSnapshots = 0
               await opts.onProgress('🍪 Dismissing cookie popup...')
               const { browser, page } = await getPage(opts.userId)
               try {
@@ -487,8 +505,9 @@ async function runAgentLoop(opts: {
               result = `Unknown tool: ${toolCall.function.name}`
           }
         } catch (err) {
-          result = `Error: ${err instanceof Error ? err.message : String(err)}`
-          await opts.onProgress(`⚠️ ${result}`)
+          const ref = args?.ref || args?.url || toolCall.function.name
+          result = toAIFriendlyError(err, ref)
+          await opts.onProgress(`⚠️ Error: ${result}`)
         }
 
         toolResults.push({ role: 'tool', tool_call_id: toolCall.id, content: result })
