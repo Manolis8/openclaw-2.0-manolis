@@ -97,7 +97,8 @@ function deriveRelayToken(gatewayToken: string, port: number): string {
 const allowedOrigins = [
   'https://unclawned.com',
   'https://www.unclawned.com',
-  'https://felo-automations-hub.vercel.app'
+  'https://www.test-frotend-unclawned.vercel.app/dashboard',
+  'https://test-frotend-unclawned.vercel.app/dashboard'
 ]
 
 app.use(helmet())
