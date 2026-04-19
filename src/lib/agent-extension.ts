@@ -170,6 +170,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'browser_type', description: 'Type text into a ref.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
   { type: 'function', function: { name: 'browser_key', description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
   { type: 'function', function: { name: 'browser_scroll', description: 'Scroll page up or down.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
+  { type: 'function', function: { name: 'browser_dismiss_cookie', description: 'Dismiss cookie/consent popups automatically. Use this FIRST when you see any cookie banner blocking the page.', parameters: { type: 'object', properties: {}, required: [] } } },
   { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
   { type: 'function', function: { name: 'task_complete', description: 'Call only after visual confirmation task succeeded.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
   { type: 'function', function: { name: 'task_failed', description: 'Call when task cannot be completed.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] } } },
@@ -218,14 +219,10 @@ CRITICAL RULES TO SAVE TOKENS:
 - If a cookie/consent popup appears, dismiss it FIRST before anything else using browser_click
 
 COOKIE POPUP RULE — HIGHEST PRIORITY:
-When ANY element has 'cookie', 'consent', 'onetrust', 'banner', 'gdpr' in its class or text:
-1. Take a snapshot immediately
-2. Look for buttons in this order: 'Reject', 'Reject all', 'Decline', 'Close', 'Accept', 'Accept all', 'Agree', 'OK', 'Got it'
-3. Click the FIRST one you find using browser_click
-4. Wait 500ms then take another snapshot
-5. Only then continue with the original task
-NEVER try to click through a cookie popup — always handle it first
-NEVER try to click the same element more than twice — if it fails twice take a snapshot and try different approach
+When you see 'cookie', 'onetrust', 'consent', 'banner' blocking clicks:
+- IMMEDIATELY call browser_dismiss_cookie tool
+- Do NOT try to find and click cookie buttons manually
+- After dismissing, take a snapshot and continue the task
 - Never click elements outside the viewport — scroll first using browser_scroll
 
 TOKEN SAVING RULES:
@@ -367,6 +364,38 @@ async function runAgentLoop(opts: {
             case 'browser_scroll': {
               await scrollPage(args.direction, args.amount, opts.userId)
               result = `Scrolled ${args.direction}`
+              break
+            }
+            case 'browser_dismiss_cookie': {
+              await opts.onProgress('🍪 Dismissing cookie popup...')
+              const { browser, page } = await getPage(opts.userId)
+              try {
+                await page.evaluate(() => {
+                  const selectors = [
+                    '[id*="onetrust"] button[class*="reject"]',
+                    '[id*="onetrust"] button[class*="decline"]', 
+                    '[id*="cookie"] button[class*="reject"]',
+                    '[id*="cookie"] button[class*="decline"]',
+                    '[id*="cookie"] button[class*="close"]',
+                    '.cookie-banner button',
+                    '#onetrust-reject-all-handler',
+                    '#onetrust-accept-btn-handler',
+                    '[aria-label*="cookie" i] button',
+                    'button[id*="reject"]',
+                    'button[id*="decline"]',
+                    'button[id*="accept"]',
+                  ]
+                  for (const selector of selectors) {
+                    const el = document.querySelector(selector) as HTMLElement
+                    if (el) { el.click(); return }
+                  }
+                })
+                await new Promise(r => setTimeout(r, 1000))
+                result = await snapshotPage(opts.tabKey)
+                result = `Cookie dismissed. Page:\n${result}`
+              } finally {
+                await browser.close()
+              }
               break
             }
             case 'browser_wait': {
