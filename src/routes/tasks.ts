@@ -66,13 +66,15 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
 
     await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
   } catch (err) {
+    const realErrorMessage = String(err)
     const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
     await supabase.from('tasks').update({
       status: 'error',
-      output: (data?.output || '') + `❌ Error: ${String(err)}\n`
+      output: (data?.output || '') + '❌ Error: Something went wrong. Our team is working on a fix.\n',
+      error_details: realErrorMessage
     }).eq('id', taskId)
 
-    await createMessage(userId, taskId, `❌ Task failed: ${String(err).slice(0, 200)}`)
+    await createMessage(userId, taskId, '❌ Task failed. Please try again.')
   } finally {
     runningTasksPerUser.delete(userId)
   }

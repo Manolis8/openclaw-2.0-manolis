@@ -116,8 +116,11 @@ async function clickRef(tabKey: string, ref: string, userId: string): Promise<vo
     const locator = target.name
       ? page.getByRole(role, { name: target.name, exact: true })
       : page.getByRole(role)
-    const resolved = target.nth !== undefined ? locator.nth(target.nth) : locator
+    // Always use nth to avoid strict mode violations
+    const nth = target.nth !== undefined ? target.nth : 0
+    const resolved = locator.nth(nth)
     await resolved.click({ timeout: 8000 })
+    await new Promise(r => setTimeout(r, 300))
   } finally {
     await browser.close()
   }
@@ -213,6 +216,16 @@ CRITICAL RULES TO SAVE TOKENS:
 - Never describe the full page — just what matters for the task
 - Maximum 3 retry attempts per element then try a different approach
 - If a cookie/consent popup appears, dismiss it FIRST before anything else using browser_click
+
+COOKIE POPUP RULE — HIGHEST PRIORITY:
+When ANY element has 'cookie', 'consent', 'onetrust', 'banner', 'gdpr' in its class or text:
+1. Take a snapshot immediately
+2. Look for buttons in this order: 'Reject', 'Reject all', 'Decline', 'Close', 'Accept', 'Accept all', 'Agree', 'OK', 'Got it'
+3. Click the FIRST one you find using browser_click
+4. Wait 500ms then take another snapshot
+5. Only then continue with the original task
+NEVER try to click through a cookie popup — always handle it first
+NEVER try to click the same element more than twice — if it fails twice take a snapshot and try different approach
 - Never click elements outside the viewport — scroll first using browser_scroll
 
 TOKEN SAVING RULES:
@@ -281,6 +294,7 @@ async function runAgentLoop(opts: {
     let iterations = 0
     let shouldRetry = false
     let retryReason = ''
+    let consecutiveSnapshots = 0
 
     while (iterations < MAX_ITERATIONS && Date.now() < deadline) {
       iterations++
@@ -308,6 +322,13 @@ async function runAgentLoop(opts: {
         try {
           switch (toolCall.function.name) {
             case 'browser_snapshot': {
+              consecutiveSnapshots++
+              if (consecutiveSnapshots > 3) {
+                await opts.onProgress('📸 Reading page...')
+                result = await snapshotPage(opts.tabKey)
+                result += '\n\nWARNING: You have taken too many snapshots in a row. You MUST now either click something, navigate somewhere, or call task_complete/task_failed. Do not take another snapshot.'
+                break
+              }
               await opts.onProgress('📸 Reading page...')
               result = await snapshotPage(opts.tabKey)
               break
@@ -433,6 +454,7 @@ async function runAgentLoop(opts: {
               break
             }
             default:
+              consecutiveSnapshots = 0
               result = `Unknown tool: ${toolCall.function.name}`
           }
         } catch (err) {
@@ -511,13 +533,13 @@ export async function runAgentWithExtension(
 
     status = result.success ? 'success' : 'error'
     resultSummary = result.summary
-    if (taskId) await createMessage(userId, taskId, result.success ? `✅ ${resultSummary}` : resultSummary.slice(0, 300))
+    if (taskId) await createMessage(userId, taskId, result.success ? `✅ Task completed successfully` : `⚠️ Task could not be completed`)
     return resultSummary
 
   } catch (err) {
     status = 'error'
     resultSummary = err instanceof Error ? err.message : String(err)
-    if (taskId) await createMessage(userId, taskId, resultSummary.slice(0, 300))
+    if (taskId) await createMessage(userId, taskId, '⚠️ Task failed. Please try again.')
     return resultSummary
 
   } finally {
