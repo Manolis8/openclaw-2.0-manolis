@@ -102,7 +102,14 @@ const allowedOrigins = [
 ]
 
 app.use(helmet())
-app.use(generalRateLimiter)
+// Apply rate limiter globally EXCEPT extension-status
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/extension-status')) {
+    return next()
+  }
+
+  return generalRateLimiter(req, res, next)
+})
 
 app.use((req, res, next) => {
   const origin = req.headers.origin
