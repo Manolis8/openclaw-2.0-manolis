@@ -185,6 +185,25 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
+function trimMessages(messages: any[]): any[] {
+  if (messages.length <= 7) return messages
+  
+  const systemMessage = messages[0]
+  const rest = messages.slice(1)
+  
+  let trimmed = rest.slice(-6)
+  
+  while (
+    trimmed.length > 0 && 
+    (trimmed[0].role === 'tool' || 
+    (trimmed[0].role === 'assistant' && !trimmed[0].content && trimmed[0].tool_calls))
+  ) {
+    trimmed = trimmed.slice(1)
+  }
+  
+  return [systemMessage, ...trimmed]
+}
+
 const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent.
 
 CRITICAL RULES TO SAVE TOKENS:
@@ -195,6 +214,19 @@ CRITICAL RULES TO SAVE TOKENS:
 - Maximum 3 retry attempts per element then try a different approach
 - If a cookie/consent popup appears, dismiss it FIRST before anything else using browser_click
 - Never click elements outside the viewport — scroll first using browser_scroll
+
+TOKEN SAVING RULES:
+- For Google searches: navigate directly to the URL with search query instead of typing in the search box. Example: navigate to https://www.google.com/search?q=your+search+query
+- Never read more than 3 search results
+- After finding the answer stop immediately — do not keep browsing
+- Keep all your responses under 100 words
+- Never explain what you are about to do — just do it
+- Never summarize what you already did — just report the final answer
+
+VIEWPORT RULE:
+- Before clicking ANY element, always call browser_scroll down first if the element might be below the fold
+- Never click 'Skip to main content' buttons — they are invisible helper elements, ignore them completely
+- If an element is outside viewport after scrolling, take a new snapshot and find a visible alternative
 
 HOW YOU WORK:
 - Call browser_snapshot to see the page — it shows interactive elements with refs like e1, e2
@@ -253,10 +285,7 @@ async function runAgentLoop(opts: {
     while (iterations < MAX_ITERATIONS && Date.now() < deadline) {
       iterations++
 
-      // Keep only last 10 messages to prevent context overflow
-      const trimmedMessages = messages.length > 10
-        ? [messages[0], ...messages.slice(-9)]
-        : messages
+      const trimmedMessages = trimMessages(messages)
 
       const response = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
