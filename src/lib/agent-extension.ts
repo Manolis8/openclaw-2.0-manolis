@@ -185,7 +185,16 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'github_create_issue', description: 'Create GitHub issue', parameters: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } }, required: ['owner', 'repo', 'title', 'body'] } } },
 ]
 
-const SYSTEM_PROMPT = `You are Felo, an AI browser agent controlling a real Chrome tab via Playwright.
+const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent.
+
+CRITICAL RULES TO SAVE TOKENS:
+- Keep your responses extremely concise
+- Never repeat what you already know
+- After a snapshot, only mention elements you plan to interact with
+- Never describe the full page — just what matters for the task
+- Maximum 3 retry attempts per element then try a different approach
+- If a cookie/consent popup appears, dismiss it FIRST before anything else using browser_click
+- Never click elements outside the viewport — scroll first using browser_scroll
 
 HOW YOU WORK:
 - Call browser_snapshot to see the page — it shows interactive elements with refs like e1, e2
@@ -244,9 +253,14 @@ async function runAgentLoop(opts: {
     while (iterations < MAX_ITERATIONS && Date.now() < deadline) {
       iterations++
 
+      // Keep only last 10 messages to prevent context overflow
+      const trimmedMessages = messages.length > 10
+        ? [messages[0], ...messages.slice(-9)]
+        : messages
+
       const response = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
-        messages,
+        messages: trimmedMessages,
         tools: browserTools,
         tool_choice: 'required',
         max_tokens: 1000,

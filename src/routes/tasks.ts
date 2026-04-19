@@ -85,6 +85,22 @@ tasksRouter.post('/create-task', async (req, res) => {
   if (!prompt || !userId) {
     return res.status(400).json({ error: 'Missing or invalid prompt or userId' })
   }
+
+  // Check daily task limit
+  const today = new Date().toISOString().split('T')[0]
+  const { count } = await supabase
+    .from('tasks')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .gte('created_at', `${today}T00:00:00.000Z`)
+
+  const DAILY_LIMIT = 20
+  if ((count || 0) >= DAILY_LIMIT) {
+    return res.status(429).json({
+      error: `Daily limit reached. You can run up to ${DAILY_LIMIT} tasks per day.`
+    })
+  }
+
   console.log(`Create task: userId=${userId}, extensionConnected=${isExtensionConnected(userId)}`)
   console.log(`All connected extensions: ${[...extensionConnections.keys()].join(', ')}`)
   const { data, error } = await supabase
