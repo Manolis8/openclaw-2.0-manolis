@@ -384,33 +384,72 @@ async function runAgentLoop(opts: {
               break
             }
             case 'browser_dismiss_cookie': {
-              consecutiveSnapshots = 0
               await opts.onProgress('🍪 Dismissing cookie popup...')
               const { browser, page } = await getPage(opts.userId)
               try {
-                await page.evaluate(() => {
-                  const selectors = [
-                    '[id*="onetrust"] button[class*="reject"]',
-                    '[id*="onetrust"] button[class*="decline"]', 
-                    '[id*="cookie"] button[class*="reject"]',
-                    '[id*="cookie"] button[class*="decline"]',
-                    '[id*="cookie"] button[class*="close"]',
-                    '.cookie-banner button',
+                const dismissed = await page.evaluate(() => {
+                  const DISMISS_SELECTORS = [
                     '#onetrust-reject-all-handler',
                     '#onetrust-accept-btn-handler',
-                    '[aria-label*="cookie" i] button',
+                    '.onetrust-close-btn-handler',
+                    '[aria-label="Reject all"]',
+                    '[aria-label="Decline all"]',
+                    '[aria-label="Accept all"]',
                     'button[id*="reject"]',
                     'button[id*="decline"]',
                     'button[id*="accept"]',
+                    'button[id*="close"]',
+                    'button[class*="reject"]',
+                    'button[class*="decline"]',
+                    'button[class*="close"]',
+                    'button[class*="cookie"]',
+                    '.cookie-banner button',
+                    '.cookie-notice button',
+                    '.cookie-consent button',
+                    '.cc-dismiss',
+                    '.cc-btn',
+                    '[data-cookiebanner] button',
+                    '[id*="cookie"] button',
+                    '[class*="cookie"] button',
+                    '[id*="consent"] button',
+                    '[class*="consent"] button',
+                    '[id*="gdpr"] button',
+                    '[class*="gdpr"] button',
                   ]
-                  for (const selector of selectors) {
-                    const el = document.querySelector(selector) as HTMLElement
-                    if (el) { el.click(); return }
+                  for (const selector of DISMISS_SELECTORS) {
+                    const el = document.querySelector(selector) as HTMLElement | null
+                    if (el && el.offsetParent !== null) {
+                      el.click()
+                      return `Clicked: ${selector}`
+                    }
                   }
+                  const overlaySelectors = [
+                    '#onetrust-consent-sdk',
+                    '.onetrust-pc-dark-filter',
+                    '[id*="cookie-banner"]',
+                    '[class*="cookie-banner"]',
+                    '[id*="cookie-notice"]',
+                    '[class*="cookie-notice"]',
+                    '[id*="consent-banner"]',
+                    '.cc-window',
+                    '#CybotCookiebotDialog',
+                    '.cookie-overlay',
+                  ]
+                  let removed = 0
+                  for (const selector of overlaySelectors) {
+                    const els = document.querySelectorAll(selector)
+                    els.forEach(el => {
+                      el.remove()
+                      removed++
+                    })
+                  }
+                  if (removed > 0) return `Removed ${removed} overlay elements`
+                  return 'No cookie popup found'
                 })
                 await new Promise(r => setTimeout(r, 1000))
                 result = await snapshotPage(opts.tabKey)
-                result = `Cookie dismissed. Page:\n${result}`
+                result = `Cookie handled: ${dismissed}\n\nPage after dismissal:\n${result}`
+                consecutiveSnapshots = 0
               } finally {
                 await browser.close()
               }
