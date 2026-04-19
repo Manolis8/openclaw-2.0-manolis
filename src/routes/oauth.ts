@@ -11,6 +11,8 @@ function sanitizeString(input: unknown, maxLength = 100): string | null {
 
 export const oauthRouter = Router()
 
+
+
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_KEY!

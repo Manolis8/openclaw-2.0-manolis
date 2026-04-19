@@ -9,7 +9,6 @@ interface RelayInfo {
   _wss: WebSocketServer
   _sessions: Map<string, Session>
 }
-
 const relayServers = new Map<string, RelayInfo>()
 
 // Real tab sessions announced by the extension via Target.attachedToTarget events

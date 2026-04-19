@@ -27,7 +27,7 @@ async function appendOutput(taskId: string, line: string) {
     .eq('id', taskId)
 }
 
-export async function runTaskInBackground(taskId: string, prompt: string, userId: string, useApiMode?: boolean) {
+export async function runTaskInBackground(taskId: string, prompt: string, userId: string, useApiMode?: boolean, keepTabOpen = false) {
   console.log(`runTaskInBackground: taskId=${taskId} userId=${userId}`)
   console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
   console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)
@@ -51,7 +51,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
     const taskPromise = runAgentWithExtension(prompt, userId, async (step) => {
       console.log(`[${taskId}] ${step}`)
       await appendOutput(taskId, step + '\n')
-    }, taskId)
+    }, taskId, keepTabOpen)
 
     const timeoutPromise = new Promise<string>((_, reject) =>
       setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
@@ -79,7 +79,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
 }
 
 tasksRouter.post('/create-task', async (req, res) => {
-  const { prompt: rawPrompt, userId: rawUserId, useApiMode } = req.body
+  const { prompt: rawPrompt, userId: rawUserId, useApiMode, keepTabOpen } = req.body
   const prompt = sanitizeString(rawPrompt, 2000)
   const userId = sanitizeString(rawUserId, 100)
   if (!prompt || !userId) {
@@ -97,7 +97,7 @@ tasksRouter.post('/create-task', async (req, res) => {
     return res.status(500).json({ error: 'Failed to create task' })
   }
   res.json({ taskId: data.id })
-  runTaskInBackground(data.id, prompt, userId, useApiMode)
+  runTaskInBackground(data.id, prompt, userId, useApiMode, keepTabOpen)
 })
 
 tasksRouter.get('/tasks/:userId', async (req, res) => {
@@ -223,7 +223,7 @@ tasksRouter.get('/admin/stats', async (req, res) => {
     return res.status(403).json({ error: 'Forbidden' })
   }
 
-  const [[users], [tasks], [feedback], [proWaitlist], [proInterest], [referrals]] = await Promise.all([
+  const [users, tasks, feedback, proWaitlist, proInterest, referrals] = await Promise.all([
     supabase.from('users').select('id', { count: 'exact', head: true }),
     supabase.from('tasks').select('id', { count: 'exact', head: true }),
     supabase.from('feedback').select('*'),

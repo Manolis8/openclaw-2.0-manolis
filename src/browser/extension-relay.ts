@@ -751,7 +751,7 @@ export async function ensureChromeExtensionRelayServer(opts: {
           return;
         }
         ws.send(JSON.stringify({ method: "ping" } satisfies ExtensionPingMessage));
-      }, 5000);
+      }, 10000);
 
       ws.on("message", (data) => {
         if (extensionWs !== ws) {

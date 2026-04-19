@@ -24,7 +24,6 @@ async function deriveRelayToken(gatewayToken: string, port: number): Promise<str
   const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`openclaw-extension-relay-v1:${port}`))
   return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
-
 const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
 
 async function getPage(userId: string) {
@@ -42,7 +41,7 @@ async function getPage(userId: string) {
   return { browser, page }
 }
 
-async function getUserIdFromTabKey(tabKey: string): string {
+function getUserIdFromTabKey(tabKey: string): string {
   return tabKey.split(':')[0]
 }
 
@@ -419,7 +418,8 @@ export async function runAgentWithExtension(
   task: string,
   userId: string,
   onStep: (step: string) => Promise<void>,
-  taskId?: string
+  taskId?: string,
+  keepTabOpen = false
 ): Promise<string> {
   const taskKey = taskId || `${userId}:${task.slice(0, 50)}`
   if (runningTasks.has(taskKey)) throw new Error('Task already running')
@@ -480,7 +480,7 @@ export async function runAgentWithExtension(
   } finally {
     runningTasks.delete(taskKey)
 
-    if (newTabId) {
+    if (newTabId && !keepTabOpen) {
       await new Promise(r => setTimeout(r, 3000))
       try {
         const { sendExtensionMessage: closeMsg } = await import('../index.js')
