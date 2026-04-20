@@ -108,20 +108,35 @@ setInterval(() => {
   }
 }, 3600000)
 
-function classifyMessage(message: string): boolean {
+async function classifyMessage(message: string): Promise<boolean> {
   const browserKeywords = [
-    'open', 'go to', 'navigate', 'search for', 'find me', 'check',
+    'open', 'go to', 'navigate', 'search', 'find', 'check',
     'look up', 'browse', 'visit', 'show me', 'get me', 'fetch',
-    'click', 'fill', 'submit', 'post', 'buy', 'book',
     'gmail', 'linkedin', 'twitter', 'youtube', 'amazon', 'instagram',
     'website', 'webpage', 'url', 'link', 'browser', 'tab',
     'notification', 'email', 'inbox', 'summarize my', 'check my',
-    'find plugins', 'find flights', 'find hotels', 'find prices',
-    'what are the', 'what is the price', 'who won', 'latest news',
-    'premier league', 'odeon', 'cinema', 'movie times', 'showtimes'
+    'news', 'latest', 'price', 'fixtures', 'cinema', 'film', 'movie',
+    'plugin', 'flight', 'hotel', 'restaurant', 'weather', 'score',
+    'ticket', 'buy', 'book', 'schedule', 'timetable', 'results',
+    'premier league', 'odeon', 'showtimes', 'who is', 'what is',
+    'how much', 'where can', 'when does', 'is there'
   ]
   const lower = message.toLowerCase()
-  return browserKeywords.some(kw => lower.includes(kw))
+  if (browserKeywords.some(kw => lower.includes(kw))) return true
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{
+        role: 'user',
+        content: `Does this message require opening a web browser or searching the internet to answer properly? Answer only YES or NO.\n\nMessage: "${message}"`
+      }],
+      max_tokens: 5
+    })
+    return response.choices[0].message.content?.trim().toUpperCase().startsWith('YES') ?? false
+  } catch {
+    return false
+  }
 }
 
 const runningTasksPerUser = new Map<string, boolean>()
@@ -218,7 +233,7 @@ tasksRouter.post('/chat', async (req, res) => {
   }
   session.lastActive = Date.now()
 
-  const needsBrowser = classifyMessage(message)
+  const needsBrowser = await classifyMessage(message)
 
   if (!needsBrowser) {
     session.messages.push({ role: 'user', content: message })
