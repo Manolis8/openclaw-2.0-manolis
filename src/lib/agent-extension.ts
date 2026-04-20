@@ -300,10 +300,23 @@ When ANY error mentions overlay, intercepts pointer events, cookie, or onetrust:
 1. Call browser_dismiss_cookie immediately
 2. Then continue
 
-## Reading Content
-- Use browser_read after navigating to get all text from the page
-- browser_read is fast and extracts everything — use it before browser_snapshot
-- After browser_read you have the information — compile it and call task_complete
+## Mandatory Reading Step
+After navigating to ANY page that has the information you need:
+1. ALWAYS call browser_dismiss_cookie first
+2. ALWAYS call browser_read to get the page text
+3. THEN call task_complete with everything you found
+You MUST call browser_read before task_complete. Never skip this step.
+Never click into articles — read the index/search results page directly with browser_read.
+For news tasks: navigate to the page, browser_read, task_complete. That is the full workflow.
+
+## Task Complete Format
+When calling task_complete, write the full answer like this:
+"Here are today's top headlines:
+- [headline 1]: [brief detail]
+- [headline 2]: [brief detail]
+- [headline 3]: [brief detail]
+(continue for all relevant results)"
+Never write less than 3 bullet points for news/research tasks.
 
 ## Google Search
 Always navigate directly: https://www.google.com/search?q=your+search+terms
