@@ -307,7 +307,7 @@ tasksRouter.post('/chat', async (req, res) => {
     .select('*', { count: 'exact', head: true })
     .eq('user_id', userId)
     .gte('created_at', `${today}T00:00:00.000Z`)
-  const DAILY_LIMIT = 30
+  const DAILY_LIMIT = 20
 
   // Load real conversation history from Supabase
   const { data: historyRows } = await supabase
