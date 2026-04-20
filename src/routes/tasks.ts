@@ -3,6 +3,10 @@ import { supabase } from '../lib/supabase.js'
 import { isExtensionConnected, extensionConnections } from '../index.js'
 import { runAgentWithExtension } from '../lib/agent-extension.js'
 import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
+import OpenAI from 'openai'
+import { createHash } from 'node:crypto'
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
 function sanitizeString(input: unknown, maxLength = 100): string | null {
   if (typeof input !== 'string') return null
@@ -10,7 +14,115 @@ function sanitizeString(input: unknown, maxLength = 100): string | null {
   return trimmed.length > 0 && trimmed.length <= maxLength ? trimmed : null
 }
 
+type ToolHistoryEntry = {
+  toolName: string
+  argsHash: string
+  resultHash?: string
+  timestamp: number
+}
+
+const taskToolHistory = new Map<string, ToolHistoryEntry[]>()
+
+function hashValue(value: unknown): string {
+  try {
+    const str = JSON.stringify(value) || String(value)
+    return createHash('sha256').update(str).digest('hex').slice(0, 16)
+  } catch {
+    return String(value).slice(0, 16)
+  }
+}
+
+function detectLoop(taskId: string, toolName: string, args: unknown, result?: string): {
+  stuck: boolean
+  level?: 'warning' | 'critical'
+  message?: string
+} {
+  if (!taskToolHistory.has(taskId)) {
+    taskToolHistory.set(taskId, [])
+  }
+  const history = taskToolHistory.get(taskId)!
+  const argsHash = `${toolName}:${hashValue(args)}`
+  const resultHash = result ? hashValue(result.slice(0, 500)) : undefined
+
+  history.push({ toolName, argsHash, resultHash, timestamp: Date.now() })
+
+  if (history.length > 30) history.shift()
+
+  const identicalResults = history.filter(h =>
+    h.argsHash === argsHash && h.resultHash && h.resultHash === resultHash
+  ).length
+
+  if (identicalResults >= 5) {
+    return {
+      stuck: true,
+      level: 'critical',
+      message: `CRITICAL: You have called ${toolName} ${identicalResults} times and got the same result each time. Nothing is changing. You MUST now call task_failed with a clear explanation of what you tried.`
+    }
+  }
+
+  if (identicalResults >= 3) {
+    return {
+      stuck: true,
+      level: 'warning',
+      message: `WARNING: ${toolName} returned the same result ${identicalResults} times in a row. The page is not changing. Try a completely different approach or call task_failed.`
+    }
+  }
+
+  if (history.length >= 6) {
+    const last6 = history.slice(-6)
+    const tools = last6.map(h => h.toolName)
+    const isPingPong = tools.every((t, i) => i === 0 || t === tools[i % 2])
+    const allSameResults = last6.every(h => h.resultHash === last6[0]?.resultHash)
+    if (isPingPong && allSameResults && new Set(tools).size === 2) {
+      return {
+        stuck: true,
+        level: 'warning',
+        message: `WARNING: You are alternating between ${tools[0]} and ${tools[1]} with no progress. This is a stuck loop. Stop and call task_failed.`
+      }
+    }
+  }
+
+  return { stuck: false }
+}
+
+function cleanupTaskHistory(taskId: string) {
+  taskToolHistory.delete(taskId)
+}
+
+export { detectLoop, cleanupTaskHistory }
+
 export const tasksRouter = Router()
+
+type ChatSession = {
+  messages: Array<{ role: string; content: string }>
+  userId: string
+  lastActive: number
+}
+
+const chatSessions = new Map<string, ChatSession>()
+
+setInterval(() => {
+  const cutoff = Date.now() - 3600000
+  for (const [id, session] of chatSessions) {
+    if (session.lastActive < cutoff) chatSessions.delete(id)
+  }
+}, 3600000)
+
+function classifyMessage(message: string): boolean {
+  const browserKeywords = [
+    'open', 'go to', 'navigate', 'search for', 'find me', 'check',
+    'look up', 'browse', 'visit', 'show me', 'get me', 'fetch',
+    'click', 'fill', 'submit', 'post', 'buy', 'book',
+    'gmail', 'linkedin', 'twitter', 'youtube', 'amazon', 'instagram',
+    'website', 'webpage', 'url', 'link', 'browser', 'tab',
+    'notification', 'email', 'inbox', 'summarize my', 'check my',
+    'find plugins', 'find flights', 'find hotels', 'find prices',
+    'what are the', 'what is the price', 'who won', 'latest news',
+    'premier league', 'odeon', 'cinema', 'movie times', 'showtimes'
+  ]
+  const lower = message.toLowerCase()
+  return browserKeywords.some(kw => lower.includes(kw))
+}
 
 const runningTasksPerUser = new Map<string, boolean>()
 
@@ -77,8 +189,75 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
     await createMessage(userId, taskId, '❌ Task failed. Please try again.')
   } finally {
     runningTasksPerUser.delete(userId)
+    cleanupTaskHistory(taskId)
   }
 }
+
+tasksRouter.post('/chat', async (req, res) => {
+  const { message: rawMessage, userId: rawUserId, sessionId: rawSessionId } = req.body
+  const message = sanitizeString(rawMessage, 2000)
+  const userId = sanitizeString(rawUserId, 100)
+  const sessionId = sanitizeString(rawSessionId, 100)
+  if (!message || !userId || !sessionId) {
+    return res.status(400).json({ error: 'Missing required fields' })
+  }
+
+  const today = new Date().toISOString().split('T')[0]
+  const { count } = await supabase
+    .from('tasks')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .gte('created_at', `${today}T00:00:00.000Z`)
+
+  const DAILY_LIMIT = 20
+
+  let session = chatSessions.get(sessionId)
+  if (!session) {
+    session = { messages: [], userId, lastActive: Date.now() }
+    chatSessions.set(sessionId, session)
+  }
+  session.lastActive = Date.now()
+
+  const needsBrowser = classifyMessage(message)
+
+  if (!needsBrowser) {
+    session.messages.push({ role: 'user', content: message })
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are Unclawned, a helpful AI assistant that can also control the user's Chrome browser to do tasks on websites. Be concise, friendly, and helpful. If the user asks you to do something on a website, tell them you will open the browser and do it. If they ask a general question, answer it directly. Keep responses under 150 words.`
+        },
+        ...session.messages.slice(-10).map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content
+        }))
+      ],
+      max_tokens: 300
+    })
+    const reply = response.choices[0].message.content || 'I am not sure how to help with that.'
+    session.messages.push({ role: 'assistant', content: reply })
+    return res.json({ reply, usesBrowser: false })
+  }
+
+  if ((count || 0) >= DAILY_LIMIT) {
+    return res.json({
+      reply: `You have reached your daily limit of ${DAILY_LIMIT} tasks. Come back tomorrow!`,
+      usesBrowser: false
+    })
+  }
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .insert({ user_id: userId, prompt: message, output: '', status: 'running' })
+    .select().single()
+
+  if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
+
+  res.json({ taskId: data.id, usesBrowser: true })
+  runTaskInBackground(data.id, message, userId, false, false)
+})
 
 tasksRouter.post('/create-task', async (req, res) => {
   const { prompt: rawPrompt, userId: rawUserId, useApiMode, keepTabOpen } = req.body

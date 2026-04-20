@@ -2,6 +2,7 @@ import OpenAI from 'openai'
 import { chromium, type Browser, type Page } from 'playwright-core'
 import { supabase } from './supabase.js'
 import { getRelayPortForUser } from '../index.js'
+import { detectLoop } from '../routes/tasks.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
@@ -392,6 +393,11 @@ async function runAgentLoop(opts: {
         const args = JSON.parse(toolCall.function.arguments || '{}')
         let result: string
 
+        const loopCheck = detectLoop(opts.taskId, toolCall.function.name, args)
+        if (loopCheck.stuck && loopCheck.level === 'critical') {
+          return { success: false, summary: loopCheck.message || 'Stuck in a loop' }
+        }
+
         try {
           switch (toolCall.function.name) {
             case 'browser_snapshot': {
@@ -475,6 +481,12 @@ async function runAgentLoop(opts: {
           const ref = args?.ref || args?.url || toolCall.function.name
           result = toAIFriendlyError(err, ref)
           await opts.onProgress(`⚠️ ${result}`)
+        }
+
+        detectLoop(opts.taskId, toolCall.function.name, args, result)
+
+        if (loopCheck.stuck && loopCheck.level === 'warning') {
+          result += `\n\n${loopCheck.message}`
         }
 
         toolResults.push({ role: 'tool', tool_call_id: toolCall.id, content: result })
