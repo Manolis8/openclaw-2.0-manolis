@@ -354,6 +354,7 @@ async function runAgentLoop(opts: {
   taskPrompt: string
   tabKey: string
   onProgress: (msg: string) => Promise<void>
+  abortSignal?: AbortSignal
 }): Promise<{ success: boolean; summary: string }> {
   const MAX_ITERATIONS = 15
   const deadline = Date.now() + 90_000
@@ -373,6 +374,9 @@ async function runAgentLoop(opts: {
     let retryReason = ''
 
     while (iterations < MAX_ITERATIONS && Date.now() < deadline) {
+      if (opts.abortSignal?.aborted) {
+        return { success: false, summary: 'Task stopped by user.' }
+      }
       iterations++
 
       const response = await openai.chat.completions.create({
@@ -396,6 +400,10 @@ async function runAgentLoop(opts: {
         const loopCheck = detectLoop(opts.taskId, toolCall.function.name, args)
         if (loopCheck.stuck && loopCheck.level === 'critical') {
           return { success: false, summary: loopCheck.message || 'Stuck in a loop' }
+        }
+
+        if (opts.abortSignal?.aborted) {
+          return { success: false, summary: 'Task stopped by user.' }
         }
 
         try {
@@ -511,8 +519,11 @@ export async function runAgentWithExtension(
   userId: string,
   onStep: (step: string) => Promise<void>,
   taskId?: string,
-  keepTabOpen = false
+  keepTabOpen = false,
+  abortSignal?: AbortSignal
 ): Promise<string> {
+  if (abortSignal?.aborted) return 'Task stopped by user.'
+
   const taskKey = taskId || `${userId}:${task.slice(0, 50)}`
   if (runningTasks.has(taskKey)) throw new Error('Task already running')
   runningTasks.add(taskKey)
@@ -538,7 +549,8 @@ export async function runAgentWithExtension(
       taskId: taskId || taskKey,
       taskPrompt: task,
       tabKey,
-      onProgress: onStep
+      onProgress: onStep,
+      abortSignal
     })
 
     return result.summary

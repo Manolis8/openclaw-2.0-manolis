@@ -140,6 +140,9 @@ async function classifyMessage(message: string): Promise<boolean> {
 }
 
 const runningTasksPerUser = new Map<string, boolean>()
+const taskAbortControllers = new Map<string, AbortController>()
+
+export { taskAbortControllers }
 
 async function appendOutput(taskId: string, line: string) {
   const { data } = await supabase
@@ -170,15 +173,18 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   runningTasksPerUser.set(userId, true)
 
   const TASK_TIMEOUT_MS = 120_000 // 2 minutes
+  const controller = new AbortController()
+  taskAbortControllers.set(taskId, controller)
 
   // Always use cloud browser (agent-extension.ts) for reliability
   // The agent-extension.ts uses aria-snapshot which is more reliable than CSS selectors
   await appendOutput(taskId, '☁️ Starting browser agent...\n')
   try {
     const taskPromise = runAgentWithExtension(prompt, userId, async (step) => {
+      if (controller.signal.aborted) return
       console.log(`[${taskId}] ${step}`)
       await appendOutput(taskId, step + '\n')
-    }, taskId, keepTabOpen)
+    }, taskId, keepTabOpen, controller.signal)
 
     const timeoutPromise = new Promise<string>((_, reject) =>
       setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
@@ -203,6 +209,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
 
     await createMessage(userId, taskId, '❌ Task failed. Please try again.')
   } finally {
+    taskAbortControllers.delete(taskId)
     runningTasksPerUser.delete(userId)
     cleanupTaskHistory(taskId)
   }
@@ -324,13 +331,24 @@ tasksRouter.get('/tasks/:userId', async (req, res) => {
 
 tasksRouter.post('/tasks/:taskId/stop', async (req, res) => {
   const { taskId } = req.params
-  const { userId } = req.body
-  if (!taskId || !userId) return res.status(400).json({ error: 'Missing taskId or userId' })
+  const { userId: rawUserId } = req.body
+  const userId = sanitizeString(rawUserId, 100)
+  if (!taskId || !userId) return res.status(400).json({ error: 'Missing fields' })
 
+  const controller = taskAbortControllers.get(taskId)
+  if (controller) {
+    controller.abort()
+    taskAbortControllers.delete(taskId)
+  }
+
+  const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
   await supabase.from('tasks').update({
     status: 'done',
-    output: supabase.rpc('append_output', { task_id: taskId, line: '\n⏹️ Task stopped by user.' })
+    output: (data?.output || '') + '\n⏹️ Task stopped by user.'
   }).eq('id', taskId).eq('user_id', userId)
+
+  runningTasksPerUser.delete(userId)
+  cleanupTaskHistory(taskId)
 
   res.json({ ok: true })
 })
