@@ -322,6 +322,19 @@ tasksRouter.get('/tasks/:userId', async (req, res) => {
   res.json(data || [])
 })
 
+tasksRouter.post('/tasks/:taskId/stop', async (req, res) => {
+  const { taskId } = req.params
+  const { userId } = req.body
+  if (!taskId || !userId) return res.status(400).json({ error: 'Missing taskId or userId' })
+
+  await supabase.from('tasks').update({
+    status: 'done',
+    output: supabase.rpc('append_output', { task_id: taskId, line: '\n⏹️ Task stopped by user.' })
+  }).eq('id', taskId).eq('user_id', userId)
+
+  res.json({ ok: true })
+})
+
 tasksRouter.post('/refresh-token', async (req, res) => {
   const { refreshToken: rawToken } = req.body
   const refreshToken = sanitizeString(rawToken, 2000)
