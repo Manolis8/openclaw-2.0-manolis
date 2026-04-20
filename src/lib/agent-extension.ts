@@ -356,8 +356,8 @@ async function runAgentLoop(opts: {
   onProgress: (msg: string) => Promise<void>
   abortSignal?: AbortSignal
 }): Promise<{ success: boolean; summary: string }> {
-  const MAX_ITERATIONS = 15
-  const deadline = Date.now() + 90_000
+  const MAX_ITERATIONS = 25
+  const deadline = Date.now() + 150_000
   let consecutiveSnapshots = 0
 
   for (let attempt = 0; attempt < 2; attempt++) {

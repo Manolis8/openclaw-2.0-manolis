@@ -185,24 +185,27 @@ async function classifyMessage(message: string): Promise<boolean> {
     'plugin', 'flight', 'hotel', 'restaurant', 'weather', 'score',
     'ticket', 'buy', 'book', 'schedule', 'timetable', 'results',
     'premier league', 'odeon', 'showtimes', 'who is', 'what is',
-    'how much', 'where can', 'when does', 'is there'
+    'how much', 'where can', 'when does', 'is there',
+    'do it again', 'try again', 'do the first', 'redo', 'repeat',
+    'same thing', 'do that again', 'do it', 'open it', 'go back',
+    'previous task', 'do what i said', 'as i said', 'like before',
+    'told you to', 'asked you to'
   ]
   const lower = message.toLowerCase()
   if (browserKeywords.some(kw => lower.includes(kw))) return true
 
-  try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{
-        role: 'user',
-        content: `Does this message require opening a web browser or searching the internet to answer properly? Answer only YES or NO.\n\nMessage: "${message}"`
-      }],
-      max_tokens: 5
-    })
-    return response.choices[0].message.content?.trim().toUpperCase().startsWith('YES') ?? false
-  } catch {
+  const chatOnlyKeywords = [
+    'what are you', 'who are you', 'how are you', 'what can you do',
+    'help me understand', 'explain', 'what is', 'what does', 'define',
+    'hello', 'hi ', 'hey', 'thanks', 'thank you', 'good morning',
+    'what time', 'how do i', 'can you help', 'tell me about yourself'
+  ]
+
+  if (chatOnlyKeywords.some(kw => lower.includes(kw)) && message.split(' ').length < 6) {
     return false
   }
+
+  return true
 }
 
 const runningTasksPerUser = new Map<string, boolean>()
@@ -238,7 +241,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   }
   runningTasksPerUser.set(userId, true)
 
-  const TASK_TIMEOUT_MS = 120_000 // 2 minutes
+  const TASK_TIMEOUT_MS = 180_000
   const controller = new AbortController()
   taskAbortControllers.set(taskId, controller)
 
