@@ -265,6 +265,7 @@ async function dismissCookie(userId: string, tabKey: string): Promise<string> {
 
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'browser_snapshot', description: 'Read the current page. Returns interactive elements with refs like e1, e2. Call this first and after every navigation.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'browser_read', description: 'Extract all readable text content from the current page. Use this to read articles, news, search results, or any page content. Much more efficient than snapshot for reading.', parameters: { type: 'object', properties: {}, required: [] } } },
   { type: 'function', function: { name: 'browser_navigate', description: 'Navigate to a URL. Always use full https:// URLs. For Google search go directly to https://www.google.com/search?q=your+query', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'browser_click', description: 'Click element by ref from last snapshot. If error says blocked by overlay call browser_dismiss_cookie first.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] } } },
   { type: 'function', function: { name: 'browser_type', description: 'Type text into a ref element.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
@@ -309,6 +310,12 @@ You must: click something, scroll, navigate, dismiss cookie, or call task_failed
 Never go to google.com and type. Always navigate directly:
 https://www.google.com/search?q=your+search+terms
 
+## Reading Page Content
+When you need to read text from a page (news, articles, search results):
+- Use browser_read instead of browser_snapshot
+- browser_read extracts all readable text efficiently
+- Only use browser_snapshot when you need to find interactive elements to click
+
 ## Strict Rules
 - Never click "Skip to main content" — ignore it always
 - Never try to log in — call task_failed if you see a login page
@@ -319,19 +326,16 @@ https://www.google.com/search?q=your+search+terms
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
 function trimMessages(messages: any[]): any[] {
-  if (messages.length <= 8) return messages
+  if (messages.length <= 30) return messages
   const system = messages[0]
-  let rest = messages.slice(1).slice(-7)
-  // Never start with a tool message — no matching tool_call
+  let rest = messages.slice(1).slice(-28)
   while (rest.length > 0 && rest[0].role === 'tool') rest = rest.slice(1)
-  // Never start with assistant tool_calls that have no content
   while (
     rest.length > 0 &&
     rest[0].role === 'assistant' &&
     rest[0].tool_calls?.length > 0 &&
     !rest[0].content
   ) rest = rest.slice(1)
-  // Verify every tool message has a matching assistant tool_call before it
   const verified: any[] = []
   for (const msg of rest) {
     if (msg.role === 'tool') {
@@ -356,8 +360,8 @@ async function runAgentLoop(opts: {
   onProgress: (msg: string) => Promise<void>
   abortSignal?: AbortSignal
 }): Promise<{ success: boolean; summary: string }> {
-  const MAX_ITERATIONS = 25
-  const deadline = Date.now() + 150_000
+  const MAX_ITERATIONS = 30
+  const deadline = Date.now() + 240_000
   let consecutiveSnapshots = 0
 
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -384,7 +388,7 @@ async function runAgentLoop(opts: {
         messages: trimMessages(messages),
         tools: browserTools,
         tool_choice: 'required',
-        max_tokens: 500,
+        max_tokens: 2000,
       })
 
       const msg = response.choices[0].message
@@ -462,6 +466,20 @@ async function runAgentLoop(opts: {
               consecutiveSnapshots = 0
               await opts.onProgress('🍪 Dismissing cookie popup...')
               result = await dismissCookie(opts.userId, opts.tabKey)
+              break
+            }
+            case 'browser_read': {
+              consecutiveSnapshots = 0
+              await opts.onProgress('📖 Reading page content...')
+              const { page } = await getBrowser(opts.userId)
+              const content = await page.evaluate(() => {
+                const remove = document.querySelectorAll('script, style, nav, header, footer, aside, .ad, .advertisement, .cookie, .popup')
+                remove.forEach(el => el.remove())
+                const main = document.querySelector('main, article, [role="main"], .content, #content, #main') as HTMLElement | null
+                const text = main ? main.innerText : document.body.innerText
+                return text.replace(/\n{3,}/g, '\n\n').trim().slice(0, 3000)
+              })
+              result = `Page content:\n${content}`
               break
             }
             case 'browser_wait': {

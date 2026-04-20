@@ -241,7 +241,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   }
   runningTasksPerUser.set(userId, true)
 
-  const TASK_TIMEOUT_MS = 180_000
+  const TASK_TIMEOUT_MS = 240_000
   const controller = new AbortController()
   taskAbortControllers.set(taskId, controller)
 
