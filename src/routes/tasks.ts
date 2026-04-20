@@ -108,6 +108,72 @@ setInterval(() => {
   }
 }, 3600000)
 
+async function summarizeChunk(
+  messages: Array<{ role: string; content: string }>,
+  maxWords: number
+): Promise<string> {
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      {
+        role: 'system',
+        content: `Summarize in max ${maxWords} words. Only keep: names, key facts, completed tasks, user preferences. Be extremely brief.`
+      },
+      {
+        role: 'user',
+        content: messages.map(m => `${m.role}: ${m.content}`).join('\n')
+      }
+    ],
+    max_tokens: Math.ceil(maxWords * 1.5)
+  })
+  return response.choices[0].message.content || ''
+}
+
+async function compactHistory(
+  messages: Array<{ role: string; content: string }>,
+  windowSize = 10
+): Promise<Array<{ role: string; content: string }>> {
+  const total = messages.length
+
+  if (total <= windowSize) return messages
+
+  const chunks: Array<Array<{ role: string; content: string }>> = []
+  for (let i = 0; i < total; i += windowSize) {
+    chunks.push(messages.slice(i, i + windowSize))
+  }
+
+  const lastChunk = chunks[chunks.length - 1]
+  const middleChunk = chunks.length >= 2 ? chunks[chunks.length - 2] : null
+  const oldChunks = chunks.slice(0, chunks.length - 2)
+
+  const result: Array<{ role: string; content: string }> = []
+
+  if (oldChunks.length > 0) {
+    try {
+      const allOld = oldChunks.flat()
+      const shortSummary = await summarizeChunk(allOld, 40)
+      result.push({
+        role: 'system',
+        content: `[Distant past: ${shortSummary}]`
+      })
+    } catch {}
+  }
+
+  if (middleChunk) {
+    try {
+      const fullSummary = await summarizeChunk(middleChunk, 80)
+      result.push({
+        role: 'system',
+        content: `[Earlier: ${fullSummary}]`
+      })
+    } catch {}
+  }
+
+  result.push(...lastChunk)
+
+  return result
+}
+
 async function classifyMessage(message: string): Promise<boolean> {
   const browserKeywords = [
     'open', 'go to', 'navigate', 'search', 'find', 'check',
@@ -215,6 +281,13 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   }
 }
 
+const CHAT_SYSTEM_PROMPT = `You are Unclawned, a personal AI assistant that can also control the user's Chrome browser to complete tasks on any website.
+
+When the user asks a general question or wants to chat, answer directly.
+When they ask you to do something on a website, open the browser and do it.
+Remember everything said earlier in this conversation and use it naturally.
+Be concise and friendly. Never write more than needed.`
+
 tasksRouter.post('/chat', async (req, res) => {
   const { message: rawMessage, userId: rawUserId, sessionId: rawSessionId } = req.body
   const message = sanitizeString(rawMessage, 2000)
@@ -224,42 +297,46 @@ tasksRouter.post('/chat', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' })
   }
 
+  // Check daily limit
   const today = new Date().toISOString().split('T')[0]
   const { count } = await supabase
     .from('tasks')
     .select('*', { count: 'exact', head: true })
     .eq('user_id', userId)
     .gte('created_at', `${today}T00:00:00.000Z`)
-
   const DAILY_LIMIT = 20
 
-  let session = chatSessions.get(sessionId)
-  if (!session) {
-    session = { messages: [], userId, lastActive: Date.now() }
-    chatSessions.set(sessionId, session)
-  }
-  session.lastActive = Date.now()
+  // Load real conversation history from Supabase
+  const { data: historyRows } = await supabase
+    .from('chat_messages')
+    .select('role, content')
+    .eq('chat_id', sessionId)
+    .order('created_at', { ascending: true })
+    .limit(50)
+
+  const history = (historyRows || [])
+    .filter((m: any) => m.content && m.content.trim())
+    .map((m: any) => ({ role: m.role as string, content: m.content as string }))
+
+  // Compact if too long
+  const compactedHistory = await compactHistory(history, 8)
 
   const needsBrowser = await classifyMessage(message)
 
   if (!needsBrowser) {
-    session.messages.push({ role: 'user', content: message })
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        {
-          role: 'system',
-          content: `You are Unclawned, a helpful AI assistant that can also control the user's Chrome browser to do tasks on websites. Be concise, friendly, and helpful. If the user asks you to do something on a website, tell them you will open the browser and do it. If they ask a general question, answer it directly. Keep responses under 150 words.`
-        },
-        ...session.messages.slice(-10).map(m => ({
-          role: m.role as 'user' | 'assistant',
+        { role: 'system', content: CHAT_SYSTEM_PROMPT },
+        ...compactedHistory.map(m => ({
+          role: m.role as 'user' | 'assistant' | 'system',
           content: m.content
-        }))
+        })),
+        { role: 'user', content: message }
       ],
-      max_tokens: 300
+      max_tokens: 400
     })
     const reply = response.choices[0].message.content || 'I am not sure how to help with that.'
-    session.messages.push({ role: 'assistant', content: reply })
     return res.json({ reply, usesBrowser: false })
   }
 
