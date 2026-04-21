@@ -287,6 +287,14 @@ When you navigate to a page, you automatically receive:
 - INTERACTIVE ELEMENTS: refs for clicking
 
 ## Your Job
+## CRITICAL RULE FOR SEARCH RESULTS
+When you receive search results after navigating to Google:
+- The results are already in the PAGE CONTENT
+- Do NOT click any links
+- Do NOT navigate to individual articles
+- IMMEDIATELY call task_complete with the search results formatted as bullet points
+- Clicking links wastes iterations and makes tasks fail
+
 1. Navigate to the right page
 2. Read the PAGE CONTENT you received
 3. Call task_complete with the full answer
@@ -467,7 +475,11 @@ async function runAgentLoop(opts: {
               }, isGoogleSearch).catch(() => '')
               // Also get interactive elements for clicking
               const snapshot = await snapshotPage(opts.userId, opts.tabKey)
-              result = `Navigated to ${args.url}.\n\nPAGE CONTENT:\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
+              if (isGoogleSearch) {
+                result = `Search results for ${args.url}:\n${content}\n\nYOU HAVE THE INFORMATION. Do NOT click any links. Do NOT navigate further. Call task_complete NOW with all the information above formatted as bullet points.`
+              } else {
+                result = `Navigated to ${args.url}.\n\nPAGE CONTENT:\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
+              }
               break
             }
             case 'browser_click': {
