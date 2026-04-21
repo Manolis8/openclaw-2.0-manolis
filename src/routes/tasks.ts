@@ -189,7 +189,10 @@ async function classifyMessage(message: string): Promise<boolean> {
     'do it again', 'try again', 'do the first', 'redo', 'repeat',
     'same thing', 'do that again', 'do it', 'open it', 'go back',
     'previous task', 'do what i said', 'as i said', 'like before',
-    'told you to', 'asked you to'
+    'told you to', 'asked you to',
+    'tell me more', 'more details', 'give me more', 'expand on',
+    'more about', 'go deeper', 'read more', 'find out more',
+    'more info', 'what else', 'continue', 'keep going'
   ]
   const lower = message.toLowerCase()
   if (browserKeywords.some(kw => lower.includes(kw))) return true
@@ -226,7 +229,7 @@ async function appendOutput(taskId: string, line: string) {
     .eq('id', taskId)
 }
 
-export async function runTaskInBackground(taskId: string, prompt: string, userId: string, useApiMode?: boolean, keepTabOpen = false) {
+export async function runTaskInBackground(taskId: string, prompt: string, userId: string, useApiMode?: boolean, keepTabOpen = false, context?: string) {
   console.log(`runTaskInBackground: taskId=${taskId} userId=${userId}`)
   console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
   console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)
@@ -253,7 +256,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       if (controller.signal.aborted) return
       console.log(`[${taskId}] ${step}`)
       await appendOutput(taskId, step + '\n')
-    }, taskId, keepTabOpen, controller.signal)
+    }, taskId, keepTabOpen, context, controller.signal)
 
     const timeoutPromise = new Promise<string>((_, reject) =>
       setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
@@ -310,36 +313,39 @@ tasksRouter.post('/chat', async (req, res) => {
   const DAILY_LIMIT = 20
 
   // Load real conversation history from Supabase (most recent last for emphasis)
-  const { data: historyRows } = await supabase
-    .from('chat_messages')
-    .select('role, content')
-    .eq('chat_id', sessionId)
-    .order('created_at', { ascending: false })
-    .limit(6)
+  let context = ''
+  let historyRows: any[] = []
+  if (sessionId) {
+    try {
+      const { data } = await supabase
+        .from('chat_messages')
+        .select('role, content')
+        .eq('chat_id', sessionId)
+        .order('created_at', { ascending: false })
+        .limit(6)
+      historyRows = data || []
+      if (historyRows.length > 0) {
+        const reversed = historyRows.reverse()
+        const lastAssistant = reversed.filter((m: any) => m.role === 'assistant').pop()
+        const lastUser = reversed.filter((m: any) => m.role === 'user').pop()
+        context = `CONVERSATION HISTORY:\n` +
+          reversed
+            .filter((m: any) => m.content?.trim())
+            .map((m: any) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 500)}`)
+            .join('\n') +
+          `\n\nLAST TOPIC DISCUSSED: ${lastAssistant?.content?.slice(0, 200) || 'none'}\n` +
+          `USER'S FOLLOW-UP REQUEST: "${lastUser?.content || message}"\n` +
+          `\nIF THE USER IS ASKING FOR MORE/DETAILS/AGAIN: Search for the LAST TOPIC using a more specific query. Extract the main subject from LAST TOPIC DISCUSSED and search for that with "detailed" or "in depth" added.`
+      }
+    } catch {}
+  }
 
   const history = (historyRows || [])
     .filter((m: any) => m.content && m.content.trim())
-    .reverse()
     .map((m: any) => ({ role: m.role as string, content: m.content as string }))
 
   // Compact if too long
   const compactedHistory = await compactHistory(history, 8)
-
-  // Add emphasis note about recent message for "tell me more" scenarios
-  let context = ''
-  if (compactedHistory.length > 0) {
-    context = `CONVERSATION HISTORY:\n` +
-      compactedHistory
-        .filter((m: any) => m.content?.trim())
-        .map((m: any) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 500)}`)
-        .join('\n') +
-      `\n\nCRITICAL MEMORY RULES:
-- If user says "do the same", "do it again", "more details", "tell me more" — look at the LAST Assistant message to understand what topic was discussed and repeat/expand on THAT exact topic
-- If the last Assistant message was about stocks, "do the same" means stocks
-- If the last Assistant message was about Iran news, "more details" means Iran news
-- NEVER default to generic "latest news" — always use the specific topic from conversation history
-- When user asks for more details, search for the SAME topic with more specific query`
-  }
 
   const needsBrowser = await classifyMessage(message)
 
@@ -375,7 +381,7 @@ tasksRouter.post('/chat', async (req, res) => {
   if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
 
   res.json({ taskId: data.id, usesBrowser: true })
-  runTaskInBackground(data.id, message, userId, false, false)
+  runTaskInBackground(data.id, message, userId, false, false, context)
 })
 
 tasksRouter.post('/create-task', async (req, res) => {

@@ -287,13 +287,15 @@ When you navigate to a page, you automatically receive:
 - INTERACTIVE ELEMENTS: refs for clicking
 
 ## Your Job
-## CRITICAL RULE FOR SEARCH RESULTS
-When you receive search results after navigating to Google:
-- The results are already in the PAGE CONTENT
-- Do NOT click any links
-- Do NOT navigate to individual articles
-- IMMEDIATELY call task_complete with the search results formatted as bullet points
-- Clicking links wastes iterations and makes tasks fail
+## For Search Tasks
+After getting search results you have two options:
+A) If task wants a quick overview: call task_complete with all titles and snippets as bullet points
+B) If task wants details/more info: navigate to the top 2-3 article URLs from results, use browser_read on each, then call task_complete with comprehensive content from all articles
+
+Always choose B when the user says "more details", "tell me more", "in depth", "read the articles"
+Always choose A for quick queries like "what's in the news today"
+
+For task_complete: write at minimum 300 words with real specific information — not vague summaries
 
 1. Navigate to the right page
 2. Read the PAGE CONTENT you received
@@ -357,6 +359,7 @@ async function runAgentLoop(opts: {
   taskPrompt: string
   tabKey: string
   onProgress: (msg: string) => Promise<void>
+  context?: string
   abortSignal?: AbortSignal
 }): Promise<{ success: boolean; summary: string }> {
   const MAX_ITERATIONS = 30
@@ -364,11 +367,15 @@ async function runAgentLoop(opts: {
   let consecutiveSnapshots = 0
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    const finalPrompt = opts.context
+      ? `${opts.context}\n\n---\nBased on the conversation above, the user is asking: "${opts.taskPrompt}"\nIf this is a follow-up like "more details", "do it again", "tell me more" — identify the specific topic from the last Assistant message and search for that topic with more detail. Do NOT search for the literal words the user typed.`
+      : opts.taskPrompt
+
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: attempt === 0
-        ? opts.taskPrompt
-        : `${opts.taskPrompt}\n\nPrevious attempt failed. Try a completely different approach.`
+        ? finalPrompt
+        : `${finalPrompt}\n\nPrevious attempt failed. Try a completely different approach.`
       }
     ]
 
@@ -387,7 +394,7 @@ async function runAgentLoop(opts: {
         messages: trimMessages(messages),
         tools: browserTools,
         tool_choice: 'required',
-        max_tokens: 2000,
+        max_tokens: 4000,
       })
 
       const msg = response.choices[0].message
@@ -449,23 +456,23 @@ async function runAgentLoop(opts: {
                   document.querySelectorAll('.g, [data-hveid]').forEach(el => {
                     const title = el.querySelector('h3')
                     const snippet = el.querySelector('.VwiC3b, .MUxGbd, [data-sncf], .s3v9rd')
+                    const link = el.querySelector('a') as HTMLAnchorElement | null
                     if (title) {
                       const titleText = (title as HTMLElement).innerText.trim()
                       const snippetText = snippet ? (snippet as HTMLElement).innerText.trim() : ''
+                      const href = link?.href || ''
                       if (titleText && titleText.length > 5) {
-                        results.push(snippetText ? `${titleText}: ${snippetText}` : titleText)
+                        results.push(`TITLE: ${titleText}\nSNIPPET: ${snippetText}\nURL: ${href}`)
                       }
                     }
                   })
-                  if (results.length > 0) {
-                    return results.slice(0, 20).join('\n')
-                  }
+                  if (results.length > 0) return results.slice(0, 10).join('\n---\n')
                   const h3s = Array.from(document.querySelectorAll('h3'))
                     .map(el => (el as HTMLElement).innerText.trim())
                     .filter(t => t.length > 5)
                   if (h3s.length > 0) return h3s.slice(0, 15).join('\n')
                   document.querySelectorAll('script,style,header,footer,nav').forEach(el => el.remove())
-                  return document.body.innerText.replace(/\n{3,}/g, '\n\n').trim().slice(0, 3000)
+                  return document.body.innerText.replace(/\n{3,}/g, '\n\n').trim().slice(0, 4000)
                 }
                 const remove = document.querySelectorAll('script,style,nav,header,footer,aside,[class*="ad"],[class*="cookie"],[class*="popup"],[id*="cookie"],[id*="popup"]')
                 remove.forEach(el => el.remove())
@@ -476,7 +483,10 @@ async function runAgentLoop(opts: {
               // Also get interactive elements for clicking
               const snapshot = await snapshotPage(opts.userId, opts.tabKey)
               if (isGoogleSearch) {
-                result = `Search results for ${args.url}:\n${content}\n\nYOU HAVE THE INFORMATION. Do NOT click any links. Call task_complete NOW with ALL results formatted as detailed bullet points. Include at least 8-10 results with titles and descriptions. Make each bullet point informative with the key details from the snippet.`
+                result = `Search results for ${args.url}:\n${content}\n\n` +
+                `INSTRUCTION: You now have search results with titles, snippets and URLs.\n` +
+                `Step 1: Call task_complete with a summary of ALL results found above.\n` +
+                `If the task asks for "more details" or "read articles": navigate to the top 2-3 URLs from the results above to read the full articles, then call task_complete with comprehensive details from all articles combined.`
               } else {
                 result = `Navigated to ${args.url}.\n\nPAGE CONTENT:\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
               }
@@ -591,6 +601,7 @@ export async function runAgentWithExtension(
   onStep: (step: string) => Promise<void>,
   taskId?: string,
   keepTabOpen = false,
+  context?: string,
   abortSignal?: AbortSignal
 ): Promise<string> {
   if (abortSignal?.aborted) return 'Task stopped by user.'
@@ -621,6 +632,7 @@ export async function runAgentWithExtension(
       taskPrompt: task,
       tabKey,
       onProgress: onStep,
+      context,
       abortSignal
     })
 
