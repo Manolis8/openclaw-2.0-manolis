@@ -309,20 +309,27 @@ tasksRouter.post('/chat', async (req, res) => {
     .gte('created_at', `${today}T00:00:00.000Z`)
   const DAILY_LIMIT = 20
 
-  // Load real conversation history from Supabase
+  // Load real conversation history from Supabase (most recent last for emphasis)
   const { data: historyRows } = await supabase
     .from('chat_messages')
     .select('role, content')
     .eq('chat_id', sessionId)
-    .order('created_at', { ascending: true })
-    .limit(50)
+    .order('created_at', { ascending: false })
+    .limit(6)
 
   const history = (historyRows || [])
     .filter((m: any) => m.content && m.content.trim())
+    .reverse()
     .map((m: any) => ({ role: m.role as string, content: m.content as string }))
 
   // Compact if too long
   const compactedHistory = await compactHistory(history, 8)
+
+  // Add emphasis note about recent message for "tell me more" scenarios
+  let emphasisNote = ''
+  if (compactedHistory.length > 0) {
+    emphasisNote = `\n\nIMPORTANT: The user's latest message is the last "User:" message above. If they say "tell me more", "more details", "expand on that", or similar — they want MORE detail about what the Assistant last said. Use the Assistant's last response as context for what to expand on.`
+  }
 
   const needsBrowser = await classifyMessage(message)
 
@@ -330,7 +337,7 @@ tasksRouter.post('/chat', async (req, res) => {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: CHAT_SYSTEM_PROMPT },
+        { role: 'system', content: CHAT_SYSTEM_PROMPT + emphasisNote },
         ...compactedHistory.map(m => ({
           role: m.role as 'user' | 'assistant' | 'system',
           content: m.content

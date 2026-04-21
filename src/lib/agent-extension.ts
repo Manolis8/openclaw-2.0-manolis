@@ -434,13 +434,37 @@ async function runAgentLoop(opts: {
               await new Promise(r => setTimeout(r, 800))
               // Auto-read the page content after navigation
               const { page: p2 } = await getBrowser(opts.userId)
-              const content = await p2.evaluate(() => {
+              const isGoogleSearch = args.url.includes('google.com/search')
+              const content = await p2.evaluate((isGs) => {
+                if (isGs) {
+                  const results: string[] = []
+                  document.querySelectorAll('.g, [data-hveid]').forEach(el => {
+                    const title = el.querySelector('h3')
+                    const snippet = el.querySelector('.VwiC3b, .MUxGbd, [data-sncf], .s3v9rd')
+                    if (title) {
+                      const titleText = (title as HTMLElement).innerText.trim()
+                      const snippetText = snippet ? (snippet as HTMLElement).innerText.trim() : ''
+                      if (titleText && titleText.length > 5) {
+                        results.push(snippetText ? `${titleText}: ${snippetText}` : titleText)
+                      }
+                    }
+                  })
+                  if (results.length > 0) {
+                    return results.slice(0, 15).join('\n')
+                  }
+                  const h3s = Array.from(document.querySelectorAll('h3'))
+                    .map(el => (el as HTMLElement).innerText.trim())
+                    .filter(t => t.length > 5)
+                  if (h3s.length > 0) return h3s.slice(0, 15).join('\n')
+                  document.querySelectorAll('script,style,header,footer,nav').forEach(el => el.remove())
+                  return document.body.innerText.replace(/\n{3,}/g, '\n\n').trim().slice(0, 3000)
+                }
                 const remove = document.querySelectorAll('script,style,nav,header,footer,aside,[class*="ad"],[class*="cookie"],[class*="popup"],[id*="cookie"],[id*="popup"]')
                 remove.forEach(el => el.remove())
                 const main = document.querySelector('main,article,[role="main"],[class*="content"],[id*="content"],[id*="main"]') as HTMLElement | null
                 const text = (main || document.body).innerText
                 return text.replace(/\n{3,}/g, '\n\n').trim().slice(0, 4000)
-              }).catch(() => '')
+              }, isGoogleSearch).catch(() => '')
               // Also get interactive elements for clicking
               const snapshot = await snapshotPage(opts.userId, opts.tabKey)
               result = `Navigated to ${args.url}.\n\nPAGE CONTENT:\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
