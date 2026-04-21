@@ -273,7 +273,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'browser_scroll', description: 'Scroll page up or down. Use before clicking elements that may be outside viewport.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
   { type: 'function', function: { name: 'browser_dismiss_cookie', description: 'Dismiss cookie/consent popups. Call this immediately when any element says it is blocked by an overlay or intercepts pointer events.', parameters: { type: 'object', properties: {}, required: [] } } },
   { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds for page to load.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
-  { type: 'function', function: { name: 'task_complete', description: 'Call when task is done. Include the full result.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
+  { type: 'function', function: { name: 'task_complete', description: 'Call when task is done. The summary MUST be detailed and complete — minimum 200 words for research/news tasks. Include all findings with specifics.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
   { type: 'function', function: { name: 'task_failed', description: 'Call when task cannot be completed after trying all approaches.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] } } },
 ]
 
@@ -458,7 +458,7 @@ async function runAgentLoop(opts: {
                     }
                   })
                   if (results.length > 0) {
-                    return results.slice(0, 15).join('\n')
+                    return results.slice(0, 20).join('\n')
                   }
                   const h3s = Array.from(document.querySelectorAll('h3'))
                     .map(el => (el as HTMLElement).innerText.trim())
@@ -476,7 +476,7 @@ async function runAgentLoop(opts: {
               // Also get interactive elements for clicking
               const snapshot = await snapshotPage(opts.userId, opts.tabKey)
               if (isGoogleSearch) {
-                result = `Search results for ${args.url}:\n${content}\n\nYOU HAVE THE INFORMATION. Do NOT click any links. Do NOT navigate further. Call task_complete NOW with all the information above formatted as bullet points.`
+                result = `Search results for ${args.url}:\n${content}\n\nYOU HAVE THE INFORMATION. Do NOT click any links. Call task_complete NOW with ALL results formatted as detailed bullet points. Include at least 8-10 results with titles and descriptions. Make each bullet point informative with the key details from the snippet.`
               } else {
                 result = `Navigated to ${args.url}.\n\nPAGE CONTENT:\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
               }

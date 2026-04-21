@@ -326,9 +326,19 @@ tasksRouter.post('/chat', async (req, res) => {
   const compactedHistory = await compactHistory(history, 8)
 
   // Add emphasis note about recent message for "tell me more" scenarios
-  let emphasisNote = ''
+  let context = ''
   if (compactedHistory.length > 0) {
-    emphasisNote = `\n\nIMPORTANT: The user's latest message is the last "User:" message above. If they say "tell me more", "more details", "expand on that", or similar — they want MORE detail about what the Assistant last said. Use the Assistant's last response as context for what to expand on.`
+    context = `CONVERSATION HISTORY:\n` +
+      compactedHistory
+        .filter((m: any) => m.content?.trim())
+        .map((m: any) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 500)}`)
+        .join('\n') +
+      `\n\nCRITICAL MEMORY RULES:
+- If user says "do the same", "do it again", "more details", "tell me more" — look at the LAST Assistant message to understand what topic was discussed and repeat/expand on THAT exact topic
+- If the last Assistant message was about stocks, "do the same" means stocks
+- If the last Assistant message was about Iran news, "more details" means Iran news
+- NEVER default to generic "latest news" — always use the specific topic from conversation history
+- When user asks for more details, search for the SAME topic with more specific query`
   }
 
   const needsBrowser = await classifyMessage(message)
@@ -337,7 +347,7 @@ tasksRouter.post('/chat', async (req, res) => {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: CHAT_SYSTEM_PROMPT + emphasisNote },
+        { role: 'system', content: CHAT_SYSTEM_PROMPT + context },
         ...compactedHistory.map(m => ({
           role: m.role as 'user' | 'assistant' | 'system',
           content: m.content
