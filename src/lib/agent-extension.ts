@@ -279,60 +279,40 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
 
 // ─── System Prompt ────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent. Your job is to complete tasks fully and thoroughly — never stop halfway.
+const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent.
 
-## Core Workflow
+## How It Works
+When you navigate to a page, you automatically receive:
+- PAGE CONTENT: the full readable text from the page
+- INTERACTIVE ELEMENTS: refs for clicking
+
+## Your Job
 1. Navigate to the right page
-2. Dismiss any cookie popups with browser_dismiss_cookie
-3. Use browser_read to extract text content from the page
-4. Use browser_snapshot only when you need to click something
-5. Call task_complete with the FULL result — never a partial answer
+2. Read the PAGE CONTENT you received
+3. Call task_complete with the full answer
 
 ## Task Complete Rules
-- task_complete summary must contain the actual information found — not "I found the news" but the actual news headlines and details
-- If the task asks for news, list the actual headlines
-- If the task asks for prices, list the actual prices
-- If the task asks for fixtures, list the actual fixtures
-- Never call task_complete with a vague summary — always include the real data
+- Always include the actual data in task_complete — real headlines, real prices, real results
+- For news: list at least 5 headlines with brief details
+- For prices: list the actual numbers
+- For fixtures: list the actual matches and times
+- Never give a vague summary — always give the real information
 
-## Cookie Rule — HIGHEST PRIORITY
-When ANY error mentions overlay, intercepts pointer events, cookie, or onetrust:
-1. Call browser_dismiss_cookie immediately
-2. Then continue
+## If You Need To Click Something
+Use the INTERACTIVE ELEMENTS refs to click
+After clicking, you get new PAGE CONTENT automatically
 
-## Mandatory Reading Step
-After navigating to ANY page that has the information you need:
-1. ALWAYS call browser_dismiss_cookie first
-2. ALWAYS call browser_read to get the page text
-3. THEN call task_complete with everything you found
-You MUST call browser_read before task_complete. Never skip this step.
-Never click into articles — read the index/search results page directly with browser_read.
-For news tasks: navigate to the page, browser_read, task_complete. That is the full workflow.
+## Cookie Popups
+If anything is blocked call browser_dismiss_cookie then browser_navigate to the same URL again
 
-## Task Complete Format
-When calling task_complete, write the full answer like this:
-"Here are today's top headlines:
-- [headline 1]: [brief detail]
-- [headline 2]: [brief detail]
-- [headline 3]: [brief detail]
-(continue for all relevant results)"
-Never write less than 3 bullet points for news/research tasks.
+## Search
+Navigate directly to: https://www.google.com/search?q=your+query
+Read the search results from PAGE CONTENT and call task_complete
 
-## Google Search
-Always navigate directly: https://www.google.com/search?q=your+search+terms
-Never go to google.com and type in the search box
-
-## Error Recovery
-- "blocked by overlay" → browser_dismiss_cookie then continue
-- "outside viewport" → browser_scroll down 400 then browser_snapshot
-- "timed out" → browser_snapshot to see current state
-- "no longer exists" → browser_snapshot for fresh refs
-
-## Strict Rules
-- Never click "Skip to main content"
+## Rules
 - Never try to log in
-- Always call task_complete or task_failed — never leave hanging
-- Do NOT stop until you have the complete answer the user asked for`
+- Always call task_complete or task_failed
+- Never leave a task without a conclusion`
 
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
@@ -436,8 +416,34 @@ async function runAgentLoop(opts: {
               consecutiveSnapshots = 0
               await opts.onProgress(`🌐 Navigating to ${args.url}...`)
               await navigateTo(args.url, opts.userId)
-              result = await snapshotPage(opts.userId, opts.tabKey)
-              result = `Navigated to ${args.url}. Page:\n${result}`
+              // Auto-dismiss cookie after navigation
+              const { page: p } = await getBrowser(opts.userId)
+              await p.evaluate(() => {
+                const SELECTORS = [
+                  '#onetrust-reject-all-handler','#onetrust-accept-btn-handler',
+                  'button[id*="reject"]','button[id*="accept"]',
+                  'button[class*="reject"]','button[class*="cookie"]',
+                  '.cc-dismiss','.cc-btn','[id*="cookie"] button',
+                  '[id*="consent"] button',
+                ]
+                for (const sel of SELECTORS) {
+                  const el = document.querySelector(sel) as HTMLElement | null
+                  if (el && el.offsetParent !== null) { el.click(); return }
+                }
+              }).catch(() => {})
+              await new Promise(r => setTimeout(r, 800))
+              // Auto-read the page content after navigation
+              const { page: p2 } = await getBrowser(opts.userId)
+              const content = await p2.evaluate(() => {
+                const remove = document.querySelectorAll('script,style,nav,header,footer,aside,[class*="ad"],[class*="cookie"],[class*="popup"],[id*="cookie"],[id*="popup"]')
+                remove.forEach(el => el.remove())
+                const main = document.querySelector('main,article,[role="main"],[class*="content"],[id*="content"],[id*="main"]') as HTMLElement | null
+                const text = (main || document.body).innerText
+                return text.replace(/\n{3,}/g, '\n\n').trim().slice(0, 4000)
+              }).catch(() => '')
+              // Also get interactive elements for clicking
+              const snapshot = await snapshotPage(opts.userId, opts.tabKey)
+              result = `Navigated to ${args.url}.\n\nPAGE CONTENT:\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
               break
             }
             case 'browser_click': {
