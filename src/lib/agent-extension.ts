@@ -171,10 +171,10 @@ async function snapshotPage(userId: string, tabKey: string): Promise<string> {
 
 async function navigateTo(url: string, userId: string): Promise<void> {
   const { page } = await getBrowser(userId)
-  await page.goto(url, { timeout: 30000 })
-  await page.waitForLoadState('domcontentloaded').catch(() => {})
-  await new Promise(r => setTimeout(r, 1000))
-  // Clear refs after navigation — page has changed
+  await page.goto(url, { timeout: 30000, waitUntil: 'domcontentloaded' })
+  // For Google wait longer to let dynamic content render
+  const isGoogle = url.includes('google.com')
+  await new Promise(r => setTimeout(r, isGoogle ? 2000 : 1000))
   const state = pageStates.get(page)
   if (state) state.roleRefs = {}
 }
@@ -450,36 +450,49 @@ async function runAgentLoop(opts: {
               // Auto-read the page content after navigation
               const { page: p2 } = await getBrowser(opts.userId)
               const isGoogleSearch = args.url.includes('google.com/search')
-              const content = await p2.evaluate((isGs) => {
-                if (isGs) {
+              if (isGoogleSearch) {
+                await new Promise(r => setTimeout(r, 1500))
+                const { page: p3 } = await getBrowser(opts.userId)
+                const content = await p3.evaluate(() => {
                   const results: string[] = []
-                  document.querySelectorAll('.g, [data-hveid]').forEach(el => {
+                  const containers = document.querySelectorAll(
+                    '.g:not(.commercial-unit-desktop-top):not(.ads-ad), [data-hveid] .g, .Gx5Zad, .tF2Cxc'
+                  )
+                  containers.forEach(el => {
                     const title = el.querySelector('h3')
-                    const snippet = el.querySelector('.VwiC3b, .MUxGbd, [data-sncf], .s3v9rd')
-                    const link = el.querySelector('a') as HTMLAnchorElement | null
+                    const snippet = el.querySelector(
+                      '.VwiC3b, .MUxGbd, .yXK7lf, .lEBKkf, [data-sncf="1"], [data-sncf="2"]'
+                    )
                     if (title) {
-                      const titleText = (title as HTMLElement).innerText.trim()
-                      const snippetText = snippet ? (snippet as HTMLElement).innerText.trim() : ''
-                      const href = link?.href || ''
-                      if (titleText && titleText.length > 5) {
-                        results.push(`TITLE: ${titleText}\nSNIPPET: ${snippetText}\nURL: ${href}`)
+                      const t = (title as HTMLElement).innerText?.trim()
+                      const s = snippet ? (snippet as HTMLElement).innerText?.trim() : ''
+                      if (t && t.length > 10 && !t.includes('Skip to main')) {
+                        results.push(s ? `• ${t} — ${s}` : `• ${t}`)
                       }
                     }
                   })
-                  if (results.length > 0) return results.slice(0, 10).join('\n---\n')
-                  const h3s = Array.from(document.querySelectorAll('h3'))
-                    .map(el => (el as HTMLElement).innerText.trim())
-                    .filter(t => t.length > 5)
-                  if (h3s.length > 0) return h3s.slice(0, 15).join('\n')
-                  document.querySelectorAll('script,style,header,footer,nav').forEach(el => el.remove())
-                  return document.body.innerText.replace(/\n{3,}/g, '\n\n').trim().slice(0, 4000)
-                }
+                  if (results.length === 0) {
+                    document.querySelectorAll('h3').forEach(el => {
+                      const t = (el as HTMLElement).innerText?.trim()
+                      if (t && t.length > 10 && !t.includes('Skip to main') && !t.includes('Accessibility')) {
+                        results.push(`• ${t}`)
+                      }
+                    })
+                  }
+                  return results.slice(0, 15).join('\n') || 'No results found'
+                }).catch(() => 'Failed to read search results')
+                result = `Google search results for: ${args.url}\n\n${content}\n\n` +
+                  `NEXT STEP: If you have enough information, call task_complete with all bullet points above formatted in detail.\n` +
+                  `If user wants more details, navigate to 1-2 of the article pages and use browser_read to get full content.`
+                break
+              }
+              const content = await p2.evaluate(() => {
                 const remove = document.querySelectorAll('script,style,nav,header,footer,aside,[class*="ad"],[class*="cookie"],[class*="popup"],[id*="cookie"],[id*="popup"]')
                 remove.forEach(el => el.remove())
                 const main = document.querySelector('main,article,[role="main"],[class*="content"],[id*="content"],[id*="main"]') as HTMLElement | null
                 const text = (main || document.body).innerText
                 return text.replace(/\n{3,}/g, '\n\n').trim().slice(0, 4000)
-              }, isGoogleSearch).catch(() => '')
+              }).catch(() => '')
               // Also get interactive elements for clicking
               const snapshot = await snapshotPage(opts.userId, opts.tabKey)
               if (isGoogleSearch) {
