@@ -390,11 +390,11 @@ async function runAgentLoop(opts: {
       iterations++
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: 'gpt-4o',
         messages: trimMessages(messages),
         tools: browserTools,
         tool_choice: 'required',
-        max_tokens: 4000,
+        max_tokens: 1000,
       })
 
       const msg = response.choices[0].message

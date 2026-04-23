@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { supabase } from '../lib/supabase.js'
 import { isExtensionConnected, extensionConnections } from '../index.js'
-import { runAgentV2 } from '../lib/agent-v2.js'
+import { runAgentWithExtension } from '../lib/agent-extension.js'
 import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
 import OpenAI from 'openai'
 import { createHash } from 'node:crypto'
@@ -252,11 +252,11 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   // The agent-extension.ts uses aria-snapshot which is more reliable than CSS selectors
   await appendOutput(taskId, '☁️ Starting browser agent...\n')
   try {
-    const taskPromise = runAgentV2(prompt, userId, async (msg) => {
+    const taskPromise = runAgentWithExtension(prompt, userId, async (msg) => {
       if (controller.signal.aborted) return
       console.log(`[${taskId}] ${msg}`)
       await appendOutput(taskId, msg + '\n')
-    }, taskId, keepTabOpen, controller.signal, context)
+    }, taskId, keepTabOpen, context, controller.signal)
 
     const timeoutPromise = new Promise<string>((_, reject) =>
       setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
