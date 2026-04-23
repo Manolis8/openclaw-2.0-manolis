@@ -295,7 +295,7 @@ Remember everything said earlier in this conversation and use it naturally.
 Be concise and friendly. Never write more than needed.`
 
 tasksRouter.post('/chat', async (req, res) => {
-  const { message: rawMessage, userId: rawUserId, sessionId: rawSessionId } = req.body
+  const { message: rawMessage, userId: rawUserId, sessionId: rawSessionId, keepTabOpen = false } = req.body
   const message = sanitizeString(rawMessage, 2000)
   const userId = sanitizeString(rawUserId, 100)
   const sessionId = sanitizeString(rawSessionId, 100)
@@ -388,7 +388,7 @@ tasksRouter.post('/chat', async (req, res) => {
   if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
 
   res.json({ taskId: data.id, usesBrowser: true })
-  runTaskInBackground(data.id, message, userId, false, false, context)
+  runTaskInBackground(data.id, message, userId, false, keepTabOpen, context)
 })
 
 tasksRouter.post('/create-task', async (req, res) => {
