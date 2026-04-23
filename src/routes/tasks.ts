@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { supabase } from '../lib/supabase.js'
 import { isExtensionConnected, extensionConnections } from '../index.js'
-import { runAgentWithExtension } from '../lib/agent-extension.js'
+import { runAgentV2 } from '../lib/agent-v2.js'
 import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
 import OpenAI from 'openai'
 import { createHash } from 'node:crypto'
@@ -252,11 +252,11 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   // The agent-extension.ts uses aria-snapshot which is more reliable than CSS selectors
   await appendOutput(taskId, '☁️ Starting browser agent...\n')
   try {
-    const taskPromise = runAgentWithExtension(prompt, userId, async (step) => {
+    const taskPromise = runAgentV2(prompt, userId, async (msg) => {
       if (controller.signal.aborted) return
-      console.log(`[${taskId}] ${step}`)
-      await appendOutput(taskId, step + '\n')
-    }, taskId, keepTabOpen, context, controller.signal)
+      console.log(`[${taskId}] ${msg}`)
+      await appendOutput(taskId, msg + '\n')
+    }, taskId, keepTabOpen, context)
 
     const timeoutPromise = new Promise<string>((_, reject) =>
       setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
@@ -303,14 +303,14 @@ tasksRouter.post('/chat', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' })
   }
 
-  // Check daily limit
-  const today = new Date().toISOString().split('T')[0]
-  const { count } = await supabase
-    .from('tasks')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .gte('created_at', `${today}T00:00:00.000Z`)
-  const DAILY_LIMIT = 20
+   // Check daily limit
+   const today = new Date().toISOString().split('T')[0]
+   const { count } = await supabase
+     .from('tasks')
+     .select('*', { count: 'exact', head: true })
+     .eq('user_id', userId)
+     .gte('created_at', `${today}T00:00:00.000Z')
+   const DAILY_LIMIT = 10
 
   // Load real conversation history from Supabase (most recent last for emphasis)
   let context = ''
@@ -392,20 +392,20 @@ tasksRouter.post('/create-task', async (req, res) => {
     return res.status(400).json({ error: 'Missing or invalid prompt or userId' })
   }
 
-  // Check daily task limit
-  const today = new Date().toISOString().split('T')[0]
-  const { count } = await supabase
-    .from('tasks')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .gte('created_at', `${today}T00:00:00.000Z`)
+   // Check daily task limit
+   const today = new Date().toISOString().split('T')[0]
+   const { count } = await supabase
+     .from('tasks')
+     .select('*', { count: 'exact', head: true })
+     .eq('user_id', userId)
+     .gte('created_at', `${today}T00:00:00.000Z`)
 
-  const DAILY_LIMIT = 20
-  if ((count || 0) >= DAILY_LIMIT) {
-    return res.status(429).json({
-      error: `Daily limit reached. You can run up to ${DAILY_LIMIT} tasks per day.`
-    })
-  }
+   const DAILY_LIMIT = 10
+   if ((count || 0) >= DAILY_LIMIT) {
+     return res.status(429).json({
+       error: `Daily limit reached. You can run up to ${DAILY_LIMIT} tasks per day.`
+     })
+   }
 
   console.log(`Create task: userId=${userId}, extensionConnected=${isExtensionConnected(userId)}`)
   console.log(`All connected extensions: ${[...extensionConnections.keys()].join(', ')}`)

@@ -2,14 +2,15 @@
   "name": "felo-backend",
   "version": "1.0.0",
   "type": "module",
-"scripts": {
-  "dev": "tsx src/index.ts",
-  "start": "tsx src/index.ts"
-},
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.90.0",
     "@nangohq/node": "^0.69.46",
     "@supabase/phoenix": "^0.4.0",
     "@supabase/supabase-js": "^2.99.2",
