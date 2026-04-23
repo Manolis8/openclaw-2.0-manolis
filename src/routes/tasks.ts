@@ -328,14 +328,21 @@ tasksRouter.post('/chat', async (req, res) => {
         const reversed = historyRows.reverse()
         const lastAssistant = reversed.filter((m: any) => m.role === 'assistant').pop()
         const lastUser = reversed.filter((m: any) => m.role === 'user').pop()
-        context = `CONVERSATION HISTORY:\n` +
-          reversed
-            .filter((m: any) => m.content?.trim())
-            .map((m: any) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 500)}`)
-            .join('\n') +
-          `\n\nLAST TOPIC DISCUSSED: ${lastAssistant?.content?.slice(0, 200) || 'none'}\n` +
-          `USER'S FOLLOW-UP REQUEST: "${lastUser?.content || message}"\n` +
-          `\nIF THE USER IS ASKING FOR MORE/DETAILS/AGAIN: Search for the LAST TOPIC using a more specific query. Extract the main subject from LAST TOPIC DISCUSSED and search for that with "detailed" or "in depth" added.`
+        const historyText = reversed
+          .filter((m: any) => m.content?.trim())
+          .map((m: any) => {
+            const role = m.role === 'user' ? 'User' : 'Assistant'
+            return role + ': ' + m.content.slice(0, 500)
+          })
+          .join('\n')
+
+        const lastTopic = lastAssistant?.content?.slice(0, 200) || 'none'
+        const lastRequest = lastUser?.content || message
+
+        context = 'CONVERSATION HISTORY:\n' + historyText +
+          '\n\nLAST TOPIC DISCUSSED: ' + lastTopic +
+          '\nUSERS FOLLOW-UP REQUEST: ' + lastRequest +
+          '\n\nIF THE USER IS ASKING FOR MORE OR DETAILS OR AGAIN: Search for the LAST TOPIC using a more specific query. Extract the main subject from LAST TOPIC DISCUSSED and search for that with more detail.'
       }
     } catch {}
   }
