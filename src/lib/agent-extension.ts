@@ -662,6 +662,13 @@ export async function runAgentWithExtension(
         const { sendExtensionMessage } = await import('../index.js')
         await sendExtensionMessage(userId, 'closeTab', { tabId: newTabId })
       } catch {}
+    } else if (keepTabOpen && newTabId) {
+      try {
+        // Keep the tab open but navigate away from blank/intermediate state
+        // Just detach the agent - don't close the tab
+        const { sendExtensionMessage } = await import('../index.js')
+        await sendExtensionMessage(userId, 'detachTab', { tabId: newTabId })
+      } catch {}
     }
 
     try {
