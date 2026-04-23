@@ -256,7 +256,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       if (controller.signal.aborted) return
       console.log(`[${taskId}] ${msg}`)
       await appendOutput(taskId, msg + '\n')
-    }, taskId, keepTabOpen, context)
+    }, taskId, keepTabOpen, controller.signal, context)
 
     const timeoutPromise = new Promise<string>((_, reject) =>
       setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
@@ -309,7 +309,7 @@ tasksRouter.post('/chat', async (req, res) => {
      .from('tasks')
      .select('*', { count: 'exact', head: true })
      .eq('user_id', userId)
-     .gte('created_at', `${today}T00:00:00.000Z')
+      .gte('created_at', `${today}T00:00:00.000Z`)
    const DAILY_LIMIT = 10
 
   // Load real conversation history from Supabase (most recent last for emphasis)
