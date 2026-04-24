@@ -262,9 +262,8 @@ async function scrollPage(direction: 'up' | 'down', amount = 300, userId: string
 async function readPage(userId: string): Promise<string> {
   const { page } = await getBrowser(userId)
   const content = await page.evaluate(() => {
-    const remove = document.querySelectorAll('script,style,nav,header,footer,aside,[class*="ad"],[class*="cookie"],[class*="popup"],[id*="cookie"],[id*="popup"]')
-    remove.forEach(el => el.remove())
-    const main = document.querySelector('main,article,[role="main"],[class*="content"],[id*="content"],[id*="main"]') as HTMLElement | null
+    // Read-only — never remove or modify DOM elements
+    const main = document.querySelector('main,article,[role="main"]') as HTMLElement | null
     const text = (main || document.body).innerText
     return text.replace(/\n{3,}/g, '\n\n').trim().slice(0, 6000)
   }).catch(() => '')
@@ -360,7 +359,14 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
 
 // ─── System prompt (OpenClaw style — short and precise) ──────────────────────
 
-const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent controlling a real Chrome browser.
+const SYSTEM_PROMPT = `## STRICT RULES — READ FIRST
+- ONLY do exactly what the user asked. Nothing more, nothing less.
+- NEVER perform any action the user did not explicitly request
+- NEVER post, share, repost, like, comment, or interact with any content unless the user specifically said to
+- NEVER click on content that seems harmful, violent, or inappropriate
+- If you are unsure whether the user wants you to do something — call ask_permission
+
+You are Unclawned, a browser automation agent controlling a real Chrome browser.
 Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_scroll, browser_dismiss_cookie, browser_wait, ask_permission, task_complete, task_failed.
 
 ## CRITICAL: The user is already logged into all their accounts in this browser
