@@ -463,6 +463,63 @@ tasksRouter.post('/tasks/:taskId/stop', async (req, res) => {
   res.json({ ok: true })
 })
 
+tasksRouter.post('/tasks/:taskId/confirm', async (req, res) => {
+  const { taskId } = req.params
+  const { confirmed, userId: rawUserId, alwaysAllow } = req.body
+  const userId = sanitizeString(rawUserId, 100)
+  if (!taskId || !userId) return res.status(400).json({ error: 'Missing fields' })
+
+  // Update permission status
+  await supabase
+    .from('task_permissions')
+    .update({ status: confirmed ? 'approved' : 'denied' })
+    .eq('task_id', taskId)
+    .eq('status', 'pending')
+
+  // If user clicked "Always allow this" save preference
+  if (confirmed && alwaysAllow) {
+    const { data: permData } = await supabase
+      .from('task_permissions')
+      .select('action, platform')
+      .eq('task_id', taskId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single()
+
+    if (permData) {
+      await supabase.from('user_memories').upsert({
+        user_id: userId,
+        fact: `User always allows: ${permData.action} on ${permData.platform || 'any platform'}`,
+        source_chat_id: 'preferences'
+      }, { onConflict: 'user_id,fact' }).catch(() => {})
+    }
+  }
+
+  res.json({ ok: true })
+})
+
+// Auto-approve toggle endpoint
+tasksRouter.post('/settings/auto-approve', async (req, res) => {
+  const { userId: rawUserId, enabled } = req.body
+  const userId = sanitizeString(rawUserId, 100)
+  if (!userId) return res.status(400).json({ error: 'Missing userId' })
+
+  if (enabled) {
+    await supabase.from('user_memories').upsert({
+      user_id: userId,
+      fact: 'auto_approve_all: user has disabled permission confirmations',
+      source_chat_id: 'preferences'
+    }, { onConflict: 'user_id,fact' }).catch(() => {})
+  } else {
+    await supabase.from('user_memories')
+      .delete()
+      .eq('user_id', userId)
+      .ilike('fact', '%auto_approve_all%')
+  }
+
+  res.json({ ok: true })
+})
+
 tasksRouter.post('/refresh-token', async (req, res) => {
   const { refreshToken: rawToken } = req.body
   const refreshToken = sanitizeString(rawToken, 2000)

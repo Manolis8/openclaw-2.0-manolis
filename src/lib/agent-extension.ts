@@ -341,6 +341,19 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'browser_scroll', description: 'Scroll page up or down. Use when element is outside viewport.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
   { type: 'function', function: { name: 'browser_dismiss_cookie', description: 'Dismiss cookie/consent popups. Call immediately when element says blocked by overlay.', parameters: { type: 'object', properties: {}, required: [] } } },
   { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds for page to load.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
+  { type: 'function', function: {
+    name: 'ask_permission',
+    description: 'Ask user permission before doing something irreversible. Call this ONLY before: clicking Post, Send, Submit, Publish, Buy, Purchase, Book, Delete buttons. Do NOT call for creating repos, filling forms, reading, navigating, or any reversible action.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'Short description of what you are about to do. e.g. "Post on LinkedIn"' },
+        details: { type: 'string', description: 'The exact content or details of the action. e.g. the full post text, email body, item being deleted' },
+        platform: { type: 'string', description: 'The platform or site. e.g. "LinkedIn", "Gmail", "Twitter"' }
+      },
+      required: ['action', 'details']
+    }
+  }},
   { type: 'function', function: { name: 'task_complete', description: 'Mark task done with full detailed result. For news/research: minimum 5 items with details. Never vague.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
   { type: 'function', function: { name: 'task_failed', description: 'Mark task failed after exhausting all approaches.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] } } },
 ]
@@ -348,7 +361,7 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
 // ─── System prompt (OpenClaw style — short and precise) ──────────────────────
 
 const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent controlling a real Chrome browser.
-Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_scroll, browser_dismiss_cookie, browser_wait, task_complete, task_failed.
+Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_scroll, browser_dismiss_cookie, browser_wait, ask_permission, task_complete, task_failed.
 
 ## CRITICAL: The user is already logged into all their accounts in this browser
 This is the user's real Chrome browser. They are already logged into GitHub, Gmail, LinkedIn, Twitter, and all other sites.
@@ -366,7 +379,12 @@ NEVER call task_failed because of "authentication" or "login" — just navigate 
 - Use browser_snapshot to get refs for clicking
 - Never guess refs — only use refs from browser_snapshot
 - Always call task_complete or task_failed — never leave unfinished
-- task_complete must include real results — never vague summaries`
+- task_complete must include real results — never vague summaries
+
+## When To Ask Permission
+Call ask_permission ONLY before clicking these buttons: Post, Send, Submit, Publish, Buy, Purchase, Book, Delete, Remove, Confirm order, Place order.
+Never call ask_permission for: creating repos, filling in forms, reading pages, navigating, searching, creating files or documents.
+After user approves — immediately do the action. Do not ask again.`
 
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
@@ -544,6 +562,67 @@ async function runAgentLoop(opts: {
               shouldRetry = true
               retryReason = args.reason
               result = 'Noted'
+              break
+            }
+            case 'ask_permission': {
+              await opts.onProgress(`🔐 Asking permission: ${args.action}`)
+
+              // Check if user has auto-approve enabled
+              const { data: pref } = await supabase
+                .from('user_memories')
+                .select('fact')
+                .eq('user_id', opts.userId)
+                .ilike('fact', '%auto_approve_all%')
+                .single()
+
+              if (pref) {
+                result = 'User has auto-approve enabled. Proceed.'
+                break
+              }
+
+              // Store permission request
+              await supabase.from('task_permissions').insert({
+                task_id: opts.taskId,
+                user_id: opts.userId,
+                action: args.action || '',
+                details: args.details || '',
+                platform: args.platform || '',
+                status: 'pending'
+              }).catch(() => {})
+
+              // Update task status so frontend knows to show permission card
+              await supabase.from('tasks').update({ status: 'waiting_permission' }).eq('id', opts.taskId)
+
+              // Poll for response — max 5 minutes
+              let permissionResult = 'timeout'
+              for (let i = 0; i < 150; i++) {
+                await new Promise(r => setTimeout(r, 2000))
+                if (opts.abortSignal?.aborted) {
+                  permissionResult = 'denied'
+                  break
+                }
+                const { data } = await supabase
+                  .from('task_permissions')
+                  .select('status')
+                  .eq('task_id', opts.taskId)
+                  .order('created_at', { ascending: false })
+                  .limit(1)
+                  .single()
+
+                if (data?.status === 'approved') { permissionResult = 'approved'; break }
+                if (data?.status === 'denied') { permissionResult = 'denied'; break }
+              }
+
+              // Resume task status
+              await supabase.from('tasks').update({ status: 'running' }).eq('id', opts.taskId)
+
+              if (permissionResult === 'approved') {
+                result = 'User approved. Proceed with the action now.'
+              } else if (permissionResult === 'denied') {
+                return { success: false, summary: 'User cancelled the action.' }
+              } else {
+                return { success: false, summary: 'Permission request timed out. Action was not taken.' }
+              }
               break
             }
             default:
