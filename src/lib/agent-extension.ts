@@ -7,19 +7,26 @@ import { detectLoop } from '../routes/tasks.js'
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
-// ─── Persistent browser connection (like OpenClaw's pw-session.ts) ───────────
+// ─── Types (from OpenClaw pw-session.ts) ─────────────────────────────────────
+
+type RoleRef = { role: string; name?: string; nth?: number }
+type RoleRefMap = Record<string, RoleRef>
 
 type PageState = {
-  roleRefs: Record<string, { role: string; name?: string; nth?: number }>
+  roleRefs: RoleRefMap
   roleRefsMode: 'role'
 }
 
+// ─── State ───────────────────────────────────────────────────────────────────
+
 const pageStates = new WeakMap<Page, PageState>()
-const roleRefsByTarget = new Map<string, PageState['roleRefs']>()
+const roleRefsByTarget = new Map<string, RoleRefMap>()
 const MAX_ROLE_REFS_CACHE = 50
 
 type ConnectedBrowser = { browser: Browser; port: number }
 const connections = new Map<string, ConnectedBrowser>()
+
+// ─── Browser connection ───────────────────────────────────────────────────────
 
 async function deriveRelayToken(gatewayToken: string, port: number): Promise<string> {
   const enc = new TextEncoder()
@@ -38,20 +45,14 @@ async function getBrowser(userId: string): Promise<{ browser: Browser; page: Pag
 
   let conn = connections.get(userId)
   if (!conn || conn.port !== port) {
-    try {
-      if (conn) {
-        conn.browser.close().catch(() => {})
-      }
-    } catch {}
+    try { if (conn) conn.browser.close().catch(() => {}) } catch {}
     const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${port}/cdp`, {
       headers: { 'x-openclaw-relay-token': relayToken }
     })
     conn = { browser, port }
     connections.set(userId, conn)
     browser.on('disconnected', () => {
-      if (connections.get(userId) === conn) {
-        connections.delete(userId)
-      }
+      if (connections.get(userId) === conn) connections.delete(userId)
     })
   }
 
@@ -61,7 +62,9 @@ async function getBrowser(userId: string): Promise<{ browser: Browser; page: Pag
   return { browser: conn.browser, page }
 }
 
-function getPageState(page: Page): PageState {
+// ─── Page state (from OpenClaw pw-session.ts) ────────────────────────────────
+
+function ensurePageState(page: Page): PageState {
   let state = pageStates.get(page)
   if (!state) {
     state = { roleRefs: {}, roleRefsMode: 'role' }
@@ -70,8 +73,8 @@ function getPageState(page: Page): PageState {
   return state
 }
 
-function storeRefs(userId: string, page: Page, refs: PageState['roleRefs']) {
-  const state = getPageState(page)
+function storeRoleRefsForTarget(userId: string, page: Page, refs: RoleRefMap) {
+  const state = ensurePageState(page)
   state.roleRefs = refs
   roleRefsByTarget.set(userId, refs)
   if (roleRefsByTarget.size > MAX_ROLE_REFS_CACHE) {
@@ -80,11 +83,20 @@ function storeRefs(userId: string, page: Page, refs: PageState['roleRefs']) {
   }
 }
 
+function restoreRoleRefsForTarget(userId: string, page: Page) {
+  const state = ensurePageState(page)
+  if (state.roleRefs && Object.keys(state.roleRefs).length > 0) return
+  const cached = roleRefsByTarget.get(userId)
+  if (cached) state.roleRefs = cached
+}
+
+// ─── Ref locator (from OpenClaw pw-session.ts refLocator) ───────────────────
+
 function refLocator(page: Page, ref: string) {
   const state = pageStates.get(page)
   const info = state?.roleRefs?.[ref]
   if (!info) {
-    throw new Error(`Unknown ref "${ref}". Call browser_snapshot first to get fresh refs.`)
+    throw new Error(`Unknown ref "${ref}". Run a new snapshot and use a ref from that snapshot.`)
   }
   const locator = info.name
     ? page.getByRole(info.role as any, { name: info.name, exact: true })
@@ -92,24 +104,23 @@ function refLocator(page: Page, ref: string) {
   return info.nth !== undefined ? locator.nth(info.nth) : locator
 }
 
-// ─── AI-friendly error messages (like OpenClaw's toAIFriendlyError) ──────────
+// ─── AI-friendly errors (from OpenClaw pw-tools-core.shared.ts) ─────────────
 
 function toAIFriendlyError(error: unknown, ref: string): string {
   const message = error instanceof Error ? error.message : String(error)
-
   if (message.includes('strict mode violation')) {
     const countMatch = message.match(/resolved to (\d+) elements/)
     const count = countMatch ? countMatch[1] : 'multiple'
-    return `Ref "${ref}" matched ${count} elements. Call browser_snapshot to get fresh refs and use a different one.`
+    return `Selector "${ref}" matched ${count} elements. Use a more specific ref or call browser_snapshot for fresh refs.`
   }
   if (message.includes('intercepts pointer events') || message.includes('not receive pointer events')) {
-    return `Element "${ref}" is blocked by an overlay. Call browser_dismiss_cookie immediately, then browser_snapshot and continue.`
+    return `Element "${ref}" is not interactable (hidden or covered). Call browser_dismiss_cookie first, then browser_snapshot.`
   }
   if (message.includes('outside of the viewport') || message.includes('element is outside')) {
-    return `Element "${ref}" is outside the viewport. Call browser_scroll direction=down amount=400, then browser_snapshot and try again.`
+    return `Element "${ref}" is outside the viewport. Call browser_scroll direction=down amount=400, then browser_snapshot.`
   }
   if (message.includes('Timeout') || message.includes('timeout')) {
-    return `Element "${ref}" timed out (not found or not visible). Call browser_snapshot to see current page elements.`
+    return `Element "${ref}" not found or not visible. Run a new browser_snapshot to get current page elements.`
   }
   if (message.includes('Unknown ref')) {
     return `Ref "${ref}" no longer exists. Call browser_snapshot to get fresh refs.`
@@ -117,15 +128,84 @@ function toAIFriendlyError(error: unknown, ref: string): string {
   return `Error on "${ref}": ${message}. Call browser_snapshot to see current page state.`
 }
 
-// ─── Snapshot (stores refs persistently like OpenClaw) ───────────────────────
+// ─── Snapshot (from OpenClaw pw-role-snapshot.ts buildRoleSnapshotFromAriaSnapshot) ─
 
-const sessionRefs = new Map<string, Record<string, { role: string; name?: string; nth?: number }>>()
-
-const INTERACTIVE = new Set([
+const INTERACTIVE_ROLES = new Set([
   'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
-  'listbox', 'menuitem', 'option', 'searchbox', 'slider', 'switch', 'tab',
-  'menuitemcheckbox', 'menuitemradio', 'treeitem', 'spinbutton'
+  'listbox', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
+  'option', 'searchbox', 'slider', 'spinbutton', 'switch', 'tab', 'treeitem'
 ])
+
+const CONTENT_ROLES = new Set([
+  'heading', 'cell', 'gridcell', 'columnheader', 'rowheader',
+  'listitem', 'article', 'region', 'main', 'navigation'
+])
+
+function buildRoleSnapshotFromAriaSnapshot(ariaSnapshot: string): { snapshot: string; refs: RoleRefMap } {
+  const lines = ariaSnapshot.split('\n')
+  const refs: RoleRefMap = {}
+  const counts = new Map<string, number>()
+  const refsByKey = new Map<string, string[]>()
+  let counter = 0
+
+  function getKey(role: string, name?: string) { return `${role}:${name ?? ''}` }
+
+  function getNextIndex(role: string, name?: string) {
+    const key = getKey(role, name)
+    const current = counts.get(key) ?? 0
+    counts.set(key, current + 1)
+    return current
+  }
+
+  function trackRef(role: string, name: string | undefined, ref: string) {
+    const key = getKey(role, name)
+    const list = refsByKey.get(key) ?? []
+    list.push(ref)
+    refsByKey.set(key, list)
+  }
+
+  const result: string[] = []
+
+  for (const line of lines) {
+    const match = line.match(/^(\s*-\s*)(\w+)(?:\s+"([^"]*)")?(.*)$/)
+    if (!match) { result.push(line); continue }
+
+    const [, prefix, roleRaw, name, suffix] = match
+    if (roleRaw.startsWith('/')) { result.push(line); continue }
+
+    const role = roleRaw.toLowerCase()
+    const isInteractive = INTERACTIVE_ROLES.has(role)
+    const isContent = CONTENT_ROLES.has(role)
+
+    const shouldHaveRef = isInteractive || (isContent && name)
+    if (!shouldHaveRef) { result.push(line); continue }
+
+    counter++
+    const ref = `e${counter}`
+    const nth = getNextIndex(role, name)
+    trackRef(role, name, ref)
+    refs[ref] = { role, name: name || undefined, nth }
+
+    let enhanced = `${prefix}${roleRaw}`
+    if (name) enhanced += ` "${name}"`
+    enhanced += ` [ref=${ref}]`
+    if (nth > 0) enhanced += ` [nth=${nth}]`
+    if (suffix) enhanced += suffix
+    result.push(enhanced)
+  }
+
+  // Remove nth from non-duplicates (OpenClaw behavior)
+  for (const [ref, data] of Object.entries(refs)) {
+    const key = getKey(data.role, data.name)
+    const list = refsByKey.get(key) ?? []
+    if (list.length <= 1) delete refs[ref].nth
+  }
+
+  return {
+    snapshot: result.join('\n') || '(empty)',
+    refs
+  }
+}
 
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
   const { page } = await getBrowser(userId)
@@ -133,38 +213,12 @@ async function snapshotPage(userId: string, tabKey: string): Promise<string> {
   const ariaSnapshotRaw = await (page.locator(':root') as any).ariaSnapshot()
   const ariaText = String(ariaSnapshotRaw ?? '')
 
-  const refs: Record<string, { role: string; name?: string; nth?: number }> = {}
-  const roleCounts = new Map<string, number>()
-  let counter = 0
-  const lines = ariaText.split('\n')
-  const outLines: string[] = []
+  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(ariaText)
 
-  for (const line of lines) {
-    const match = line.match(/^(\s*)-\s+(\w+)(?:\s+"([^"]*)")?(.*)$/)
-    if (!match) { outLines.push(line); continue }
-    const [, indent, role, name, rest] = match
-    const roleLower = role.toLowerCase()
-
-    if (INTERACTIVE.has(roleLower)) {
-      counter++
-      const ref = `e${counter}`
-      const key = `${roleLower}:${name ?? ''}`
-      const nth = roleCounts.get(key) ?? 0
-      roleCounts.set(key, nth + 1)
-      refs[ref] = { role: roleLower, name: name || undefined, nth: nth > 0 ? nth : undefined }
-      const refTag = nth > 0 ? ` [ref=${ref}] [nth=${nth}]` : ` [ref=${ref}]`
-      outLines.push(`${indent}- ${role}${name ? ` "${name}"` : ''}${refTag}${rest}`)
-    } else {
-      outLines.push(line)
-    }
-  }
-
-  // Store refs persistently on the page object AND in tabKey map
-  storeRefs(userId, page, refs)
-  sessionRefs.set(tabKey, refs)
+  storeRoleRefsForTarget(userId, page, refs)
 
   console.log(`[snapshot] url=${url} refs=${Object.keys(refs).length}`)
-  return `URL: ${url}\n${outLines.join('\n') || '(no elements)'}`
+  return `URL: ${url}\n${snapshot}`
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -172,33 +226,23 @@ async function snapshotPage(userId: string, tabKey: string): Promise<string> {
 async function navigateTo(url: string, userId: string): Promise<void> {
   const { page } = await getBrowser(userId)
   await page.goto(url, { timeout: 30000, waitUntil: 'domcontentloaded' })
-  // For Google wait longer to let dynamic content render
   const isGoogle = url.includes('google.com')
   await new Promise(r => setTimeout(r, isGoogle ? 2000 : 1000))
   const state = pageStates.get(page)
   if (state) state.roleRefs = {}
 }
 
-async function clickRef(tabKey: string, ref: string, userId: string): Promise<void> {
+async function clickRef(userId: string, ref: string): Promise<void> {
   const { page } = await getBrowser(userId)
-  // Restore refs from cache if page state was lost
-  const state = getPageState(page)
-  if (!state.roleRefs[ref]) {
-    const cached = roleRefsByTarget.get(userId)
-    if (cached) state.roleRefs = cached
-  }
+  restoreRoleRefsForTarget(userId, page)
   const locator = refLocator(page, ref)
   await locator.click({ timeout: 8000 })
   await new Promise(r => setTimeout(r, 300))
 }
 
-async function typeInRef(tabKey: string, ref: string, text: string, userId: string): Promise<void> {
+async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
   const { page } = await getBrowser(userId)
-  const state = getPageState(page)
-  if (!state.roleRefs[ref]) {
-    const cached = roleRefsByTarget.get(userId)
-    if (cached) state.roleRefs = cached
-  }
+  restoreRoleRefsForTarget(userId, page)
   const locator = refLocator(page, ref)
   await locator.fill(text, { timeout: 8000 })
 }
@@ -215,30 +259,28 @@ async function scrollPage(direction: 'up' | 'down', amount = 300, userId: string
   await new Promise(r => setTimeout(r, 300))
 }
 
+async function readPage(userId: string): Promise<string> {
+  const { page } = await getBrowser(userId)
+  const content = await page.evaluate(() => {
+    const remove = document.querySelectorAll('script,style,nav,header,footer,aside,[class*="ad"],[class*="cookie"],[class*="popup"],[id*="cookie"],[id*="popup"]')
+    remove.forEach(el => el.remove())
+    const main = document.querySelector('main,article,[role="main"],[class*="content"],[id*="content"],[id*="main"]') as HTMLElement | null
+    const text = (main || document.body).innerText
+    return text.replace(/\n{3,}/g, '\n\n').trim().slice(0, 6000)
+  }).catch(() => '')
+  return `Page content:\n${content}`
+}
+
 async function dismissCookie(userId: string, tabKey: string): Promise<string> {
   const { page } = await getBrowser(userId)
   const dismissed = await page.evaluate(() => {
     const SELECTORS = [
-      '#onetrust-reject-all-handler',
-      '#onetrust-accept-btn-handler',
-      '.onetrust-close-btn-handler',
-      '[aria-label="Reject all"]',
-      '[aria-label="Accept all"]',
-      'button[id*="reject"]',
-      'button[id*="decline"]',
-      'button[id*="accept"]',
-      'button[id*="close"]',
-      'button[class*="reject"]',
-      'button[class*="decline"]',
-      'button[class*="cookie"]',
-      '.cookie-banner button',
-      '.cookie-notice button',
-      '.cc-dismiss',
-      '.cc-btn',
-      '[id*="cookie"] button',
-      '[class*="cookie"] button',
-      '[id*="consent"] button',
-      '[id*="gdpr"] button',
+      '#onetrust-reject-all-handler', '#onetrust-accept-btn-handler',
+      '.onetrust-close-btn-handler', '[aria-label="Reject all"]', '[aria-label="Accept all"]',
+      'button[id*="reject"]', 'button[id*="decline"]', 'button[id*="accept"]', 'button[id*="close"]',
+      'button[class*="reject"]', 'button[class*="decline"]', 'button[class*="cookie"]',
+      '.cookie-banner button', '.cookie-notice button', '.cc-dismiss', '.cc-btn',
+      '[id*="cookie"] button', '[class*="cookie"] button', '[id*="consent"] button', '[id*="gdpr"] button',
     ]
     for (const sel of SELECTORS) {
       const el = document.querySelector(sel) as HTMLElement | null
@@ -246,83 +288,80 @@ async function dismissCookie(userId: string, tabKey: string): Promise<string> {
     }
     const overlays = [
       '#onetrust-consent-sdk', '.onetrust-pc-dark-filter',
-      '[id*="cookie-banner"]', '[class*="cookie-banner"]',
-      '.cc-window', '#CybotCookiebotDialog',
+      '[id*="cookie-banner"]', '[class*="cookie-banner"]', '.cc-window', '#CybotCookiebotDialog',
     ]
     let removed = 0
     for (const sel of overlays) {
       document.querySelectorAll(sel).forEach(el => { el.remove(); removed++ })
     }
-    if (removed > 0) return `Removed ${removed} overlay elements`
-    return 'No cookie popup found'
+    return removed > 0 ? `Removed ${removed} overlay elements` : 'No cookie popup found'
   })
   await new Promise(r => setTimeout(r, 800))
   const snapshot = await snapshotPage(userId, tabKey)
   return `Cookie handled: ${dismissed}\n\nPage after:\n${snapshot}`
 }
 
+async function readGoogleSearchResults(userId: string): Promise<string> {
+  await new Promise(r => setTimeout(r, 1500))
+  const { page } = await getBrowser(userId)
+  return await page.evaluate(() => {
+    const results: string[] = []
+    document.querySelectorAll('.g, .Gx5Zad, .tF2Cxc').forEach(el => {
+      const title = el.querySelector('h3')
+      const snippet = el.querySelector('.VwiC3b, .MUxGbd, .yXK7lf, .lEBKkf')
+      if (title) {
+        const t = (title as HTMLElement).innerText?.trim()
+        const s = snippet ? (snippet as HTMLElement).innerText?.trim() : ''
+        if (t && t.length > 10 && !t.includes('Skip to main')) {
+          results.push(s ? `• ${t} — ${s}` : `• ${t}`)
+        }
+      }
+    })
+    if (results.length === 0) {
+      document.querySelectorAll('h3').forEach(el => {
+        const t = (el as HTMLElement).innerText?.trim()
+        if (t && t.length > 10 && !t.includes('Skip') && !t.includes('Accessibility')) {
+          results.push(`• ${t}`)
+        }
+      })
+    }
+    return results.slice(0, 15).join('\n') || 'No results found'
+  }).catch(() => 'Failed to read search results')
+}
+
 // ─── Tools ───────────────────────────────────────────────────────────────────
 
 const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
-  { type: 'function', function: { name: 'browser_snapshot', description: 'Read the current page. Returns interactive elements with refs like e1, e2. Call this first and after every navigation.', parameters: { type: 'object', properties: {}, required: [] } } },
-  { type: 'function', function: { name: 'browser_read', description: 'Extract all readable text content from the current page. Use this to read articles, news, search results, or any page content. Much more efficient than snapshot for reading.', parameters: { type: 'object', properties: {}, required: [] } } },
-  { type: 'function', function: { name: 'browser_navigate', description: 'Navigate to a URL. Always use full https:// URLs. For Google search go directly to https://www.google.com/search?q=your+query', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
-  { type: 'function', function: { name: 'browser_click', description: 'Click element by ref from last snapshot. If error says blocked by overlay call browser_dismiss_cookie first.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] } } },
-  { type: 'function', function: { name: 'browser_type', description: 'Type text into a ref element.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
-  { type: 'function', function: { name: 'browser_key', description: 'Press a key: Enter, Tab, Escape, ArrowDown, ArrowUp.', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
-  { type: 'function', function: { name: 'browser_scroll', description: 'Scroll page up or down. Use before clicking elements that may be outside viewport.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
-  { type: 'function', function: { name: 'browser_dismiss_cookie', description: 'Dismiss cookie/consent popups. Call this immediately when any element says it is blocked by an overlay or intercepts pointer events.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'browser_navigate', description: 'Navigate to a URL. Always use full https:// URLs. For Google search: https://www.google.com/search?q=your+query', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
+  { type: 'function', function: { name: 'browser_snapshot', description: 'Get interactive elements on current page with refs like e1, e2. Use when you need to click something. After navigate you get content automatically.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'browser_read', description: 'Extract all readable text from current page. Use to read articles, news, page content.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'browser_click', description: 'Click element by ref from last snapshot. Ref must come from browser_snapshot.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] } } },
+  { type: 'function', function: { name: 'browser_type', description: 'Type text into input element by ref.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
+  { type: 'function', function: { name: 'browser_key', description: 'Press keyboard key: Enter, Tab, Escape, ArrowDown, ArrowUp.', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
+  { type: 'function', function: { name: 'browser_scroll', description: 'Scroll page up or down. Use when element is outside viewport.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
+  { type: 'function', function: { name: 'browser_dismiss_cookie', description: 'Dismiss cookie/consent popups. Call immediately when element says blocked by overlay.', parameters: { type: 'object', properties: {}, required: [] } } },
   { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds for page to load.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
-  { type: 'function', function: { name: 'task_complete', description: 'Call when task is done. The summary MUST be detailed and complete — minimum 200 words for research/news tasks. Include all findings with specifics.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
-  { type: 'function', function: { name: 'task_failed', description: 'Call when task cannot be completed after trying all approaches.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] } } },
+  { type: 'function', function: { name: 'task_complete', description: 'Mark task done with full detailed result. For news/research: minimum 5 items with details. Never vague.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } },
+  { type: 'function', function: { name: 'task_failed', description: 'Mark task failed after exhausting all approaches.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] } } },
 ]
 
-// ─── System Prompt ────────────────────────────────────────────────────────────
+// ─── System prompt (OpenClaw style — short and precise) ──────────────────────
 
 const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent.
+Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_scroll, browser_dismiss_cookie, browser_wait, task_complete, task_failed.
 
-## How It Works
-When you navigate to a page, you automatically receive:
-- PAGE CONTENT: the full readable text from the page
-- INTERACTIVE ELEMENTS: refs for clicking
-
-## Your Job
-## For Search Tasks
-After getting search results you have two options:
-A) If task wants a quick overview: call task_complete with all titles and snippets as bullet points
-B) If task wants details/more info: navigate to the top 2-3 article URLs from results, use browser_read on each, then call task_complete with comprehensive content from all articles
-
-Always choose B when the user says "more details", "tell me more", "in depth", "read the articles"
-Always choose A for quick queries like "what's in the news today"
-
-For task_complete: write at minimum 300 words with real specific information — not vague summaries
-
-1. Navigate to the right page
-2. Read the PAGE CONTENT you received
-3. Call task_complete with the full answer
-
-## Task Complete Rules
-- Always include the actual data in task_complete — real headlines, real prices, real results
-- For news: list at least 5 headlines with brief details
-- For prices: list the actual numbers
-- For fixtures: list the actual matches and times
-- Never give a vague summary — always give the real information
-
-## If You Need To Click Something
-Use the INTERACTIVE ELEMENTS refs to click
-After clicking, you get new PAGE CONTENT automatically
-
-## Cookie Popups
-If anything is blocked call browser_dismiss_cookie then browser_navigate to the same URL again
-
-## Search
-Navigate directly to: https://www.google.com/search?q=your+query
-Read the search results from PAGE CONTENT and call task_complete
-
-## Rules
-- Never try to log in
-- Always call task_complete or task_failed
-- Never leave a task without a conclusion`
+Rules:
+- For browser tasks: browser_navigate first — you get page content automatically
+- For reading content: use browser_read, not browser_snapshot
+- For clicking: use browser_snapshot to get refs, then browser_click
+- Never guess refs — only use refs from browser_snapshot
+- For Google search: navigate to https://www.google.com/search?q=query
+- Always call task_complete or task_failed — never leave a task unfinished
+- task_complete must include real data — actual headlines, prices, results — never vague summaries
+- If element blocked by overlay: browser_dismiss_cookie then retry
+- If element outside viewport: browser_scroll then browser_snapshot
+- Never try to log in — call task_failed if login required
+- Complete tasks in minimum steps`
 
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
@@ -341,9 +380,7 @@ function trimMessages(messages: any[]): any[] {
   for (const msg of rest) {
     if (msg.role === 'tool') {
       const prev = verified[verified.length - 1]
-      if (prev?.role === 'assistant' && prev?.tool_calls?.length > 0) {
-        verified.push(msg)
-      }
+      if (prev?.role === 'assistant' && prev?.tool_calls?.length > 0) verified.push(msg)
     } else {
       verified.push(msg)
     }
@@ -351,7 +388,7 @@ function trimMessages(messages: any[]): any[] {
   return [system, ...verified]
 }
 
-// ─── Agent Loop ───────────────────────────────────────────────────────────────
+// ─── Agent loop ───────────────────────────────────────────────────────────────
 
 async function runAgentLoop(opts: {
   userId: string
@@ -368,15 +405,12 @@ async function runAgentLoop(opts: {
 
   for (let attempt = 0; attempt < 2; attempt++) {
     const finalPrompt = opts.context
-      ? `${opts.context}\n\n---\nBased on the conversation above, the user is asking: "${opts.taskPrompt}"\nIf this is a follow-up like "more details", "do it again", "tell me more" — identify the specific topic from the last Assistant message and search for that topic with more detail. Do NOT search for the literal words the user typed.`
+      ? `${opts.context}\n\n---\nCurrent task: "${opts.taskPrompt}"\nIf this is a follow-up like "more details" or "do it again" — use conversation context to identify the topic and expand on it.`
       : opts.taskPrompt
 
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: attempt === 0
-        ? finalPrompt
-        : `${finalPrompt}\n\nPrevious attempt failed. Try a completely different approach.`
-      }
+      { role: 'user', content: attempt === 0 ? finalPrompt : `${finalPrompt}\n\nPrevious attempt failed. Try a completely different approach.` }
     ]
 
     let iterations = 0
@@ -384,9 +418,7 @@ async function runAgentLoop(opts: {
     let retryReason = ''
 
     while (iterations < MAX_ITERATIONS && Date.now() < deadline) {
-      if (opts.abortSignal?.aborted) {
-        return { success: false, summary: 'Task stopped by user.' }
-      }
+      if (opts.abortSignal?.aborted) return { success: false, summary: 'Task stopped by user.' }
       iterations++
 
       const response = await openai.chat.completions.create({
@@ -412,103 +444,52 @@ async function runAgentLoop(opts: {
           return { success: false, summary: loopCheck.message || 'Stuck in a loop' }
         }
 
-        if (opts.abortSignal?.aborted) {
-          return { success: false, summary: 'Task stopped by user.' }
-        }
+        if (opts.abortSignal?.aborted) return { success: false, summary: 'Task stopped by user.' }
 
         try {
           switch (toolCall.function.name) {
+            case 'browser_navigate': {
+              consecutiveSnapshots = 0
+              await opts.onProgress(`🌐 Navigating to ${args.url}...`)
+              await navigateTo(args.url, opts.userId)
+              // Auto-dismiss cookie
+              const { page: p } = await getBrowser(opts.userId)
+              await p.evaluate(() => {
+                const sels = ['#onetrust-reject-all-handler','#onetrust-accept-btn-handler','button[id*="reject"]','button[id*="accept"]','button[class*="cookie"]','.cc-dismiss','.cc-btn','[id*="cookie"] button','[id*="consent"] button']
+                for (const sel of sels) { const el = document.querySelector(sel) as HTMLElement; if (el?.offsetParent !== null) { el.click(); break } }
+              }).catch(() => {})
+              await new Promise(r => setTimeout(r, 600))
+              // Auto-read after navigation
+              const isGoogleSearch = args.url.includes('google.com/search')
+              if (isGoogleSearch) {
+                const content = await readGoogleSearchResults(opts.userId)
+                result = `Google search results:\n${content}\n\nCall task_complete with all results formatted as bullet points. If user wants more details navigate to article URLs and use browser_read.`
+              } else {
+                const content = await readPage(opts.userId)
+                const snapshot = await snapshotPage(opts.userId, opts.tabKey)
+                result = `Navigated to ${args.url}.\n\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
+              }
+              break
+            }
             case 'browser_snapshot': {
               consecutiveSnapshots++
               await opts.onProgress('📸 Reading page...')
               result = await snapshotPage(opts.userId, opts.tabKey)
               if (consecutiveSnapshots >= 3) {
-                result += `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row with no action. You MUST now: click something, scroll, navigate, call browser_dismiss_cookie, or call task_failed. Do NOT snapshot again.`
+                result += `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, dismiss cookie, or call task_failed.`
               }
               break
             }
-            case 'browser_navigate': {
+            case 'browser_read': {
               consecutiveSnapshots = 0
-              await opts.onProgress(`🌐 Navigating to ${args.url}...`)
-              await navigateTo(args.url, opts.userId)
-              // Auto-dismiss cookie after navigation
-              const { page: p } = await getBrowser(opts.userId)
-              await p.evaluate(() => {
-                const SELECTORS = [
-                  '#onetrust-reject-all-handler','#onetrust-accept-btn-handler',
-                  'button[id*="reject"]','button[id*="accept"]',
-                  'button[class*="reject"]','button[class*="cookie"]',
-                  '.cc-dismiss','.cc-btn','[id*="cookie"] button',
-                  '[id*="consent"] button',
-                ]
-                for (const sel of SELECTORS) {
-                  const el = document.querySelector(sel) as HTMLElement | null
-                  if (el && el.offsetParent !== null) { el.click(); return }
-                }
-              }).catch(() => {})
-              await new Promise(r => setTimeout(r, 800))
-              // Auto-read the page content after navigation
-              const { page: p2 } = await getBrowser(opts.userId)
-              const isGoogleSearch = args.url.includes('google.com/search')
-              if (isGoogleSearch) {
-                await new Promise(r => setTimeout(r, 1500))
-                const { page: p3 } = await getBrowser(opts.userId)
-                const content = await p3.evaluate(() => {
-                  const results: string[] = []
-                  const containers = document.querySelectorAll(
-                    '.g:not(.commercial-unit-desktop-top):not(.ads-ad), [data-hveid] .g, .Gx5Zad, .tF2Cxc'
-                  )
-                  containers.forEach(el => {
-                    const title = el.querySelector('h3')
-                    const snippet = el.querySelector(
-                      '.VwiC3b, .MUxGbd, .yXK7lf, .lEBKkf, [data-sncf="1"], [data-sncf="2"]'
-                    )
-                    if (title) {
-                      const t = (title as HTMLElement).innerText?.trim()
-                      const s = snippet ? (snippet as HTMLElement).innerText?.trim() : ''
-                      if (t && t.length > 10 && !t.includes('Skip to main')) {
-                        results.push(s ? `• ${t} — ${s}` : `• ${t}`)
-                      }
-                    }
-                  })
-                  if (results.length === 0) {
-                    document.querySelectorAll('h3').forEach(el => {
-                      const t = (el as HTMLElement).innerText?.trim()
-                      if (t && t.length > 10 && !t.includes('Skip to main') && !t.includes('Accessibility')) {
-                        results.push(`• ${t}`)
-                      }
-                    })
-                  }
-                  return results.slice(0, 15).join('\n') || 'No results found'
-                }).catch(() => 'Failed to read search results')
-                result = `Google search results for: ${args.url}\n\n${content}\n\n` +
-                  `NEXT STEP: If you have enough information, call task_complete with all bullet points above formatted in detail.\n` +
-                  `If user wants more details, navigate to 1-2 of the article pages and use browser_read to get full content.`
-                break
-              }
-              const content = await p2.evaluate(() => {
-                const remove = document.querySelectorAll('script,style,nav,header,footer,aside,[class*="ad"],[class*="cookie"],[class*="popup"],[id*="cookie"],[id*="popup"]')
-                remove.forEach(el => el.remove())
-                const main = document.querySelector('main,article,[role="main"],[class*="content"],[id*="content"],[id*="main"]') as HTMLElement | null
-                const text = (main || document.body).innerText
-                return text.replace(/\n{3,}/g, '\n\n').trim().slice(0, 4000)
-              }).catch(() => '')
-              // Also get interactive elements for clicking
-              const snapshot = await snapshotPage(opts.userId, opts.tabKey)
-              if (isGoogleSearch) {
-                result = `Search results for ${args.url}:\n${content}\n\n` +
-                `INSTRUCTION: You now have search results with titles, snippets and URLs.\n` +
-                `Step 1: Call task_complete with a summary of ALL results found above.\n` +
-                `If the task asks for "more details" or "read articles": navigate to the top 2-3 URLs from the results above to read the full articles, then call task_complete with comprehensive details from all articles combined.`
-              } else {
-                result = `Navigated to ${args.url}.\n\nPAGE CONTENT:\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
-              }
+              await opts.onProgress('📖 Reading page...')
+              result = await readPage(opts.userId)
               break
             }
             case 'browser_click': {
               consecutiveSnapshots = 0
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
-              await clickRef(opts.tabKey, args.ref, opts.userId)
+              await clickRef(opts.userId, args.ref)
               await new Promise(r => setTimeout(r, 500))
               result = await snapshotPage(opts.userId, opts.tabKey)
               result = `Clicked ${args.ref}. Page:\n${result}`
@@ -517,7 +498,7 @@ async function runAgentLoop(opts: {
             case 'browser_type': {
               consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
-              await typeInRef(opts.tabKey, args.ref, args.text, opts.userId)
+              await typeInRef(opts.userId, args.ref, args.text)
               if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 300))
               result = await snapshotPage(opts.userId, opts.tabKey)
@@ -542,20 +523,6 @@ async function runAgentLoop(opts: {
               consecutiveSnapshots = 0
               await opts.onProgress('🍪 Dismissing cookie popup...')
               result = await dismissCookie(opts.userId, opts.tabKey)
-              break
-            }
-            case 'browser_read': {
-              consecutiveSnapshots = 0
-              await opts.onProgress('📖 Reading page content...')
-              const { page } = await getBrowser(opts.userId)
-              const content = await page.evaluate(() => {
-                const remove = document.querySelectorAll('script, style, nav, header, footer, aside, .ad, .advertisement, .cookie, .popup')
-                remove.forEach(el => el.remove())
-                const main = document.querySelector('main, article, [role="main"], .content, #content, #main') as HTMLElement | null
-                const text = main ? main.innerText : document.body.innerText
-                return text.replace(/\n{3,}/g, '\n\n').trim().slice(0, 3000)
-              })
-              result = `Page content:\n${content}`
               break
             }
             case 'browser_wait': {
@@ -586,11 +553,7 @@ async function runAgentLoop(opts: {
         }
 
         detectLoop(opts.taskId, toolCall.function.name, args, result)
-
-        if (loopCheck.stuck && loopCheck.level === 'warning') {
-          result += `\n\n${loopCheck.message}`
-        }
-
+        if (loopCheck.stuck && loopCheck.level === 'warning') result += `\n\n${loopCheck.message}`
         toolResults.push({ role: 'tool', tool_call_id: toolCall.id, content: result })
       }
 
@@ -655,7 +618,6 @@ export async function runAgentWithExtension(
     return err instanceof Error ? err.message : String(err)
   } finally {
     runningTasks.delete(taskKey)
-
     if (!keepTabOpen && newTabId) {
       try {
         await new Promise(r => setTimeout(r, 500))
@@ -664,13 +626,10 @@ export async function runAgentWithExtension(
       } catch {}
     } else if (keepTabOpen && newTabId) {
       try {
-        // Keep the tab open but navigate away from blank/intermediate state
-        // Just detach the agent - don't close the tab
         const { sendExtensionMessage } = await import('../index.js')
         await sendExtensionMessage(userId, 'detachTab', { tabId: newTabId })
       } catch {}
     }
-
     try {
       await supabase.from('task_executions').insert({
         user_id: userId,
