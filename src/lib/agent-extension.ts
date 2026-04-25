@@ -218,7 +218,11 @@ async function snapshotPage(userId: string, tabKey: string): Promise<string> {
   storeRoleRefsForTarget(userId, page, refs)
 
   console.log(`[snapshot] url=${url} refs=${Object.keys(refs).length}`)
-  return `URL: ${url}\n${snapshot}`
+  const MAX_SNAPSHOT_CHARS = 10000
+  const snapshotText = `URL: ${url}\n${snapshot}`
+  return snapshotText.length > MAX_SNAPSHOT_CHARS
+    ? snapshotText.slice(0, MAX_SNAPSHOT_CHARS) + '\n...(snapshot truncated)'
+    : snapshotText
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -374,15 +378,16 @@ This is the user's real Chrome browser. They are already logged into GitHub, Gma
 You do NOT need to log in. You do NOT need credentials. Just navigate and act.
 NEVER call task_failed because of "authentication" or "login" — just navigate to the site and do it.
 
-## Rules
-- Always start by navigating to the right page with browser_navigate
+## Navigation Flow (follow exactly)
+1. browser_navigate — navigates to page, returns URL only
+2. browser_read — read the page text content (for news, articles, search results)
+3. browser_snapshot — get interactive elements with refs (for clicking)
+Never call browser_snapshot immediately after browser_navigate unless you need to click something
+For reading content always use browser_read after navigating
 - Never refuse a task without trying — navigate first, then decide
 - For GitHub: navigate to https://github.com/new to create repos
 - For Gmail: navigate to https://mail.google.com
-- For any website task: navigate there first, take a snapshot, then act
 - For Google search: navigate to https://www.google.com/search?q=query
-- Use browser_read to read page content
-- Use browser_snapshot to get refs for clicking
 - Never guess refs — only use refs from browser_snapshot
 - Always call task_complete or task_failed — never leave unfinished
 - task_complete must include real results — never vague summaries
@@ -481,23 +486,19 @@ async function runAgentLoop(opts: {
               consecutiveSnapshots = 0
               await opts.onProgress(`🌐 Navigating to ${args.url}...`)
               await navigateTo(args.url, opts.userId)
-              // Auto-dismiss cookie
+              // Auto-dismiss cookie only — no content reading
               const { page: p } = await getBrowser(opts.userId)
               await p.evaluate(() => {
-                const sels = ['#onetrust-reject-all-handler','#onetrust-accept-btn-handler','button[id*="reject"]','button[id*="accept"]','button[class*="cookie"]','.cc-dismiss','.cc-btn','[id*="cookie"] button','[id*="consent"] button']
-                for (const sel of sels) { const el = document.querySelector(sel) as HTMLElement; if (el?.offsetParent !== null) { el.click(); break } }
+                const sels = ['#onetrust-reject-all-handler','#onetrust-accept-btn-handler','button[id*="reject"]','button[id*="accept"]','button[class*="cookie"]','.cc-dismiss','[id*="consent"] button']
+                for (const sel of sels) {
+                  const el = document.querySelector(sel) as HTMLElement
+                  if (el?.offsetParent !== null) { el.click(); break }
+                }
               }).catch(() => {})
               await new Promise(r => setTimeout(r, 600))
-              // Auto-read after navigation
-              const isGoogleSearch = args.url.includes('google.com/search')
-              if (isGoogleSearch) {
-                const content = await readGoogleSearchResults(opts.userId)
-                result = `Google search results:\n${content}\n\nCall task_complete with all results formatted as bullet points. If user wants more details navigate to article URLs and use browser_read.`
-              } else {
-                const content = await readPage(opts.userId)
-                const snapshot = await snapshotPage(opts.userId, opts.tabKey)
-                result = `Navigated to ${args.url}.\n\n${content}\n\nINTERACTIVE ELEMENTS:\n${snapshot}`
-              }
+              // Return URL only — agent calls browser_snapshot or browser_read next
+              const { page: p2 } = await getBrowser(opts.userId)
+              result = `Navigated to ${args.url} (current URL: ${p2.url()}). Now call browser_snapshot to see interactive elements or browser_read to read page content.`
               break
             }
             case 'browser_snapshot': {
