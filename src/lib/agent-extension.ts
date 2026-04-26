@@ -149,7 +149,7 @@ const CONTENT_ROLES = new Set([
 ])
 
 
-const EFFICIENT_SNAPSHOT_MAX_CHARS = 8000
+const EFFICIENT_SNAPSHOT_MAX_CHARS = 6000
 const CDP_URL = () => `ws://127.0.0.1:${18792}/cdp` // relay port
 
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
@@ -518,9 +518,9 @@ Use browser_evaluate when you need to read data not visible in snapshot.`
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
 function trimMessages(messages: any[]): any[] {
-  if (messages.length <= 30) return messages
+  if (messages.length <= 12) return messages
   const system = messages[0]
-  let rest = messages.slice(1).slice(-28)
+  let rest = messages.slice(1).slice(-10)
   while (rest.length > 0 && rest[0].role === 'tool') rest = rest.slice(1)
   while (
     rest.length > 0 &&
@@ -551,7 +551,7 @@ async function runAgentLoop(opts: {
   context?: string
   abortSignal?: AbortSignal
 }): Promise<{ success: boolean; summary: string }> {
-  const MAX_ITERATIONS = 30
+  const MAX_ITERATIONS = 20
   const deadline = Date.now() + 240_000
   let consecutiveSnapshots = 0
 
@@ -574,11 +574,11 @@ async function runAgentLoop(opts: {
       iterations++
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
+        model: 'gpt-4o-mini',
         messages: trimMessages(messages),
         tools: browserTools,
         tool_choice: 'required',
-        max_tokens: 500,
+        max_tokens: 300,
       })
 
       const msg = response.choices[0].message
