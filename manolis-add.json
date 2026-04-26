@@ -1,0 +1,152 @@
+{
+  "changes": [
+    {
+      "description": "Replace simple OpenAI tool calls with HTTP route-based architecture like OpenClaw. Create routes for each action (e.g., /act, /snapshot) instead of embedding in OpenAI function tools.",
+      "why": "OpenClaw's server-based approach is more robust, allows better error handling, and separates concerns."
+    },
+    {
+      "description": "Implement comprehensive snapshot formats: Add AI snapshots (using Playwright's _snapshotForAI), Aria snapshots, and options for interactive/compact modes.",
+      "why": "OpenClaw supports multiple snapshot types for different use cases, making complex UI analysis possible."
+    },
+    {
+      "description": "Add sophisticated error handling with AI-friendly error rewriting (e.g., toAIFriendlyError function) that provides actionable guidance instead of raw errors.",
+      "why": "OpenClaw's error messages help agents recover from failures like viewport issues or missing elements."
+    },
+    {
+      "description": "Implement role ref caching and persistence across sessions, similar to OpenClaw's roleRefsByTarget and storeRoleRefsForTarget.",
+      "why": "This prevents ref staleness and allows refs to persist across multiple actions."
+    },
+    {
+      "description": "Add support for browser profiles, allowing different isolated browser instances (e.g., chrome profile for relay, openclaw profile for managed browser).",
+      "why": "OpenClaw supports different browser configurations for various automation needs."
+    },
+    {
+      "description": "Implement proper timeout normalization and interaction timeouts (e.g., resolveInteractionTimeoutMs) to prevent hangs.",
+      "why": "OpenClaw clamps timeouts to reasonable ranges and handles long-running operations safely."
+    },
+    {
+      "description": "Add frame/iframe support in snapshots and actions, allowing operations within nested frames.",
+      "why": "OpenClaw can target elements in iframes, which is essential for complex web apps."
+    },
+    {
+      "description": "Implement browser lifecycle management: status, start, stop, and tab management (open, focus, close).",
+      "why": "OpenClaw provides full control over browser state, not just navigation."
+    },
+    {
+      "description": "Add advanced wait conditions: wait for text, textGone, selector, URL, loadState, and custom functions.",
+      "why": "OpenClaw's wait actions handle dynamic content loading much better than simple time-based waits."
+    }
+  ],
+  "missing_functions": [
+    {
+      "name": "scrollIntoViewViaPlaywright",
+      "description": "Scrolls an element into view by ref using Playwright's locator.scrollIntoViewIfNeeded with timeout handling. Essential for off-screen elements.",
+      "complex_task": "Handles viewport scrolling for elements outside current view, with proper error handling for non-existent refs."
+    },
+    {
+      "name": "evaluateViaPlaywright",
+      "description": "Executes custom JavaScript in browser context, supporting both page-level and element-specific evaluation with timeout and abort handling.",
+      "complex_task": "Allows running arbitrary JS code for advanced automation tasks like form manipulation, data extraction, or custom interactions."
+    },
+    {
+      "name": "waitForViaPlaywright",
+      "description": "Advanced wait function supporting multiple conditions: time, text appearance/disappearance, selector visibility, URL changes, load states, and custom JS functions.",
+      "complex_task": "Enables waiting for complex page state changes, crucial for dynamic web applications with AJAX loading."
+    },
+    {
+      "name": "dragViaPlaywright",
+      "description": "Drags an element from one ref to another, with timeout handling.",
+      "complex_task": "Supports drag-and-drop interactions common in modern web apps."
+    },
+    {
+      "name": "selectOptionViaPlaywright",
+      "description": "Selects options in dropdown elements by value array, with timeout.",
+      "complex_task": "Handles complex select elements with multiple selections."
+    },
+    {
+      "name": "fillFormViaPlaywright",
+      "description": "Fills multiple form fields at once based on field array, handling different input types.",
+      "complex_task": "Automates complex form filling with proper type handling (checkboxes, radios, text)."
+    },
+    {
+      "name": "takeScreenshotViaPlaywright",
+      "description": "Takes screenshots of full page, elements, or viewport with type options.",
+      "complex_task": "Supports visual verification and debugging of page states."
+    },
+    {
+      "name": "screenshotWithLabelsViaPlaywright",
+      "description": "Creates labeled screenshots showing element boundaries and refs.",
+      "complex_task": "Visual debugging tool showing interactive elements overlaid on page."
+    },
+    {
+      "name": "pdfViaPlaywright",
+      "description": "Saves current page as PDF with print background.",
+      "complex_task": "Document generation and archiving capabilities."
+    },
+    {
+      "name": "browserConsoleMessages",
+      "description": "Retrieves browser console messages with filtering by level and targetId.",
+      "complex_task": "Debugging tool for JavaScript errors and console output in automated sessions."
+    },
+    {
+      "name": "navigateViaPlaywright",
+      "description": "Enhanced navigation with error handling, retry on detached frames, and URL validation.",
+      "complex_task": "Robust navigation handling for unreliable web apps and extension relays."
+    },
+    {
+      "name": "snapshotAiViaPlaywright",
+      "description": "Creates AI-optimized snapshots using Playwright's internal snapshot tool.",
+      "complex_task": "Provides more intelligent element analysis for complex UI understanding."
+    },
+    {
+      "name": "snapshotRoleViaPlaywright",
+      "description": "Creates role-based snapshots with interactive/content filtering and frame support.",
+      "complex_task": "Advanced snapshot modes for focusing on specific element types or areas."
+    },
+    {
+      "name": "closePageViaPlaywright",
+      "description": "Closes browser pages/tabs.",
+      "complex_task": "Proper tab management in multi-tab automation scenarios."
+    },
+    {
+      "name": "resizeViewportViaPlaywright",
+      "description": "Changes browser viewport size.",
+      "complex_task": "Testing responsive designs and handling mobile/desktop layouts."
+    },
+    {
+      "name": "highlightViaPlaywright",
+      "description": "Highlights elements for visual debugging.",
+      "complex_task": "Visual feedback during automation development and debugging."
+    },
+    {
+      "name": "pressKeyViaPlaywright",
+      "description": "Sends keyboard input to page.",
+      "complex_task": "Complex keyboard interactions like shortcuts and sequences."
+    },
+    {
+      "name": "setInputFilesViaPlaywright",
+      "description": "Sets files for file input elements with proper event dispatching.",
+      "complex_task": "File upload automation with change event triggering."
+    },
+    {
+      "name": "forceDisconnectPlaywrightForTarget",
+      "description": "Force disconnects Playwright connection to recover from stuck operations.",
+      "complex_task": "Recovery mechanism for hanging JavaScript evaluations or timeouts."
+    },
+    {
+      "name": "listPagesViaPlaywright",
+      "description": "Lists all open pages/tabs with metadata.",
+      "complex_task": "Multi-tab management and monitoring."
+    },
+    {
+      "name": "createPageViaPlaywright",
+      "description": "Creates new browser pages/tabs.",
+      "complex_task": "Multi-tab workflow automation."
+    },
+    {
+      "name": "focusPageByTargetIdViaPlaywright",
+      "description": "Focuses specific pages/tabs.",
+      "complex_task": "Tab switching in complex multi-tab scenarios."
+    }
+  ]
+}

@@ -263,6 +263,58 @@ async function scrollPage(direction: 'up' | 'down', amount = 300, userId: string
   await new Promise(r => setTimeout(r, 300))
 }
 
+// From OpenClaw waitForViaPlaywright
+async function waitForCondition(userId: string, opts: {
+  timeMs?: number
+  text?: string
+  selector?: string
+  url?: string
+}): Promise<void> {
+  const { page } = await getBrowser(userId)
+  const timeout = 20000
+  if (opts.timeMs) await page.waitForTimeout(Math.max(0, opts.timeMs))
+  if (opts.text) await page.getByText(opts.text).first().waitFor({ state: 'visible', timeout }).catch(() => {})
+  if (opts.selector) await page.locator(opts.selector).first().waitFor({ state: 'visible', timeout }).catch(() => {})
+  if (opts.url) await page.waitForURL(opts.url, { timeout }).catch(() => {})
+}
+
+// From OpenClaw evaluateViaPlaywright — safe JS evaluation
+async function evaluatePage(userId: string, fn: string): Promise<unknown> {
+  const { page } = await getBrowser(userId)
+  const timeout = 15000
+  try {
+    return await page.evaluate(new Function(`
+      "use strict";
+      try {
+        var candidate = eval("(" + ${JSON.stringify(fn)} + ")");
+        var result = typeof candidate === "function" ? candidate() : candidate;
+        if (result && typeof result.then === "function") {
+          return Promise.race([result, new Promise((_, r) => setTimeout(() => r(new Error("timeout")), ${timeout}))]);
+        }
+        return result;
+      } catch(e) { throw new Error("eval error: " + e.message); }
+    `) as any)
+  } catch (err) {
+    throw new Error(`evaluate failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+// From OpenClaw selectOptionViaPlaywright
+async function selectOption(userId: string, ref: string, values: string[]): Promise<void> {
+  const { page } = await getBrowser(userId)
+  restoreRoleRefsForTarget(userId, page)
+  const locator = refLocator(page, ref)
+  await locator.selectOption(values, { timeout: 8000 })
+}
+
+// From OpenClaw hoverViaPlaywright
+async function hoverRef(userId: string, ref: string): Promise<void> {
+  const { page } = await getBrowser(userId)
+  restoreRoleRefsForTarget(userId, page)
+  const locator = refLocator(page, ref)
+  await locator.hover({ timeout: 8000 })
+}
+
 async function readPage(userId: string): Promise<string> {
   const { page } = await getBrowser(userId)
   const content = await page.evaluate(() => {
@@ -364,6 +416,47 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
       required: ['direction']
     }
   }},
+  { type: 'function', function: {
+    name: 'browser_hover',
+    description: 'Hover over an element by ref. Use to trigger dropdown menus or tooltips.',
+    parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] }
+  }},
+  { type: 'function', function: {
+    name: 'browser_select',
+    description: 'Select option(s) in a dropdown/select element by ref.',
+    parameters: {
+      type: 'object',
+      properties: {
+        ref: { type: 'string' },
+        values: { type: 'array', items: { type: 'string' }, description: 'Values to select' }
+      },
+      required: ['ref', 'values']
+    }
+  }},
+  { type: 'function', function: {
+    name: 'browser_wait_for',
+    description: 'Wait for a condition: text to appear, selector to be visible, or URL to match. Use after clicking buttons that trigger loading.',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Wait for this text to appear on page' },
+        selector: { type: 'string', description: 'CSS selector to wait for' },
+        url: { type: 'string', description: 'URL pattern to wait for' },
+        ms: { type: 'number', description: 'Wait this many milliseconds' }
+      }
+    }
+  }},
+  { type: 'function', function: {
+    name: 'browser_evaluate',
+    description: 'Run JavaScript in the page. Use for reading data, checking state, or doing things impossible with refs. Return value is shown to you.',
+    parameters: {
+      type: 'object',
+      properties: {
+        fn: { type: 'string', description: 'JS function body to execute e.g. "() => document.title"' }
+      },
+      required: ['fn']
+    }
+  }},
   { type: 'function', function: { name: 'browser_dismiss_cookie', description: 'Dismiss cookie/consent popups. Call immediately when element says blocked by overlay.', parameters: { type: 'object', properties: {}, required: [] } } },
   { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds for page to load.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
   { type: 'function', function: {
@@ -416,7 +509,7 @@ Never read the user's post history to write content — write it yourself based 
 draft_content must be called before ask_permission for any publishing action.
 
 You are Unclawned, a browser automation agent controlling a real Chrome browser.
-Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_page_scroll, browser_scroll_to_ref, browser_dismiss_cookie, browser_wait, draft_content, ask_permission, task_complete, task_failed.
+Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_page_scroll, browser_scroll_to_ref, browser_hover, browser_select, browser_wait_for, browser_evaluate, browser_dismiss_cookie, browser_wait, draft_content, ask_permission, task_complete, task_failed.
 
 ## CRITICAL: The user is already logged into all their accounts in this browser
 This is the user's real Chrome browser. They are already logged into GitHub, Gmail, LinkedIn, Twitter, and all other sites.
@@ -450,7 +543,16 @@ For settings pages or long pages:
 ## When To Ask Permission
 Call ask_permission ONLY before clicking these buttons: Post, Send, Submit, Publish, Buy, Purchase, Book, Delete, Remove, Confirm order, Place order.
 Never call ask_permission for: creating repos, filling in forms, reading pages, navigating, searching, creating files or documents.
-After user approves — immediately do the action. Do not ask again.`
+After user approves — immediately do the action. Do not ask again.
+
+## Additional Tools
+- browser_hover — hover to open menus or trigger tooltips
+- browser_select — select dropdown options by value
+- browser_wait_for — wait for text/element/URL to appear after an action
+- browser_evaluate — run JavaScript to read data or check page state
+
+Use browser_wait_for after clicking buttons that trigger navigation or loading.
+Use browser_evaluate when you need to read data not visible in snapshot.`
 
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
@@ -767,6 +869,47 @@ async function runAgentLoop(opts: {
                 return { success: false, summary: 'User cancelled the action.' }
               } else {
                 return { success: false, summary: 'Permission request timed out. Action was not taken.' }
+              }
+              break
+            }
+            case 'browser_hover': {
+              consecutiveSnapshots = 0
+              await opts.onProgress(`🖱️ Hovering ${args.ref}...`)
+              await hoverRef(opts.userId, args.ref)
+              await new Promise(r => setTimeout(r, 400))
+              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = `Hovered ${args.ref}. Page:\n${result}`
+              break
+            }
+            case 'browser_select': {
+              consecutiveSnapshots = 0
+              await opts.onProgress(`📋 Selecting in ${args.ref}...`)
+              await selectOption(opts.userId, args.ref, args.values || [])
+              await new Promise(r => setTimeout(r, 300))
+              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = `Selected ${args.values?.join(', ')} in ${args.ref}. Page:\n${result}`
+              break
+            }
+            case 'browser_wait_for': {
+              await opts.onProgress(`⏳ Waiting...`)
+              await waitForCondition(opts.userId, {
+                timeMs: args.ms,
+                text: args.text,
+                selector: args.selector,
+                url: args.url
+              })
+              result = await snapshotPage(opts.userId, opts.tabKey)
+              result = `Wait done. Page:\n${result}`
+              break
+            }
+            case 'browser_evaluate': {
+              consecutiveSnapshots = 0
+              await opts.onProgress(`⚙️ Running script...`)
+              try {
+                const evalResult = await evaluatePage(opts.userId, args.fn)
+                result = `Script result: ${JSON.stringify(evalResult, null, 2)}`
+              } catch (err) {
+                result = `Script error: ${err instanceof Error ? err.message : String(err)}`
               }
               break
             }
