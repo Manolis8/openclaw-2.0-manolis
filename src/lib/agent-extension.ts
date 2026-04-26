@@ -566,7 +566,7 @@ function cleanContext(context?: string): string {
 async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4o',
       max_tokens: 200,
       messages: [
         {
