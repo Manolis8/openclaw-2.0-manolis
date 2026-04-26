@@ -516,26 +516,32 @@ Use browser_evaluate when you need to read data not visible in snapshot.`
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
 function trimMessages(messages: any[]): any[] {
-  if (messages.length <= 12) return messages
+  if (messages.length <= 14) return messages
   const system = messages[0]
-  let rest = messages.slice(1).slice(-10)
+  let rest = messages.slice(1).slice(-12)
+
+  // Find first complete pair — never start with a tool message
   while (rest.length > 0 && rest[0].role === 'tool') rest = rest.slice(1)
+
+  // Never start with an assistant message that has tool_calls but no following tool message
   while (
     rest.length > 0 &&
     rest[0].role === 'assistant' &&
-    rest[0].tool_calls?.length > 0 &&
-    !rest[0].content
-  ) rest = rest.slice(1)
-  const verified: any[] = []
-  for (const msg of rest) {
-    if (msg.role === 'tool') {
-      const prev = verified[verified.length - 1]
-      if (prev?.role === 'assistant' && prev?.tool_calls?.length > 0) verified.push(msg)
-    } else {
-      verified.push(msg)
-    }
+    Array.isArray(rest[0].tool_calls) &&
+    rest[0].tool_calls.length > 0
+  ) {
+    // Check if all tool_calls have responses immediately after
+    const toolCallIds = rest[0].tool_calls.map((tc: any) => tc.id)
+    const following = rest.slice(1)
+    const respondedIds = following
+      .filter((m: any) => m.role === 'tool')
+      .map((m: any) => m.tool_call_id)
+    const allResponded = toolCallIds.every((id: string) => respondedIds.includes(id))
+    if (allResponded) break
+    rest = rest.slice(1)
   }
-  return [system, ...verified]
+
+  return [system, ...rest]
 }
 
 // Only pass last user message and last assistant summary — not agent steps
