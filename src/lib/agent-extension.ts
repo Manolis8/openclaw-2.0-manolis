@@ -150,40 +150,33 @@ const CONTENT_ROLES = new Set([
 
 
 const EFFICIENT_SNAPSHOT_MAX_CHARS = 6000
+const INTERACTIVE_SNAPSHOT_MAX_CHARS = 2000
 const CDP_URL = () => `ws://127.0.0.1:${18792}/cdp` // relay port
 
-async function snapshotPage(userId: string, tabKey: string): Promise<string> {
+async function snapshotPage(userId: string, tabKey: string, interactiveOnly = false): Promise<string> {
   const { page } = await getBrowser(userId)
   const url = page.url()
-  const maybeAI = page as any
+  const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
+  const ariaText = String(ariaRaw ?? '')
+  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(ariaText)
+  storeRoleRefsForTarget(userId, page, refs)
 
-  // OpenClaw path 1: use _snapshotForAI — stable Playwright refs that survive scrolling
-  if (typeof maybeAI._snapshotForAI === 'function') {
-    try {
-      const result = await maybeAI._snapshotForAI({ timeout: 5000, track: 'response' })
-      let raw = String(result?.full ?? '')
-      if (raw.length > EFFICIENT_SNAPSHOT_MAX_CHARS) {
-        raw = raw.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n\n[...TRUNCATED]'
-      }
-      // buildRoleSnapshotFromAiSnapshot preserves Playwright's own [ref=e13] IDs
-      const { snapshot, refs } = buildRoleSnapshotFromAiSnapshot(raw)
-      storeRoleRefsForTarget(userId, page, refs)
-      console.log(`[snapshot:ai] url=${url} refs=${Object.keys(refs).length} chars=${raw.length}`)
-      return `URL: ${url}\n${snapshot}`
-    } catch (err) {
-      console.log(`[snapshot:ai] failed, falling back: ${err}`)
-    }
+  if (interactiveOnly) {
+    // Only keep lines with refs — buttons, links, inputs
+    const lines = snapshot.split('\n')
+    const interactive = lines.filter(l => l.includes('[ref='))
+    const text = `URL: ${url}\n${interactive.join('\n')}`
+    console.log(`[snapshot:interactive] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
+    return text.length > INTERACTIVE_SNAPSHOT_MAX_CHARS
+      ? text.slice(0, INTERACTIVE_SNAPSHOT_MAX_CHARS) + '\n...(truncated)'
+      : text
   }
 
-  // OpenClaw path 2: ariaSnapshot fallback
-  const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
-  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(String(ariaRaw ?? ''))
-  storeRoleRefsForTarget(userId, page, refs)
-  const text = `URL: ${url}\n${snapshot}`
-  console.log(`[snapshot:aria] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
-  return text.length > EFFICIENT_SNAPSHOT_MAX_CHARS
-    ? text.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n\n[...TRUNCATED]'
-    : text
+  const snapshotText = `URL: ${url}\n${snapshot}`
+  console.log(`[snapshot:full] url=${url} refs=${Object.keys(refs).length} chars=${snapshotText.length}`)
+  return snapshotText.length > EFFICIENT_SNAPSHOT_MAX_CHARS
+    ? snapshotText.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n...(truncated)'
+    : snapshotText
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -499,7 +492,12 @@ For settings pages or long pages:
 1. browser_snapshot — get all refs including off-screen ones
 2. If you see the target ref — browser_scroll_to_ref then browser_click
 3. If target not visible in snapshot — browser_page_scroll down to reveal more
-4. Repeat until found — max 5 scrolls then call task_failed
+ 4. Repeat until found — max 5 scrolls then call task_failed
+
+## Execution Plan
+At the start of each task you receive an EXECUTION PLAN with numbered steps.
+Follow the plan in order. Do not skip steps. Do not add extra steps.
+If a step fails, try once more then call task_failed.
 
 ## When To Ask Permission
 Call ask_permission ONLY before clicking these buttons: Post, Send, Submit, Publish, Buy, Purchase, Book, Delete, Remove, Confirm order, Place order.
@@ -540,7 +538,48 @@ function trimMessages(messages: any[]): any[] {
   return [system, ...verified]
 }
 
+// Only pass last user message and last assistant summary — not agent steps
+function cleanContext(context?: string): string {
+  if (!context) return ''
+  const lines = context.split('\n')
+  const cleaned: string[] = []
+  let inAgentSteps = false
+  for (const line of lines) {
+    // Skip lines that are agent progress steps
+    if (line.match(/^(🌐|📸|🖱️|⌨️|📖|🍪|🔍|⏳|⚙️|🔐|📝|✅|⚠️|🔄)/)) continue
+    if (line.startsWith('Navigated to') || line.startsWith('Clicked') || line.startsWith('Typed') || line.startsWith('Scrolled') || line.startsWith('URL:') || line.startsWith('- button') || line.startsWith('- link') || line.startsWith('- textbox') || line.includes('[ref=')) continue
+    cleaned.push(line)
+  }
+  // Keep only last 500 chars of cleaned context
+  const result = cleaned.join('\n').trim()
+  return result.length > 500 ? result.slice(-500) : result
+}
+
 // ─── Agent loop ───────────────────────────────────────────────────────────────
+
+async function planTask(prompt: string, url?: string): Promise<string> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 200,
+      messages: [
+        {
+          role: 'system',
+          content: `You are a browser automation planner. Given a task, output a numbered list of exact steps to complete it in a real Chrome browser. Be specific about URLs, button names, and what to type. Max 6 steps. No explanations.`
+        },
+        {
+          role: 'user',
+          content: url
+            ? `Current page: ${url}\nTask: ${prompt}`
+            : `Task: ${prompt}`
+        }
+      ]
+    })
+    return response.choices[0].message.content?.trim() ?? ''
+  } catch {
+    return ''
+  }
+}
 
 async function runAgentLoop(opts: {
   userId: string
@@ -555,14 +594,25 @@ async function runAgentLoop(opts: {
   const deadline = Date.now() + 240_000
   let consecutiveSnapshots = 0
 
+  const cleanedContext = cleanContext(opts.context)
+  const finalPrompt = cleanedContext
+    ? `Previous conversation:\n${cleanedContext}\n\nCurrent task: "${opts.taskPrompt}"`
+    : opts.taskPrompt
+
+  // Generate plan once using cheap model
+  const plan = await planTask(opts.taskPrompt)
+  const planContext = plan ? `\n\nEXECUTION PLAN (follow this order):\n${plan}` : ''
+
   for (let attempt = 0; attempt < 2; attempt++) {
-    const finalPrompt = opts.context
-      ? `${opts.context}\n\n---\nCurrent task: "${opts.taskPrompt}"\nIf this is a follow-up like "more details" or "do it again" — use conversation context to identify the topic and expand on it.`
-      : opts.taskPrompt
 
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: attempt === 0 ? finalPrompt : `${finalPrompt}\n\nPrevious attempt failed. Try a completely different approach.` }
+      {
+        role: 'user',
+        content: attempt === 0
+          ? `${finalPrompt}${planContext}`
+          : `${finalPrompt}\n\nPrevious attempt failed. Try a completely different approach.`
+      }
     ]
 
     let iterations = 0
@@ -574,7 +624,7 @@ async function runAgentLoop(opts: {
       iterations++
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: 'gpt-4o',
         messages: trimMessages(messages),
         tools: browserTools,
         tool_choice: 'required',
