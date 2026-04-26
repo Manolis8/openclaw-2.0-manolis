@@ -149,7 +149,7 @@ const CONTENT_ROLES = new Set([
 ])
 
 
-const EFFICIENT_SNAPSHOT_MAX_CHARS = 10000
+const EFFICIENT_SNAPSHOT_MAX_CHARS = 25000
 const CDP_URL = () => `ws://127.0.0.1:${18792}/cdp` // relay port
 
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
