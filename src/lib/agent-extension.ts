@@ -1,8 +1,15 @@
+//// agent-extension.ts
+
 import OpenAI from 'openai'
 import { chromium, type Browser, type Page } from 'playwright-core'
 import { supabase } from './supabase.js'
 import { getRelayPortForUser } from '../index.js'
 import { detectLoop } from '../routes/tasks.js'
+
+// Use OpenClaw's exact functions from src/browser/
+import { scrollIntoViewViaPlaywright } from '../browser/pw-tools-core.interactions.js'
+import { snapshotAiViaPlaywright, snapshotRoleViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
+import { buildRoleSnapshotFromAriaSnapshot, buildRoleSnapshotFromAiSnapshot } from '../browser/pw-role-snapshot.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
@@ -141,88 +148,42 @@ const CONTENT_ROLES = new Set([
   'listitem', 'article', 'region', 'main', 'navigation'
 ])
 
-function buildRoleSnapshotFromAriaSnapshot(ariaSnapshot: string): { snapshot: string; refs: RoleRefMap } {
-  const lines = ariaSnapshot.split('\n')
-  const refs: RoleRefMap = {}
-  const counts = new Map<string, number>()
-  const refsByKey = new Map<string, string[]>()
-  let counter = 0
 
-  function getKey(role: string, name?: string) { return `${role}:${name ?? ''}` }
-
-  function getNextIndex(role: string, name?: string) {
-    const key = getKey(role, name)
-    const current = counts.get(key) ?? 0
-    counts.set(key, current + 1)
-    return current
-  }
-
-  function trackRef(role: string, name: string | undefined, ref: string) {
-    const key = getKey(role, name)
-    const list = refsByKey.get(key) ?? []
-    list.push(ref)
-    refsByKey.set(key, list)
-  }
-
-  const result: string[] = []
-
-  for (const line of lines) {
-    const match = line.match(/^(\s*-\s*)(\w+)(?:\s+"([^"]*)")?(.*)$/)
-    if (!match) { result.push(line); continue }
-
-    const [, prefix, roleRaw, name, suffix] = match
-    if (roleRaw.startsWith('/')) { result.push(line); continue }
-
-    const role = roleRaw.toLowerCase()
-    const isInteractive = INTERACTIVE_ROLES.has(role)
-    const isContent = CONTENT_ROLES.has(role)
-
-    const shouldHaveRef = isInteractive || (isContent && name)
-    if (!shouldHaveRef) { result.push(line); continue }
-
-    counter++
-    const ref = `e${counter}`
-    const nth = getNextIndex(role, name)
-    trackRef(role, name, ref)
-    refs[ref] = { role, name: name || undefined, nth }
-
-    let enhanced = `${prefix}${roleRaw}`
-    if (name) enhanced += ` "${name}"`
-    enhanced += ` [ref=${ref}]`
-    if (nth > 0) enhanced += ` [nth=${nth}]`
-    if (suffix) enhanced += suffix
-    result.push(enhanced)
-  }
-
-  // Remove nth from non-duplicates (OpenClaw behavior)
-  for (const [ref, data] of Object.entries(refs)) {
-    const key = getKey(data.role, data.name)
-    const list = refsByKey.get(key) ?? []
-    if (list.length <= 1) delete refs[ref].nth
-  }
-
-  return {
-    snapshot: result.join('\n') || '(empty)',
-    refs
-  }
-}
+const EFFICIENT_SNAPSHOT_MAX_CHARS = 10000
+const CDP_URL = () => `ws://127.0.0.1:${18792}/cdp` // relay port
 
 async function snapshotPage(userId: string, tabKey: string): Promise<string> {
   const { page } = await getBrowser(userId)
   const url = page.url()
-  const ariaSnapshotRaw = await (page.locator(':root') as any).ariaSnapshot()
-  const ariaText = String(ariaSnapshotRaw ?? '')
+  const maybeAI = page as any
 
-  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(ariaText)
+  // OpenClaw path 1: use _snapshotForAI — stable Playwright refs that survive scrolling
+  if (typeof maybeAI._snapshotForAI === 'function') {
+    try {
+      const result = await maybeAI._snapshotForAI({ timeout: 5000, track: 'response' })
+      let raw = String(result?.full ?? '')
+      if (raw.length > EFFICIENT_SNAPSHOT_MAX_CHARS) {
+        raw = raw.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n\n[...TRUNCATED]'
+      }
+      // buildRoleSnapshotFromAiSnapshot preserves Playwright's own [ref=e13] IDs
+      const { snapshot, refs } = buildRoleSnapshotFromAiSnapshot(raw)
+      storeRoleRefsForTarget(userId, page, refs)
+      console.log(`[snapshot:ai] url=${url} refs=${Object.keys(refs).length} chars=${raw.length}`)
+      return `URL: ${url}\n${snapshot}`
+    } catch (err) {
+      console.log(`[snapshot:ai] failed, falling back: ${err}`)
+    }
+  }
 
+  // OpenClaw path 2: ariaSnapshot fallback
+  const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
+  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(String(ariaRaw ?? ''))
   storeRoleRefsForTarget(userId, page, refs)
-
-  console.log(`[snapshot] url=${url} refs=${Object.keys(refs).length}`)
-  const EFFICIENT_SNAPSHOT_MAX_CHARS = 15000
-  const snapshotText = `URL: ${url}\n${snapshot}`
-  return snapshotText.length > EFFICIENT_SNAPSHOT_MAX_CHARS
-    ? snapshotText.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n...(snapshot truncated)'
-    : snapshotText
+  const text = `URL: ${url}\n${snapshot}`
+  console.log(`[snapshot:aria] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
+  return text.length > EFFICIENT_SNAPSHOT_MAX_CHARS
+    ? text.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n\n[...TRUNCATED]'
+    : text
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -718,17 +679,13 @@ async function runAgentLoop(opts: {
               restoreRoleRefsForTarget(opts.userId, page)
               try {
                 const locator = refLocator(page, args.ref)
-                await locator.scrollIntoViewIfNeeded({ timeout: 8000 })
+                await locator.scrollIntoViewIfNeeded({ timeout: 20000 })
                 await new Promise(r => setTimeout(r, 500))
-                // Take fresh snapshot after scroll so agent sees updated state
-                const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey)
-                result = `Scrolled ${args.ref} into view. Updated page:\n${freshSnapshot}`
+                const fresh = await snapshotPage(opts.userId, opts.tabKey)
+                result = `Scrolled ${args.ref} into view. Page:\n${fresh}`
               } catch (err) {
-                // Ref not found — try scrolling page down and re-snapshotting
-                await page.evaluate(() => window.scrollBy(0, 600))
-                await new Promise(r => setTimeout(r, 400))
-                const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey)
-                result = `Could not find ref ${args.ref} directly. Scrolled page down. New snapshot:\n${freshSnapshot}\nIf you can see the target element now, use its new ref to click it.`
+                const fresh = await snapshotPage(opts.userId, opts.tabKey)
+                result = `Could not scroll to ${args.ref}: ${toAIFriendlyError(err, args.ref)}\nCurrent page:\n${fresh}`
               }
               break
             }

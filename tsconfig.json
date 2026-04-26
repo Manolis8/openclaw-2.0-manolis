@@ -7,5 +7,33 @@
     "strict": false,
     "skipLibCheck": true,
     "noImplicitAny": false
-  }
+  },
+  "exclude": [
+    "node_modules",
+    "**/*.test.ts",
+    "**/*.test-harness.ts",
+    "**/*.e2e.test.ts",
+    "src/agents/tools/browser-tool.ts",
+    "src/agents/tools/browser-tool.actions.ts",
+    "src/agents/tools/browser-tool.schema.ts",
+    "src/browser/*.ts",
+    "!src/browser/index.ts",
+    "!src/browser/pw-session.ts",
+    "!src/browser/pw-role-snapshot.ts",
+    "!src/browser/pw-tools-core.shared.ts",
+    "!src/browser/pw-tools-core.snapshot.ts",
+    "!src/browser/pw-tools-core.interactions.ts",
+    "!src/browser/pw-tools-core.activity.ts",
+    "!src/browser/pw-tools-core.state.ts",
+    "!src/browser/constants.ts",
+    "!src/browser/navigation-guard.ts",
+    "!src/browser/stubs.ts",
+    "!src/browser/chrome.ts",
+    "!src/browser/cdp-proxy-bypass.ts",
+    "!src/browser/cdp.helpers.ts",
+    "!src/browser/cdp.ts",
+    "!src/browser/pw-ai.ts",
+    "!src/browser/pw-ai-module.ts",
+    "!src/browser/pw-tools-core.ts"
+  ]
 }

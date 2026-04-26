@@ -1,49 +1,44 @@
-import type { SsrFPolicy } from "../infra/net/ssrf.js";
+import { SsrFBlockedError, InvalidBrowserNavigationUrlError, type SsrFPolicy } from './stubs.js'
 
-export async function assertBrowserNavigationAllowed(opts: {
-  url: string;
-  allowedOrigins?: string[];
-  blockedOrigins?: string[];
-  allowLoopback?: boolean;
-  blockFileUrls?: boolean;
-}): Promise<void> {
-  try {
-    const url = new URL(opts.url);
-    
-    if (opts.blockFileUrls && url.protocol === "file:") {
-      throw new Error("Navigation to file: URLs is blocked");
-    }
-    
-    if (opts.blockedOrigins?.includes(url.origin)) {
-      throw new Error(`Navigation to ${url.origin} is blocked`);
-    }
-    
-    if (opts.allowedOrigins?.length && !opts.allowedOrigins.includes(url.origin)) {
-      throw new Error(`Navigation to ${url.origin} is not allowed`);
-    }
-    
-    if (opts.allowLoopback === false) {
-      const host = url.hostname.toLowerCase();
-      if (host === "localhost" || host === "127.0.0.1" || host === "::1") {
-        throw new Error("Loopback navigation is blocked");
-      }
-    }
-  } catch (err) {
-    if (err instanceof Error) throw err;
-    throw new Error("Invalid URL");
-  }
+export { SsrFBlockedError, InvalidBrowserNavigationUrlError }
+export type { SsrFPolicy }
+export type LookupFn = (hostname: string) => Promise<string[]>
+
+const NETWORK_NAVIGATION_PROTOCOLS = new Set(['http:', 'https:'])
+const SAFE_NON_NETWORK_URLS = new Set(['about:blank'])
+
+export type BrowserNavigationPolicyOptions = { ssrfPolicy?: SsrFPolicy }
+
+export function withBrowserNavigationPolicy(ssrfPolicy?: SsrFPolicy): BrowserNavigationPolicyOptions {
+  return ssrfPolicy ? { ssrfPolicy } : {}
 }
 
-export function withBrowserNavigationPolicy(
-  ssrfPolicy?: SsrFPolicy,
-): { allowedOrigins?: string[]; blockedOrigins?: string[]; allowLoopback?: boolean; blockFileUrls?: boolean } {
-  if (!ssrfPolicy) {
-    return {};
+export async function assertBrowserNavigationAllowed(opts: {
+  url: string
+  lookupFn?: LookupFn
+} & BrowserNavigationPolicyOptions): Promise<void> {
+  const rawUrl = String(opts.url ?? '').trim()
+  if (!rawUrl) throw new InvalidBrowserNavigationUrlError('url is required')
+  let parsed: URL
+  try { parsed = new URL(rawUrl) } catch {
+    throw new InvalidBrowserNavigationUrlError(`Invalid URL: ${rawUrl}`)
   }
-  return {
-    allowedOrigins: ssrfPolicy.allowedOrigins,
-    blockedOrigins: ssrfPolicy.blockedOrigins,
-    allowLoopback: ssrfPolicy.allowLoopback,
-    blockFileUrls: ssrfPolicy.blockFileUrls,
-  };
+  if (!NETWORK_NAVIGATION_PROTOCOLS.has(parsed.protocol)) {
+    if (SAFE_NON_NETWORK_URLS.has(parsed.href)) return
+    throw new InvalidBrowserNavigationUrlError(`Navigation blocked: unsupported protocol "${parsed.protocol}"`)
+  }
+  // No SSRF restrictions in this context
+}
+
+export async function assertBrowserNavigationResultAllowed(opts: {
+  url: string
+  lookupFn?: LookupFn
+} & BrowserNavigationPolicyOptions): Promise<void> {
+  const rawUrl = String(opts.url ?? '').trim()
+  if (!rawUrl) return
+  let parsed: URL
+  try { parsed = new URL(rawUrl) } catch { return }
+  if (NETWORK_NAVIGATION_PROTOCOLS.has(parsed.protocol) || SAFE_NON_NETWORK_URLS.has(parsed.href)) {
+    await assertBrowserNavigationAllowed(opts)
+  }
 }

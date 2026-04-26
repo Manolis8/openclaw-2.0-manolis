@@ -9,9 +9,8 @@ import type {
   Response,
 } from "playwright-core";
 import { chromium } from "playwright-core";
-import { formatErrorMessage } from "../infra/errors.js";
-import type { SsrFPolicy } from "../infra/net/ssrf.js";
-import { withNoProxyForCdpUrl } from "./cdp-proxy-bypass.js";
+import { formatErrorMessage, type SsrFPolicy } from './stubs.js';
+import { withNoProxyForCdpUrl } from "./cdp-proxy-bypass.js"; // already stubbed
 import { appendCdpPath, fetchJson, getHeadersWithAuth, withCdpSocket } from "./cdp.helpers.js";
 import { normalizeCdpWsUrl } from "./cdp.js";
 import { getChromeWebSocketUrl } from "./chrome.js";

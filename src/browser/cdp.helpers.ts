@@ -1,9 +1,5 @@
 import WebSocket from "ws";
-
-export function isLoopbackHost(host: string): boolean {
-  const h = host.toLowerCase();
-  return h === "localhost" || h === "127.0.0.1" || h === "::1" || h.startsWith("::ffff:127.");
-}
+import { isLoopbackHost, rawDataToString } from "./stubs.js";
 
 export function appendCdpPath(cdpUrl: string, path: string): string {
   const url = new URL(cdpUrl);
