@@ -784,14 +784,16 @@ async function runAgentLoop(opts: {
               }
 
               // Store as permission request
-              await supabase.from('task_permissions').insert({
-                task_id: opts.taskId,
-                user_id: opts.userId,
-                action: args.action || `Post on ${args.platform}`,
-                details: args.content,
-                platform: args.platform,
-                status: 'pending'
-              }).catch(() => {})
+              try {
+                await supabase.from('task_permissions').insert({
+                  task_id: opts.taskId,
+                  user_id: opts.userId,
+                  action: args.action || `Post on ${args.platform}`,
+                  details: args.content,
+                  platform: args.platform,
+                  status: 'pending'
+                })
+              } catch {}
 
               await supabase.from('tasks').update({ status: 'waiting_permission' }).eq('id', opts.taskId)
 
@@ -841,14 +843,16 @@ async function runAgentLoop(opts: {
               }
 
               // Store permission request
-              await supabase.from('task_permissions').insert({
-                task_id: opts.taskId,
-                user_id: opts.userId,
-                action: args.action || '',
-                details: args.details || '',
-                platform: args.platform || '',
-                status: 'pending'
-              }).catch(() => {})
+              try {
+                await supabase.from('task_permissions').insert({
+                  task_id: opts.taskId,
+                  user_id: opts.userId,
+                  action: args.action || '',
+                  details: args.details || '',
+                  platform: args.platform || '',
+                  status: 'pending'
+                })
+              } catch {}
 
               // Update task status so frontend knows to show permission card
               await supabase.from('tasks').update({ status: 'waiting_permission' }).eq('id', opts.taskId)
