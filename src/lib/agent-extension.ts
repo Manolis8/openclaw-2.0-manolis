@@ -218,7 +218,7 @@ async function snapshotPage(userId: string, tabKey: string): Promise<string> {
   storeRoleRefsForTarget(userId, page, refs)
 
   console.log(`[snapshot] url=${url} refs=${Object.keys(refs).length}`)
-  const EFFICIENT_SNAPSHOT_MAX_CHARS = 6000
+  const EFFICIENT_SNAPSHOT_MAX_CHARS = 15000
   const snapshotText = `URL: ${url}\n${snapshot}`
   return snapshotText.length > EFFICIENT_SNAPSHOT_MAX_CHARS
     ? snapshotText.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n...(snapshot truncated)'
@@ -341,7 +341,6 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'browser_click', description: 'Click element by ref from last snapshot. Ref must come from browser_snapshot.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] } } },
   { type: 'function', function: { name: 'browser_type', description: 'Type text into input element by ref.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
   { type: 'function', function: { name: 'browser_key', description: 'Press keyboard key: Enter, Tab, Escape, ArrowDown, ArrowUp.', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
-  { type: 'function', function: { name: 'browser_scroll', description: 'Scroll page up or down. Use when element is outside viewport.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
   { type: 'function', function: {
     name: 'browser_scroll_to_ref',
     description: 'Scroll a specific element into view using its ref. Use this when browser_click fails with "outside viewport" error. Get the ref from browser_snapshot first, then use this to scroll it into view, then click it.',
@@ -351,6 +350,18 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
         ref: { type: 'string', description: 'The ref of the element to scroll into view e.g. e12' }
       },
       required: ['ref']
+    }
+  }},
+  { type: 'function', function: {
+    name: 'browser_page_scroll',
+    description: 'Scroll the page up or down by pixels and get a fresh snapshot. Use when you need to see more of the page.',
+    parameters: {
+      type: 'object',
+      properties: {
+        direction: { type: 'string', enum: ['up', 'down'] },
+        amount: { type: 'number', description: 'Pixels to scroll, default 600' }
+      },
+      required: ['direction']
     }
   }},
   { type: 'function', function: { name: 'browser_dismiss_cookie', description: 'Dismiss cookie/consent popups. Call immediately when element says blocked by overlay.', parameters: { type: 'object', properties: {}, required: [] } } },
@@ -405,7 +416,7 @@ Never read the user's post history to write content — write it yourself based 
 draft_content must be called before ask_permission for any publishing action.
 
 You are Unclawned, a browser automation agent controlling a real Chrome browser.
-Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_scroll, browser_scroll_to_ref, browser_dismiss_cookie, browser_wait, draft_content, ask_permission, task_complete, task_failed.
+Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_page_scroll, browser_scroll_to_ref, browser_dismiss_cookie, browser_wait, draft_content, ask_permission, task_complete, task_failed.
 
 ## CRITICAL: The user is already logged into all their accounts in this browser
 This is the user's real Chrome browser. They are already logged into GitHub, Gmail, LinkedIn, Twitter, and all other sites.
@@ -426,19 +437,15 @@ For reading content always use browser_read after navigating
 - Always call task_complete or task_failed — never leave unfinished
 - task_complete must include real results — never vague summaries
 
-## Finding Elements Outside Viewport
-The snapshot includes ALL elements even if off-screen.
-When browser_click fails with "outside viewport":
-1. You already have the ref from browser_snapshot
-2. Call browser_scroll_to_ref with that same ref
-3. Then call browser_click with the same ref
-Never do a general page scroll to find elements — use browser_scroll_to_ref instead.
+## Scrolling and Finding Elements
+- browser_scroll_to_ref — scroll a specific ref into view (use when click fails with viewport error)
+- browser_page_scroll — scroll page up/down to reveal more content, returns fresh snapshot
 
-Example:
-- browser_snapshot → sees "Delete repository" button as e47
-- browser_click e47 → fails "outside viewport"
-- browser_scroll_to_ref e47 → scrolls it into view
-- browser_click e47 → succeeds
+For settings pages or long pages:
+1. browser_snapshot — get all refs including off-screen ones
+2. If you see the target ref — browser_scroll_to_ref then browser_click
+3. If target not visible in snapshot — browser_page_scroll down to reveal more
+4. Repeat until found — max 5 scrolls then call task_failed
 
 ## When To Ask Permission
 Call ask_permission ONLY before clicking these buttons: Post, Send, Submit, Publish, Buy, Purchase, Book, Delete, Remove, Confirm order, Place order.
@@ -591,10 +598,15 @@ async function runAgentLoop(opts: {
               result = `Pressed ${args.key}`
               break
             }
-            case 'browser_scroll': {
+            case 'browser_page_scroll': {
               consecutiveSnapshots = 0
-              await scrollPage(args.direction, args.amount || 300, opts.userId)
-              result = `Scrolled ${args.direction} ${args.amount || 300}px`
+              const { page } = await getBrowser(opts.userId)
+              const amount = args.amount || 600
+              const delta = args.direction === 'down' ? amount : -amount
+              await page.evaluate(`window.scrollBy(0, ${delta})`)
+              await new Promise(r => setTimeout(r, 400))
+              const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey)
+              result = `Scrolled ${args.direction} ${amount}px. Page now:\n${freshSnapshot}`
               break
             }
             case 'browser_scroll_to_ref': {
@@ -605,10 +617,16 @@ async function runAgentLoop(opts: {
               try {
                 const locator = refLocator(page, args.ref)
                 await locator.scrollIntoViewIfNeeded({ timeout: 8000 })
-                await new Promise(r => setTimeout(r, 400))
-                result = `Scrolled ${args.ref} into view. Now call browser_click with ref="${args.ref}" to click it.`
+                await new Promise(r => setTimeout(r, 500))
+                // Take fresh snapshot after scroll so agent sees updated state
+                const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey)
+                result = `Scrolled ${args.ref} into view. Updated page:\n${freshSnapshot}`
               } catch (err) {
-                result = toAIFriendlyError(err, args.ref)
+                // Ref not found — try scrolling page down and re-snapshotting
+                await page.evaluate(() => window.scrollBy(0, 600))
+                await new Promise(r => setTimeout(r, 400))
+                const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey)
+                result = `Could not find ref ${args.ref} directly. Scrolled page down. New snapshot:\n${freshSnapshot}\nIf you can see the target element now, use its new ref to click it.`
               }
               break
             }
