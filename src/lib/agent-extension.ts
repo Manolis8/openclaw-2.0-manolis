@@ -117,7 +117,7 @@ function toAIFriendlyError(error: unknown, ref: string): string {
     return `Element "${ref}" is not interactable (hidden or covered). Call browser_dismiss_cookie first, then browser_snapshot.`
   }
   if (message.includes('outside of the viewport') || message.includes('element is outside')) {
-    return `Element "${ref}" is outside the viewport. Call browser_scroll direction=down amount=400, then browser_snapshot.`
+    return `Element "${ref}" is outside the viewport. Call browser_scroll_to_ref with ref="${ref}" to scroll it into view, then click it.`
   }
   if (message.includes('Timeout') || message.includes('timeout')) {
     return `Element "${ref}" not found or not visible. Run a new browser_snapshot to get current page elements.`
@@ -218,10 +218,10 @@ async function snapshotPage(userId: string, tabKey: string): Promise<string> {
   storeRoleRefsForTarget(userId, page, refs)
 
   console.log(`[snapshot] url=${url} refs=${Object.keys(refs).length}`)
-  const MAX_SNAPSHOT_CHARS = 10000
+  const EFFICIENT_SNAPSHOT_MAX_CHARS = 6000
   const snapshotText = `URL: ${url}\n${snapshot}`
-  return snapshotText.length > MAX_SNAPSHOT_CHARS
-    ? snapshotText.slice(0, MAX_SNAPSHOT_CHARS) + '\n...(snapshot truncated)'
+  return snapshotText.length > EFFICIENT_SNAPSHOT_MAX_CHARS
+    ? snapshotText.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n...(snapshot truncated)'
     : snapshotText
 }
 
@@ -342,8 +342,32 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
   { type: 'function', function: { name: 'browser_type', description: 'Type text into input element by ref.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } } },
   { type: 'function', function: { name: 'browser_key', description: 'Press keyboard key: Enter, Tab, Escape, ArrowDown, ArrowUp.', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
   { type: 'function', function: { name: 'browser_scroll', description: 'Scroll page up or down. Use when element is outside viewport.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' } }, required: ['direction'] } } },
+  { type: 'function', function: {
+    name: 'browser_scroll_to_ref',
+    description: 'Scroll a specific element into view using its ref. Use this when browser_click fails with "outside viewport" error. Get the ref from browser_snapshot first, then use this to scroll it into view, then click it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        ref: { type: 'string', description: 'The ref of the element to scroll into view e.g. e12' }
+      },
+      required: ['ref']
+    }
+  }},
   { type: 'function', function: { name: 'browser_dismiss_cookie', description: 'Dismiss cookie/consent popups. Call immediately when element says blocked by overlay.', parameters: { type: 'object', properties: {}, required: [] } } },
   { type: 'function', function: { name: 'browser_wait', description: 'Wait milliseconds for page to load.', parameters: { type: 'object', properties: { ms: { type: 'number' } }, required: ['ms'] } } },
+  { type: 'function', function: {
+    name: 'draft_content',
+    description: 'Use this BEFORE posting anything on social media, sending emails, or any publishing action. Write the content draft and show it to the user for approval BEFORE opening any website. The user will confirm or cancel. Only after confirmation should you navigate to the platform and post.',
+    parameters: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'The full content to be posted or sent' },
+        platform: { type: 'string', description: 'Where this will be posted e.g. Twitter/X, LinkedIn, Gmail' },
+        action: { type: 'string', description: 'What will happen after approval e.g. Post tweet, Send email, Publish post' }
+      },
+      required: ['content', 'platform', 'action']
+    }
+  }},
   { type: 'function', function: {
     name: 'ask_permission',
     description: 'Ask user permission before doing something irreversible. Call this ONLY before: clicking Post, Send, Submit, Publish, Buy, Purchase, Book, Delete buttons. Do NOT call for creating repos, filling forms, reading, navigating, or any reversible action.',
@@ -370,8 +394,18 @@ const SYSTEM_PROMPT = `## STRICT RULES — READ FIRST
 - NEVER click on content that seems harmful, violent, or inappropriate
 - If you are unsure whether the user wants you to do something — call ask_permission
 
+## Content Publishing Rules (CRITICAL)
+When user asks you to post, tweet, share, or publish anything:
+1. FIRST call draft_content with the written content — do NOT open any website yet
+2. Wait for user approval
+3. ONLY after approval navigate to the platform and post
+
+Never navigate to Twitter/X, LinkedIn, Instagram, or any social platform before the user approves the content.
+Never read the user's post history to write content — write it yourself based on the request.
+draft_content must be called before ask_permission for any publishing action.
+
 You are Unclawned, a browser automation agent controlling a real Chrome browser.
-Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_scroll, browser_dismiss_cookie, browser_wait, ask_permission, task_complete, task_failed.
+Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_scroll, browser_scroll_to_ref, browser_dismiss_cookie, browser_wait, draft_content, ask_permission, task_complete, task_failed.
 
 ## CRITICAL: The user is already logged into all their accounts in this browser
 This is the user's real Chrome browser. They are already logged into GitHub, Gmail, LinkedIn, Twitter, and all other sites.
@@ -391,6 +425,20 @@ For reading content always use browser_read after navigating
 - Never guess refs — only use refs from browser_snapshot
 - Always call task_complete or task_failed — never leave unfinished
 - task_complete must include real results — never vague summaries
+
+## Finding Elements Outside Viewport
+The snapshot includes ALL elements even if off-screen.
+When browser_click fails with "outside viewport":
+1. You already have the ref from browser_snapshot
+2. Call browser_scroll_to_ref with that same ref
+3. Then call browser_click with the same ref
+Never do a general page scroll to find elements — use browser_scroll_to_ref instead.
+
+Example:
+- browser_snapshot → sees "Delete repository" button as e47
+- browser_click e47 → fails "outside viewport"
+- browser_scroll_to_ref e47 → scrolls it into view
+- browser_click e47 → succeeds
 
 ## When To Ask Permission
 Call ask_permission ONLY before clicking these buttons: Post, Send, Submit, Publish, Buy, Purchase, Book, Delete, Remove, Confirm order, Place order.
@@ -549,6 +597,21 @@ async function runAgentLoop(opts: {
               result = `Scrolled ${args.direction} ${args.amount || 300}px`
               break
             }
+            case 'browser_scroll_to_ref': {
+              consecutiveSnapshots = 0
+              await opts.onProgress(`🔍 Scrolling to ${args.ref}...`)
+              const { page } = await getBrowser(opts.userId)
+              restoreRoleRefsForTarget(opts.userId, page)
+              try {
+                const locator = refLocator(page, args.ref)
+                await locator.scrollIntoViewIfNeeded({ timeout: 8000 })
+                await new Promise(r => setTimeout(r, 400))
+                result = `Scrolled ${args.ref} into view. Now call browser_click with ref="${args.ref}" to click it.`
+              } catch (err) {
+                result = toAIFriendlyError(err, args.ref)
+              }
+              break
+            }
             case 'browser_dismiss_cookie': {
               consecutiveSnapshots = 0
               await opts.onProgress('🍪 Dismissing cookie popup...')
@@ -569,6 +632,63 @@ async function runAgentLoop(opts: {
               shouldRetry = true
               retryReason = args.reason
               result = 'Noted'
+              break
+            }
+            case 'draft_content': {
+              await opts.onProgress(`📝 Draft ready for ${args.platform}`)
+
+              // Check auto-approve preference
+              const { data: pref } = await supabase
+                .from('user_memories')
+                .select('fact')
+                .eq('user_id', opts.userId)
+                .ilike('fact', '%auto_approve_all%')
+                .single()
+
+              if (pref) {
+                result = `Auto-approved. Proceed to post on ${args.platform}.`
+                break
+              }
+
+              // Store as permission request
+              await supabase.from('task_permissions').insert({
+                task_id: opts.taskId,
+                user_id: opts.userId,
+                action: args.action || `Post on ${args.platform}`,
+                details: args.content,
+                platform: args.platform,
+                status: 'pending'
+              }).catch(() => {})
+
+              await supabase.from('tasks').update({ status: 'waiting_permission' }).eq('id', opts.taskId)
+
+              // Wait for user approval — max 10 minutes for content review
+              let permissionResult = 'timeout'
+              for (let i = 0; i < 300; i++) {
+                await new Promise(r => setTimeout(r, 2000))
+                if (opts.abortSignal?.aborted) { permissionResult = 'denied'; break }
+                const { data } = await supabase
+                  .from('task_permissions')
+                  .select('status')
+                  .eq('task_id', opts.taskId)
+                  .eq('status', 'pending')
+                  .order('created_at', { ascending: false })
+                  .limit(1)
+                  .single()
+                if (!data) { permissionResult = 'approved'; break }
+                if (data?.status === 'approved') { permissionResult = 'approved'; break }
+                if (data?.status === 'denied') { permissionResult = 'denied'; break }
+              }
+
+              await supabase.from('tasks').update({ status: 'running' }).eq('id', opts.taskId)
+
+              if (permissionResult === 'approved') {
+                result = `User approved the content. Now navigate to ${args.platform} and post exactly this content: "${args.content}"`
+              } else if (permissionResult === 'denied') {
+                return { success: false, summary: 'User cancelled the post.' }
+              } else {
+                return { success: false, summary: 'Draft approval timed out.' }
+              }
               break
             }
             case 'ask_permission': {
