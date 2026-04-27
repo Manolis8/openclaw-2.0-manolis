@@ -419,15 +419,13 @@ tasksRouter.post('/chat', async (req, res) => {
   const destructiveCheck = await classifyDestructive(message)
 
   if (destructiveCheck.isDestructive) {
-    // Create task but set to waiting_permission immediately — agent does NOT start
     const { data, error } = await supabase
       .from('tasks')
-      .insert({ user_id: userId, prompt: message, output: '', status: 'waiting_permission' })
+      .insert({ user_id: userId, prompt: message, output: '🔐 Waiting for your confirmation...\n', status: 'waiting_permission' })
       .select().single()
 
     if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
 
-    // Insert permission record immediately
     await supabase.from('task_permissions').insert({
       task_id: data.id,
       user_id: userId,
@@ -437,10 +435,9 @@ tasksRouter.post('/chat', async (req, res) => {
       status: 'pending'
     })
 
-    // Return taskId — frontend polls and sees waiting_permission immediately
     res.json({ taskId: data.id, usesBrowser: true })
 
-    // Wait for user confirmation — poll for up to 10 minutes
+    // Wait for confirmation — do NOT start agent until confirmed
     ;(async () => {
       for (let i = 0; i < 300; i++) {
         await new Promise(r => setTimeout(r, 2000))
@@ -454,14 +451,12 @@ tasksRouter.post('/chat', async (req, res) => {
           .single()
 
         if (perm?.status === 'approved') {
-          // User confirmed — now start the agent with pre-approval flag
           await supabase.from('tasks').update({ status: 'running' }).eq('id', data.id)
           runTaskInBackground(data.id, message, userId, false, keepTabOpen, context, true)
           return
         }
 
         if (perm?.status === 'denied') {
-          // User cancelled — mark task done
           await supabase.from('tasks').update({
             status: 'done',
             output: '⏹️ Action cancelled by user.'
@@ -469,8 +464,6 @@ tasksRouter.post('/chat', async (req, res) => {
           return
         }
       }
-
-      // Timeout — mark as cancelled
       await supabase.from('tasks').update({
         status: 'done',
         output: '⏹️ Permission request timed out.'
