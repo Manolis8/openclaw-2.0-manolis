@@ -7,9 +7,7 @@ import { getRelayPortForUser } from '../index.js'
 import { detectLoop } from '../routes/tasks.js'
 
 // Use OpenClaw's exact functions from src/browser/
-import { scrollIntoViewViaPlaywright } from '../browser/pw-tools-core.interactions.js'
-import { snapshotAiViaPlaywright, snapshotRoleViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
-import { buildRoleSnapshotFromAriaSnapshot, buildRoleSnapshotFromAiSnapshot } from '../browser/pw-role-snapshot.js'
+import { buildRoleSnapshotFromAriaSnapshot } from '../browser/pw-role-snapshot.js'
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
@@ -470,19 +468,15 @@ This is the user's real Chrome browser. They are already logged into GitHub, Gma
 You do NOT need to log in. You do NOT need credentials. Just navigate and act.
 NEVER call task_failed because of "authentication" or "login" — just navigate to the site and do it.
 
-## Navigation Flow (follow exactly)
-1. browser_navigate — navigates to page, returns URL only
-2. browser_read — read the page text content (for news, articles, search results)
-3. browser_snapshot — get interactive elements with refs (for clicking)
-Never call browser_snapshot immediately after browser_navigate unless you need to click something
-For reading content always use browser_read after navigating
-- Never refuse a task without trying — navigate first, then decide
-- For GitHub: navigate to https://github.com/new to create repos
-- For Gmail: navigate to https://mail.google.com
-- For Google search: navigate to https://www.google.com/search?q=query
-- Never guess refs — only use refs from browser_snapshot
-- Always call task_complete or task_failed — never leave unfinished
-- task_complete must include real results — never vague summaries
+## Navigation Flow
+1. browser_navigate — go to URL, returns URL only
+2. browser_snapshot — get ALL interactive elements with refs (call this to see what to click)
+3. browser_click / browser_type — act on refs
+4. Only call browser_snapshot again if you need to see new elements after an action
+5. browser_read — only for reading article/news content, not for finding clickable elements
+
+After clicking a button that opens a modal or dialog — call browser_snapshot to see new elements.
+After scrolling — the snapshot is returned automatically, no need to call browser_snapshot again.
 
 ## Scrolling and Finding Elements
 - browser_scroll_to_ref — scroll a specific ref into view (use when click fails with viewport error)
@@ -678,9 +672,11 @@ async function runAgentLoop(opts: {
             case 'browser_snapshot': {
               consecutiveSnapshots++
               await opts.onProgress('📸 Reading page...')
-              result = await snapshotPage(opts.userId, opts.tabKey)
+              const snap = await snapshotPage(opts.userId, opts.tabKey, true)
               if (consecutiveSnapshots >= 3) {
-                result += `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, dismiss cookie, or call task_failed.`
+                result = snap + `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, or call task_failed.`
+              } else {
+                result = snap
               }
               break
             }
@@ -695,8 +691,7 @@ async function runAgentLoop(opts: {
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
               await clickRef(opts.userId, args.ref)
               await new Promise(r => setTimeout(r, 500))
-              result = await snapshotPage(opts.userId, opts.tabKey)
-              result = `Clicked ${args.ref}. Page:\n${result}`
+              result = `Clicked ${args.ref} successfully. Call browser_snapshot if you need to see the updated page.`
               break
             }
             case 'browser_type': {
@@ -705,8 +700,7 @@ async function runAgentLoop(opts: {
               await typeInRef(opts.userId, args.ref, args.text)
               if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 300))
-              result = await snapshotPage(opts.userId, opts.tabKey)
-              result = `Typed. Page:\n${result}`
+              result = `Typed "${args.text}" into ${args.ref} successfully. Call browser_snapshot if you need to see the updated page.`
               break
             }
             case 'browser_key': {
@@ -714,7 +708,7 @@ async function runAgentLoop(opts: {
               await opts.onProgress(`⌨️ Pressing ${args.key}...`)
               await pressKey(args.key, opts.userId)
               await new Promise(r => setTimeout(r, 300))
-              result = `Pressed ${args.key}`
+              result = `Pressed ${args.key}.`
               break
             }
             case 'browser_page_scroll': {
@@ -724,8 +718,8 @@ async function runAgentLoop(opts: {
               const delta = args.direction === 'down' ? amount : -amount
               await page.evaluate(`window.scrollBy(0, ${delta})`)
               await new Promise(r => setTimeout(r, 400))
-              const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey)
-              result = `Scrolled ${args.direction} ${amount}px. Page now:\n${freshSnapshot}`
+              const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey, true)
+              result = `Scrolled ${args.direction} ${amount}px. Interactive elements now:\n${freshSnapshot}`
               break
             }
             case 'browser_scroll_to_ref': {
@@ -737,11 +731,11 @@ async function runAgentLoop(opts: {
                 const locator = refLocator(page, args.ref)
                 await locator.scrollIntoViewIfNeeded({ timeout: 20000 })
                 await new Promise(r => setTimeout(r, 500))
-                const fresh = await snapshotPage(opts.userId, opts.tabKey)
-                result = `Scrolled ${args.ref} into view. Page:\n${fresh}`
+                const fresh = await snapshotPage(opts.userId, opts.tabKey, true)
+                result = `Scrolled ${args.ref} into view. Interactive elements:\n${fresh}`
               } catch (err) {
-                const fresh = await snapshotPage(opts.userId, opts.tabKey)
-                result = `Could not scroll to ${args.ref}: ${toAIFriendlyError(err, args.ref)}\nCurrent page:\n${fresh}`
+                const fresh = await snapshotPage(opts.userId, opts.tabKey, true)
+                result = `Could not scroll to ${args.ref}: ${toAIFriendlyError(err, args.ref)}\nCurrent elements:\n${fresh}`
               }
               break
             }
@@ -894,8 +888,7 @@ async function runAgentLoop(opts: {
               await opts.onProgress(`🖱️ Hovering ${args.ref}...`)
               await hoverRef(opts.userId, args.ref)
               await new Promise(r => setTimeout(r, 400))
-              result = await snapshotPage(opts.userId, opts.tabKey)
-              result = `Hovered ${args.ref}. Page:\n${result}`
+              result = `Hovered ${args.ref}. Call browser_snapshot to see any changes.`
               break
             }
             case 'browser_select': {
@@ -903,8 +896,7 @@ async function runAgentLoop(opts: {
               await opts.onProgress(`📋 Selecting in ${args.ref}...`)
               await selectOption(opts.userId, args.ref, args.values || [])
               await new Promise(r => setTimeout(r, 300))
-              result = await snapshotPage(opts.userId, opts.tabKey)
-              result = `Selected ${args.values?.join(', ')} in ${args.ref}. Page:\n${result}`
+              result = `Selected ${args.values?.join(', ')} in ${args.ref}. Call browser_snapshot to see changes.`
               break
             }
             case 'browser_wait_for': {
@@ -915,8 +907,8 @@ async function runAgentLoop(opts: {
                 selector: args.selector,
                 url: args.url
               })
-              result = await snapshotPage(opts.userId, opts.tabKey)
-              result = `Wait done. Page:\n${result}`
+              result = await snapshotPage(opts.userId, opts.tabKey, true)
+              result = `Wait done. Elements:\n${result}`
               break
             }
             case 'browser_evaluate': {
