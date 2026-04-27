@@ -537,15 +537,72 @@ tasksRouter.post('/create-task', async (req, res) => {
 
   console.log(`Create task: userId=${userId}, extensionConnected=${isExtensionConnected(userId)}`)
   console.log(`All connected extensions: ${[...extensionConnections.keys()].join(', ')}`)
+  // Classify if destructive BEFORE opening browser
+  const destructiveCheck = await classifyDestructive(prompt)
+
+  if (destructiveCheck.isDestructive) {
+    const { data, error } = await supabase
+      .from('tasks')
+      .insert({
+        user_id: userId,
+        prompt,
+        output: '🔐 Waiting for your confirmation...\n',
+        status: 'waiting_permission'
+      })
+      .select().single()
+
+    if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
+
+    await supabase.from('task_permissions').insert({
+      task_id: data.id,
+      user_id: userId,
+      action: destructiveCheck.action,
+      details: destructiveCheck.details,
+      platform: '',
+      status: 'pending'
+    })
+
+    res.json({ taskId: data.id })
+
+    // Wait for confirmation — browser does NOT open until confirmed
+    ;(async () => {
+      for (let i = 0; i < 300; i++) {
+        await new Promise(r => setTimeout(r, 800))
+        const { data: perm } = await supabase
+          .from('task_permissions')
+          .select('status')
+          .eq('task_id', data.id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single()
+        if (perm?.status === 'approved') {
+          await supabase.from('tasks').update({ status: 'running' }).eq('id', data.id)
+          runTaskInBackground(data.id, prompt, userId, useApiMode, keepTabOpen, undefined, true)
+          return
+        }
+        if (perm?.status === 'denied') {
+          await supabase.from('tasks').update({
+            status: 'done',
+            output: '⏹️ Action cancelled by user.'
+          }).eq('id', data.id)
+          return
+        }
+      }
+      await supabase.from('tasks').update({
+        status: 'done',
+        output: '⏹️ Permission request timed out.'
+      }).eq('id', data.id)
+    })()
+    return
+  }
+
+  // Not destructive — start immediately
   const { data, error } = await supabase
     .from('tasks')
     .insert({ user_id: userId, prompt, output: '', status: 'running' })
-    .select()
-    .single()
-  if (error || !data) {
-    console.error('Supabase insert error:', error)
-    return res.status(500).json({ error: 'Failed to create task' })
-  }
+    .select().single()
+
+  if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
   res.json({ taskId: data.id })
   runTaskInBackground(data.id, prompt, userId, useApiMode, keepTabOpen)
 })
