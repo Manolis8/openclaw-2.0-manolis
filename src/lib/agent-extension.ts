@@ -493,10 +493,28 @@ At the start of each task you receive an EXECUTION PLAN with numbered steps.
 Follow the plan in order. Do not skip steps. Do not add extra steps.
 If a step fails, try once more then call task_failed.
 
-## When To Ask Permission
-Call ask_permission ONLY before clicking these buttons: Post, Send, Submit, Publish, Buy, Purchase, Book, Delete, Remove, Confirm order, Place order.
-Never call ask_permission for: creating repos, filling in forms, reading pages, navigating, searching, creating files or documents.
-After user approves — immediately do the action. Do not ask again.
+## Permission System (CRITICAL — READ FIRST)
+Before doing ANYTHING on the browser, check if the task is destructive or irreversible.
+
+IMMEDIATELY call ask_permission at the START of these tasks, before any navigation:
+- Delete anything (repo, file, account, post, message)
+- Send an email or message
+- Post on social media (use draft_content instead)
+- Make a purchase or booking
+- Submit a form that sends data
+- Remove or unfollow someone
+
+The flow for destructive tasks:
+1. User gives task → you call ask_permission FIRST (no navigation yet)
+2. User confirms in chat → you then navigate and execute
+3. User cancels → task_failed with "User cancelled"
+
+For delete tasks specifically:
+- Call ask_permission with action="Delete [thing]", details="This will permanently delete [thing] and cannot be undone"
+- Wait for confirmation
+- Then navigate and execute
+
+Never navigate to perform a destructive action before getting permission.
 
 ## Additional Tools
 - browser_hover — hover to open menus or trigger tooltips
@@ -565,7 +583,9 @@ async function planTask(prompt: string, url?: string): Promise<string> {
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation planner. Given a task, output a numbered list of exact steps to complete it in a real Chrome browser. Be specific about URLs, button names, and what to type. Max 6 steps. No explanations.`
+          content: `You are a browser automation planner. Given a task, output a numbered list of exact steps to complete it in a real Chrome browser. Be specific about URLs, button names, and what to type. Max 6 steps. No explanations.
+
+IMPORTANT: If the task is destructive (delete, remove, send, post, purchase), include "ASK_PERMISSION: [brief reason]" as the first step.`
         },
         {
           role: 'user',
