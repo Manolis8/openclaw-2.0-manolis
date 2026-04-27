@@ -415,17 +415,24 @@ tasksRouter.post('/chat', async (req, res) => {
     })
   }
 
-  // Classify if destructive BEFORE starting task
+  // Step 1: classify if destructive BEFORE creating task or opening browser
   const destructiveCheck = await classifyDestructive(message)
 
   if (destructiveCheck.isDestructive) {
+    // Create task in waiting_permission state — browser does NOT open yet
     const { data, error } = await supabase
       .from('tasks')
-      .insert({ user_id: userId, prompt: message, output: '🔐 Waiting for your confirmation...\n', status: 'waiting_permission' })
+      .insert({
+        user_id: userId,
+        prompt: message,
+        output: '🔐 Waiting for your confirmation...\n',
+        status: 'waiting_permission'
+      })
       .select().single()
 
     if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
 
+    // Insert permission record
     await supabase.from('task_permissions').insert({
       task_id: data.id,
       user_id: userId,
@@ -435,9 +442,10 @@ tasksRouter.post('/chat', async (req, res) => {
       status: 'pending'
     })
 
+    // Respond immediately — frontend will poll and see waiting_permission
     res.json({ taskId: data.id, usesBrowser: true })
 
-    // Wait for confirmation — do NOT start agent until confirmed
+    // Background: wait for user to confirm or deny — agent does NOT start until confirmed
     ;(async () => {
       for (let i = 0; i < 300; i++) {
         await new Promise(r => setTimeout(r, 800))
@@ -451,6 +459,7 @@ tasksRouter.post('/chat', async (req, res) => {
           .single()
 
         if (perm?.status === 'approved') {
+          // User confirmed — NOW start the browser agent
           await supabase.from('tasks').update({ status: 'running' }).eq('id', data.id)
           runTaskInBackground(data.id, message, userId, false, keepTabOpen, context, true)
           return
@@ -464,6 +473,8 @@ tasksRouter.post('/chat', async (req, res) => {
           return
         }
       }
+
+      // 10 min timeout
       await supabase.from('tasks').update({
         status: 'done',
         output: '⏹️ Permission request timed out.'
@@ -473,10 +484,15 @@ tasksRouter.post('/chat', async (req, res) => {
     return
   }
 
-  // Not destructive — start immediately as before
+  // Not destructive — create task and start browser agent immediately
   const { data, error } = await supabase
     .from('tasks')
-    .insert({ user_id: userId, prompt: message, output: '', status: 'running' })
+    .insert({
+      user_id: userId,
+      prompt: message,
+      output: '',
+      status: 'running'
+    })
     .select().single()
 
   if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
