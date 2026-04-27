@@ -333,6 +333,7 @@ Remember everything said earlier in this conversation and use it naturally.
 Be concise and friendly. Never write more than needed.`
 
 tasksRouter.post('/chat', async (req, res) => {
+  console.log('[chat] received request')
   const { message: rawMessage, userId: rawUserId, sessionId: rawSessionId, keepTabOpen = false } = req.body
   const message = sanitizeString(rawMessage, 2000)
   const userId = sanitizeString(rawUserId, 100)
@@ -340,6 +341,7 @@ tasksRouter.post('/chat', async (req, res) => {
   if (!message || !userId || !sessionId) {
     return res.status(400).json({ error: 'Missing required fields' })
   }
+  console.log('[chat] sanitized, checking limit')
 
    // Check daily limit
    const today = new Date().toISOString().split('T')[0]
@@ -347,10 +349,12 @@ tasksRouter.post('/chat', async (req, res) => {
      .from('tasks')
      .select('*', { count: 'exact', head: true })
      .eq('user_id', userId)
-      .gte('created_at', `${today}T00:00:00.000Z`)
-   const DAILY_LIMIT = 10
+       .gte('created_at', `${today}T00:00:00.000Z`)
+  console.log('[chat] limit checked:', count)
+  const DAILY_LIMIT = 10
 
   // Load real conversation history from Supabase (most recent last for emphasis)
+  console.log('[chat] loading history')
   let context = ''
   let historyRows: any[] = []
   if (sessionId) {
@@ -392,7 +396,9 @@ tasksRouter.post('/chat', async (req, res) => {
   // Compact if too long
   const compactedHistory = await compactHistory(history, 8)
 
+  console.log('[chat] classifying message')
   const needsBrowser = await classifyMessage(message)
+  console.log('[chat] classifyMessage result:', needsBrowser)
 
   if (!needsBrowser) {
     const response = await openai.chat.completions.create({
@@ -419,7 +425,9 @@ tasksRouter.post('/chat', async (req, res) => {
   }
 
   // Step 1: classify if destructive BEFORE creating task or opening browser
+  console.log('[chat] classifying destructive')
   const destructiveCheck = await classifyDestructive(message)
+  console.log('[chat] destructive result:', destructiveCheck)
 
   if (destructiveCheck.isDestructive) {
     // Create task in waiting_permission state — browser does NOT open yet
