@@ -454,7 +454,13 @@ tasksRouter.post('/chat', async (req, res) => {
     })
 
     // Respond immediately — frontend will poll and see waiting_permission
-    res.json({ taskId: data.id, usesBrowser: true })
+    res.json({
+      taskId: data.id,
+      usesBrowser: true,
+      waitingPermission: true,
+      action: destructiveCheck.action,
+      details: destructiveCheck.details
+    })
 
     // Background: wait for user to confirm or deny — agent does NOT start until confirmed
     ;(async () => {
@@ -562,7 +568,12 @@ tasksRouter.post('/create-task', async (req, res) => {
       status: 'pending'
     })
 
-    res.json({ taskId: data.id })
+    res.json({
+      taskId: data.id,
+      waitingPermission: true,
+      action: destructiveCheck.action,
+      details: destructiveCheck.details
+    })
 
     // Wait for confirmation — browser does NOT open until confirmed
     ;(async () => {
