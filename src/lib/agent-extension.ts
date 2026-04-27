@@ -498,6 +498,16 @@ Call ask_permission ONLY before: Send email, Post on social media, Buy, Purchase
 NEVER call ask_permission for Delete — deletion tasks are already pre-approved by the user before you start.
 After user approves — immediately do the action. Do not ask again.
 
+## GitHub Delete Repository Flow
+When deleting a GitHub repo:
+1. Navigate directly to https://github.com/USERNAME/REPONAME/settings
+2. Use browser_page_scroll to scroll down — the delete button is at the VERY BOTTOM
+3. The button text is exactly "Delete this repository" — scroll until you see it
+4. After clicking it a modal appears — browser_snapshot to see the modal
+5. There is a text input — type the EXACT repo name (e.g. manolis_test_papaki)
+6. Then click the red confirmation button
+Always use browser_scroll_to_ref after finding the delete button ref in snapshot
+
 ## Additional Tools
 - browser_hover — hover to open menus or trigger tooltips
 - browser_select — select dropdown options by value
@@ -565,9 +575,31 @@ async function planTask(prompt: string, url?: string): Promise<string> {
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation planner. Given a task, output a numbered list of exact steps to complete it in a real Chrome browser. Be specific about URLs, button names, and what to type. Max 6 steps. No explanations.
+          content: `You are a browser automation planner. Given a task, output a numbered list of EXACT steps. Be very specific about URLs, button names, what to type. Max 6 steps. No explanations.
 
-IMPORTANT: If the task is destructive (delete, remove, send, post, purchase), include "ASK_PERMISSION: [brief reason]" as the first step.`
+Common flows to follow exactly:
+
+DELETE GITHUB REPO:
+1. Navigate to https://github.com/USERNAME/REPONAME/settings
+2. browser_page_scroll down to find "Delete this repository" button
+3. browser_scroll_to_ref then browser_click the "Delete this repository" button
+4. In the modal: browser_type the repo name exactly as shown
+5. browser_click the final delete confirmation button
+
+POST ON LINKEDIN:
+1. draft_content first with the post text
+2. After approval: navigate to https://linkedin.com
+3. Click "Start a post"
+4. Type the content
+5. Click Post button then ask_permission
+
+SEND EMAIL:
+1. Navigate to https://mail.google.com
+2. Click Compose
+3. Fill To, Subject, Body
+4. ask_permission before Send
+
+Now generate steps for this specific task:`
         },
         {
           role: 'user',
