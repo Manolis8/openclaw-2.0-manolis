@@ -216,34 +216,37 @@ async function classifyDestructive(message: string): Promise<{
   action: string
   details: string
 }> {
-  try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      max_tokens: 100,
-      messages: [
-        {
-          role: 'system',
-          content: `You classify browser tasks as destructive or safe. Destructive = cannot be undone: delete, send email, post on social media, purchase, remove, unfollow, submit payment. Safe = reversible: search, read, navigate, create, fill form, research.
+  const timeout = new Promise<{isDestructive: boolean; action: string; details: string}>(
+    resolve => setTimeout(() => resolve({ isDestructive: false, action: '', details: '' }), 3000)
+  )
 
-Respond with JSON only: {"isDestructive": true/false, "action": "short action name", "details": "one sentence what will happen"}`
-        },
-        {
-          role: 'user',
-          content: message
-        }
-      ]
-    })
-    const text = response.choices[0].message.content?.trim() ?? '{}'
-    const clean = text.replace(/```json|```/g, '').trim()
-    const parsed = JSON.parse(clean)
-    return {
-      isDestructive: Boolean(parsed.isDestructive),
-      action: String(parsed.action || 'Perform action'),
-      details: String(parsed.details || message)
+  const classify = (async () => {
+    try {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        max_tokens: 60,
+        messages: [
+          {
+            role: 'system',
+            content: `Classify if this browser task is destructive (delete, send, post, purchase, remove). Reply with JSON only: {"isDestructive": true/false, "action": "short name", "details": "one sentence"}`
+          },
+          { role: 'user', content: message }
+        ]
+      })
+      const text = response.choices[0].message.content?.trim() ?? '{}'
+      const clean = text.replace(/```json|```/g, '').trim()
+      const parsed = JSON.parse(clean)
+      return {
+        isDestructive: Boolean(parsed.isDestructive),
+        action: String(parsed.action || 'Perform action'),
+        details: String(parsed.details || message)
+      }
+    } catch {
+      return { isDestructive: false, action: '', details: '' }
     }
-  } catch {
-    return { isDestructive: false, action: '', details: '' }
-  }
+  })()
+
+  return Promise.race([classify, timeout])
 }
 
 const runningTasksPerUser = new Map<string, boolean>()
