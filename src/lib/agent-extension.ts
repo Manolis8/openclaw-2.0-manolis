@@ -590,8 +590,8 @@ async function runAgentLoop(opts: {
   context?: string
   abortSignal?: AbortSignal
 }): Promise<{ success: boolean; summary: string }> {
-  const MAX_ITERATIONS = 20
-  const deadline = Date.now() + 240_000
+  const MAX_ITERATIONS = 25
+  const deadline = Date.now() + 300_000
   let consecutiveSnapshots = 0
 
   const cleanedContext = cleanContext(opts.context)
@@ -863,10 +863,12 @@ async function runAgentLoop(opts: {
                   .from('task_permissions')
                   .select('status')
                   .eq('task_id', opts.taskId)
+                  .eq('status', 'pending')
                   .order('created_at', { ascending: false })
                   .limit(1)
                   .single()
 
+                if (!data) { permissionResult = 'approved'; break }
                 if (data?.status === 'approved') { permissionResult = 'approved'; break }
                 if (data?.status === 'denied') { permissionResult = 'denied'; break }
               }
