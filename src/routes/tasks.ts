@@ -211,6 +211,41 @@ async function classifyMessage(message: string): Promise<boolean> {
   return true
 }
 
+async function classifyDestructive(message: string): Promise<{
+  isDestructive: boolean
+  action: string
+  details: string
+}> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 100,
+      messages: [
+        {
+          role: 'system',
+          content: `You classify browser tasks as destructive or safe. Destructive = cannot be undone: delete, send email, post on social media, purchase, remove, unfollow, submit payment. Safe = reversible: search, read, navigate, create, fill form, research.
+
+Respond with JSON only: {"isDestructive": true/false, "action": "short action name", "details": "one sentence what will happen"}`
+        },
+        {
+          role: 'user',
+          content: message
+        }
+      ]
+    })
+    const text = response.choices[0].message.content?.trim() ?? '{}'
+    const clean = text.replace(/```json|```/g, '').trim()
+    const parsed = JSON.parse(clean)
+    return {
+      isDestructive: Boolean(parsed.isDestructive),
+      action: String(parsed.action || 'Perform action'),
+      details: String(parsed.details || message)
+    }
+  } catch {
+    return { isDestructive: false, action: '', details: '' }
+  }
+}
+
 const runningTasksPerUser = new Map<string, boolean>()
 const taskAbortControllers = new Map<string, AbortController>()
 
@@ -229,7 +264,7 @@ async function appendOutput(taskId: string, line: string) {
     .eq('id', taskId)
 }
 
-export async function runTaskInBackground(taskId: string, prompt: string, userId: string, useApiMode?: boolean, keepTabOpen = false, context?: string) {
+export async function runTaskInBackground(taskId: string, prompt: string, userId: string, useApiMode?: boolean, keepTabOpen = false, context?: string, preApproved = false) {
   console.log(`runTaskInBackground: taskId=${taskId} userId=${userId}`)
   console.log(`Extension connected for ${userId}: ${isExtensionConnected(userId)}`)
   console.log(`All connected users: ${[...extensionConnections.keys()].join(', ')}`)
@@ -256,7 +291,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       if (controller.signal.aborted) return
       console.log(`[${taskId}] ${msg}`)
       await appendOutput(taskId, msg + '\n')
-    }, taskId, keepTabOpen, context, controller.signal)
+    }, taskId, keepTabOpen, context, controller.signal, preApproved)
 
     const timeoutPromise = new Promise<string>((_, reject) =>
       setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
@@ -380,6 +415,72 @@ tasksRouter.post('/chat', async (req, res) => {
     })
   }
 
+  // Classify if destructive BEFORE starting task
+  const destructiveCheck = await classifyDestructive(message)
+
+  if (destructiveCheck.isDestructive) {
+    // Create task but set to waiting_permission immediately — agent does NOT start
+    const { data, error } = await supabase
+      .from('tasks')
+      .insert({ user_id: userId, prompt: message, output: '', status: 'waiting_permission' })
+      .select().single()
+
+    if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
+
+    // Insert permission record immediately
+    await supabase.from('task_permissions').insert({
+      task_id: data.id,
+      user_id: userId,
+      action: destructiveCheck.action,
+      details: destructiveCheck.details,
+      platform: '',
+      status: 'pending'
+    })
+
+    // Return taskId — frontend polls and sees waiting_permission immediately
+    res.json({ taskId: data.id, usesBrowser: true })
+
+    // Wait for user confirmation — poll for up to 10 minutes
+    ;(async () => {
+      for (let i = 0; i < 300; i++) {
+        await new Promise(r => setTimeout(r, 2000))
+
+        const { data: perm } = await supabase
+          .from('task_permissions')
+          .select('status')
+          .eq('task_id', data.id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single()
+
+        if (perm?.status === 'approved') {
+          // User confirmed — now start the agent with pre-approval flag
+          await supabase.from('tasks').update({ status: 'running' }).eq('id', data.id)
+          runTaskInBackground(data.id, message, userId, false, keepTabOpen, context, true)
+          return
+        }
+
+        if (perm?.status === 'denied') {
+          // User cancelled — mark task done
+          await supabase.from('tasks').update({
+            status: 'done',
+            output: '⏹️ Action cancelled by user.'
+          }).eq('id', data.id)
+          return
+        }
+      }
+
+      // Timeout — mark as cancelled
+      await supabase.from('tasks').update({
+        status: 'done',
+        output: '⏹️ Permission request timed out.'
+      }).eq('id', data.id)
+    })()
+
+    return
+  }
+
+  // Not destructive — start immediately as before
   const { data, error } = await supabase
     .from('tasks')
     .insert({ user_id: userId, prompt: message, output: '', status: 'running' })

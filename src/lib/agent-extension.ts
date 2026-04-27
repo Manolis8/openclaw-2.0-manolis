@@ -609,6 +609,7 @@ async function runAgentLoop(opts: {
   onProgress: (msg: string) => Promise<void>
   context?: string
   abortSignal?: AbortSignal
+  preApproved?: boolean
 }): Promise<{ success: boolean; summary: string }> {
   const MAX_ITERATIONS = 25
   const deadline = Date.now() + 300_000
@@ -841,6 +842,12 @@ async function runAgentLoop(opts: {
               break
             }
             case 'ask_permission': {
+              // If already pre-approved by upfront classification, skip permission
+              if (opts.preApproved) {
+                result = 'User already approved this action. Proceed immediately.'
+                break
+              }
+
               await opts.onProgress(`🔐 Asking permission: ${args.action}`)
 
               // Check if user has auto-approve enabled
@@ -981,7 +988,8 @@ export async function runAgentWithExtension(
   taskId?: string,
   keepTabOpen = false,
   context?: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  preApproved = false
 ): Promise<string> {
   if (abortSignal?.aborted) return 'Task stopped by user.'
 
@@ -1012,7 +1020,8 @@ export async function runAgentWithExtension(
       tabKey,
       onProgress: onStep,
       context,
-      abortSignal
+      abortSignal,
+      preApproved
     })
 
     return result.summary
