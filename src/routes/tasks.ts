@@ -440,7 +440,7 @@ tasksRouter.post('/chat', async (req, res) => {
     // Wait for confirmation — do NOT start agent until confirmed
     ;(async () => {
       for (let i = 0; i < 300; i++) {
-        await new Promise(r => setTimeout(r, 2000))
+        await new Promise(r => setTimeout(r, 800))
 
         const { data: perm } = await supabase
           .from('task_permissions')
