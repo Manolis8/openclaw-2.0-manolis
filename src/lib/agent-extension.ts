@@ -147,34 +147,51 @@ const CONTENT_ROLES = new Set([
 ])
 
 
-const EFFICIENT_SNAPSHOT_MAX_CHARS = 6000
-const INTERACTIVE_SNAPSHOT_MAX_CHARS = 2000
+const EFFICIENT_SNAPSHOT_MAX_CHARS = 12000
+const INTERACTIVE_SNAPSHOT_MAX_CHARS = 4000
 const CDP_URL = () => `ws://127.0.0.1:${18792}/cdp` // relay port
 
 async function snapshotPage(userId: string, tabKey: string, interactiveOnly = false): Promise<string> {
   const { page } = await getBrowser(userId)
   const url = page.url()
-  const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
-  const ariaText = String(ariaRaw ?? '')
-  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(ariaText)
-  storeRoleRefsForTarget(userId, page, refs)
+  const maybeAI = page as any
 
-  if (interactiveOnly) {
-    // Only keep lines with refs — buttons, links, inputs
-    const lines = snapshot.split('\n')
-    const interactive = lines.filter(l => l.includes('[ref='))
-    const text = `URL: ${url}\n${interactive.join('\n')}`
-    console.log(`[snapshot:interactive] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
-    return text.length > INTERACTIVE_SNAPSHOT_MAX_CHARS
-      ? text.slice(0, INTERACTIVE_SNAPSHOT_MAX_CHARS) + '\n...(truncated)'
-      : text
+  if (typeof maybeAI._snapshotForAI === 'function') {
+    try {
+      const result = await maybeAI._snapshotForAI({ timeout: 5000, track: 'response' })
+      let raw = String(result?.full ?? '')
+      const limit = interactiveOnly ? INTERACTIVE_SNAPSHOT_MAX_CHARS : EFFICIENT_SNAPSHOT_MAX_CHARS
+      if (raw.length > limit) raw = raw.slice(0, limit) + '\n\n[...TRUNCATED]'
+      const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(raw)
+      storeRoleRefsForTarget(userId, page, refs)
+      if (interactiveOnly) {
+        const lines = snapshot.split('\n').filter(l => l.includes('[ref='))
+        const text = `URL: ${url}\n${lines.join('\n')}`
+        console.log(`[snapshot:ai:interactive] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
+        return text
+      }
+      const text = `URL: ${url}\n${snapshot}`
+      console.log(`[snapshot:ai] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
+      return text
+    } catch (err) {
+      console.log(`[snapshot:ai:failed] ${err} — falling back to ariaSnapshot`)
+    }
   }
 
-  const snapshotText = `URL: ${url}\n${snapshot}`
-  console.log(`[snapshot:full] url=${url} refs=${Object.keys(refs).length} chars=${snapshotText.length}`)
-  return snapshotText.length > EFFICIENT_SNAPSHOT_MAX_CHARS
-    ? snapshotText.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n...(truncated)'
-    : snapshotText
+  const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
+  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(String(ariaRaw ?? ''))
+  storeRoleRefsForTarget(userId, page, refs)
+  if (interactiveOnly) {
+    const lines = snapshot.split('\n').filter(l => l.includes('[ref='))
+    const text = `URL: ${url}\n${lines.join('\n')}`
+    console.log(`[snapshot:aria:interactive] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
+    return text.length > INTERACTIVE_SNAPSHOT_MAX_CHARS
+      ? text.slice(0, INTERACTIVE_SNAPSHOT_MAX_CHARS) + '\n...(truncated)' : text
+  }
+  const text = `URL: ${url}\n${snapshot}`
+  console.log(`[snapshot:aria] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
+  return text.length > EFFICIENT_SNAPSHOT_MAX_CHARS
+    ? text.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n...(truncated)' : text
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -443,79 +460,51 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
 
 // ─── System prompt (OpenClaw style — short and precise) ──────────────────────
 
-const SYSTEM_PROMPT = `## STRICT RULES — READ FIRST
-- ONLY do exactly what the user asked. Nothing more, nothing less.
-- NEVER perform any action the user did not explicitly request
-- NEVER post, share, repost, like, comment, or interact with any content unless the user specifically said to
-- NEVER click on content that seems harmful, violent, or inappropriate
-- If you are unsure whether the user wants you to do something — call ask_permission
+const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent controlling the user's real Chrome browser.
 
-## Content Publishing Rules (CRITICAL)
-When user asks you to post, tweet, share, or publish anything:
-1. FIRST call draft_content with the written content — do NOT open any website yet
-2. Wait for user approval
-3. ONLY after approval navigate to the platform and post
+## Critical Rules
+- User is already logged into all accounts — never call task_failed for authentication
+- ONLY do what the user asked — nothing more, nothing less
+- Never post, share, or interact with content unless explicitly asked
+- Always end with task_complete or task_failed
 
-Never navigate to Twitter/X, LinkedIn, Instagram, or any social platform before the user approves the content.
-Never read the user's post history to write content — write it yourself based on the request.
-draft_content must be called before ask_permission for any publishing action.
+## Reasoning — Do This Before Every Single Action
+Before calling any tool write one line starting with "→" describing what you see and what you will do:
+→ I can see the settings page. The plan says scroll to find Delete button. I will browser_page_scroll down 2000px.
+→ I can see a modal with a text input ref e34. I will type the repo name.
+→ I clicked the button but nothing changed. I will browser_snapshot to check current state.
 
-You are Unclawned, a browser automation agent controlling a real Chrome browser.
-Available tools: browser_navigate, browser_snapshot, browser_read, browser_click, browser_type, browser_key, browser_page_scroll, browser_scroll_to_ref, browser_hover, browser_select, browser_wait_for, browser_evaluate, browser_dismiss_cookie, browser_wait, draft_content, ask_permission, task_complete, task_failed.
+This reasoning is NOT shown to the user — it is for your own clarity.
 
-## CRITICAL: The user is already logged into all their accounts in this browser
-This is the user's real Chrome browser. They are already logged into GitHub, Gmail, LinkedIn, Twitter, and all other sites.
-You do NOT need to log in. You do NOT need credentials. Just navigate and act.
-NEVER call task_failed because of "authentication" or "login" — just navigate to the site and do it.
+## After Every Click
+If the click was supposed to open a modal, dialog, or new page — call browser_snapshot immediately to verify it worked.
+If nothing changed after a click — try browser_scroll_to_ref on the same ref and click again once.
+If it fails twice — try a completely different ref or call task_failed.
 
-## Navigation Flow
-1. browser_navigate — go to URL, returns URL only
-2. browser_snapshot — get ALL interactive elements with refs (call this to see what to click)
-3. browser_click / browser_type — act on refs
-4. Only call browser_snapshot again if you need to see new elements after an action
-5. browser_read — only for reading article/news content, not for finding clickable elements
+## Tool Usage
+- browser_navigate — go to URL, returns URL only
+- browser_snapshot — get ALL elements with refs including off-screen ones
+- browser_read — read page text content
+- browser_click — click by ref from snapshot
+- browser_type — type into ref
+- browser_scroll_to_ref — scroll element into view by ref, then click it
+- browser_page_scroll — scroll page, returns fresh snapshot with new refs
+- browser_wait_for — wait for element after action
+- browser_evaluate — run JS to read data or check state
 
-After clicking a button that opens a modal or dialog — call browser_snapshot to see new elements.
-After scrolling — the snapshot is returned automatically, no need to call browser_snapshot again.
+## Finding Elements
+- browser_snapshot returns ALL refs including off-screen — check if the element is there before scrolling
+- If element ref is in snapshot but off-screen — use browser_scroll_to_ref then browser_click
+- If element not in snapshot at all — use browser_page_scroll to reveal more, then browser_snapshot again
+- Max 5 page scrolls then call task_failed
 
-## Scrolling and Finding Elements
-- browser_scroll_to_ref — scroll a specific ref into view (use when click fails with viewport error)
-- browser_page_scroll — scroll page up/down to reveal more content, returns fresh snapshot
+## Content Publishing
+Call draft_content BEFORE navigating to any social platform
+Wait for user approval then navigate and post
 
-For settings pages or long pages:
-1. browser_snapshot — get all refs including off-screen ones
-2. If you see the target ref — browser_scroll_to_ref then browser_click
-3. If target not visible in snapshot — browser_page_scroll down to reveal more
- 4. Repeat until found — max 5 scrolls then call task_failed
-
-## Execution Plan
-At the start of each task you receive an EXECUTION PLAN with numbered steps.
-Follow the plan in order. Do not skip steps. Do not add extra steps.
-If a step fails, try once more then call task_failed.
-
-## When To Ask Permission
-Call ask_permission ONLY before: Send email, Post on social media, Buy, Purchase, Book.
-NEVER call ask_permission for Delete — deletion tasks are already pre-approved by the user before you start.
-After user approves — immediately do the action. Do not ask again.
-
-## GitHub Delete Repository Flow
-When deleting a GitHub repo:
-1. Navigate directly to https://github.com/USERNAME/REPONAME/settings
-2. Use browser_page_scroll to scroll down — the delete button is at the VERY BOTTOM
-3. The button text is exactly "Delete this repository" — scroll until you see it
-4. After clicking it a modal appears — browser_snapshot to see the modal
-5. There is a text input — type the EXACT repo name (e.g. manolis_test_papaki)
-6. Then click the red confirmation button
-Always use browser_scroll_to_ref after finding the delete button ref in snapshot
-
-## Additional Tools
-- browser_hover — hover to open menus or trigger tooltips
-- browser_select — select dropdown options by value
-- browser_wait_for — wait for text/element/URL to appear after an action
-- browser_evaluate — run JavaScript to read data or check page state
-
-Use browser_wait_for after clicking buttons that trigger navigation or loading.
-Use browser_evaluate when you need to read data not visible in snapshot.`
+## Permissions
+Call ask_permission before: Send, Post, Publish, Buy, Delete, Remove
+After approval — act immediately, do not ask again`
 
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
@@ -724,9 +713,25 @@ async function runAgentLoop(opts: {
             case 'browser_click': {
               consecutiveSnapshots = 0
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
-              await clickRef(opts.userId, args.ref)
-              await new Promise(r => setTimeout(r, 500))
-              result = `Clicked ${args.ref} successfully. Call browser_snapshot if you need to see the updated page.`
+              try {
+                await clickRef(opts.userId, args.ref)
+                await new Promise(r => setTimeout(r, 800))
+                result = `Clicked ${args.ref} successfully. If this should have opened a modal or changed the page — call browser_snapshot to verify.`
+              } catch (err) {
+                // Try scroll into view then click once more
+                try {
+                  const { page } = await getBrowser(opts.userId)
+                  restoreRoleRefsForTarget(opts.userId, page)
+                  const locator = refLocator(page, args.ref)
+                  await locator.scrollIntoViewIfNeeded({ timeout: 5000 })
+                  await new Promise(r => setTimeout(r, 400))
+                  await locator.click({ timeout: 8000 })
+                  await new Promise(r => setTimeout(r, 800))
+                  result = `Clicked ${args.ref} after scrolling into view. Call browser_snapshot to verify the result.`
+                } catch (err2) {
+                  result = toAIFriendlyError(err2, args.ref)
+                }
+              }
               break
             }
             case 'browser_type': {
