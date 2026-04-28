@@ -148,7 +148,7 @@ const CONTENT_ROLES = new Set([
 
 
 const EFFICIENT_SNAPSHOT_MAX_CHARS = 12000
-const INTERACTIVE_SNAPSHOT_MAX_CHARS = 4000
+const INTERACTIVE_SNAPSHOT_MAX_CHARS = 8000
 const CDP_URL = () => `ws://127.0.0.1:${18792}/cdp` // relay port
 
 async function snapshotPage(userId: string, tabKey: string, interactiveOnly = false): Promise<string> {
@@ -156,9 +156,10 @@ async function snapshotPage(userId: string, tabKey: string, interactiveOnly = fa
   const url = page.url()
   const maybeAI = page as any
 
-  if (typeof maybeAI._snapshotForAI === 'function') {
+  const snapshotFn = maybeAI._snapshotForAI || maybeAI['_snapshotForAI']
+  if (typeof snapshotFn === 'function') {
     try {
-      const result = await maybeAI._snapshotForAI({ timeout: 5000, track: 'response' })
+      const result = await snapshotFn.call(page, { timeout: 5000, track: 'response' })
       let raw = String(result?.full ?? '')
       const limit = interactiveOnly ? INTERACTIVE_SNAPSHOT_MAX_CHARS : EFFICIENT_SNAPSHOT_MAX_CHARS
       if (raw.length > limit) raw = raw.slice(0, limit) + '\n\n[...TRUNCATED]'
@@ -468,6 +469,13 @@ const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent controlling
 - Never post, share, or interact with content unless explicitly asked
 - Always end with task_complete or task_failed
 
+## Discovering Unknown Information
+If you need information to complete a task (like a GitHub username, account name, or ID):
+- Navigate to the main site first (e.g. github.com)
+- Take a snapshot or use browser_evaluate to find the info
+- Then construct the correct URL with real values
+Never navigate to a URL with placeholder text like USERNAME or OWNER
+
 ## Reasoning — Do This Before Every Single Action
 Before calling any tool write one line starting with "→" describing what you see and what you will do:
 → I can see the settings page. The plan says scroll to find Delete button. I will browser_page_scroll down 2000px.
@@ -587,6 +595,11 @@ SEND EMAIL:
 2. Click Compose
 3. Fill To, Subject, Body
 4. ask_permission before Send
+
+IMPORTANT: Never use placeholder words like USERNAME, OWNER, USER in URLs.
+If you don't know the exact username or value needed:
+- For GitHub: the agent should navigate to https://github.com first, take a snapshot to find the username, then construct the correct URL
+- Always use real values or instruct the agent to discover them first
 
 Now generate steps for this specific task:`
         },
@@ -758,7 +771,7 @@ async function runAgentLoop(opts: {
               const delta = args.direction === 'down' ? amount : -amount
               await page.evaluate(`window.scrollBy(0, ${delta})`)
               await new Promise(r => setTimeout(r, 400))
-              const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey, true)
+              const freshSnapshot = await snapshotPage(opts.userId, opts.tabKey, false)
               result = `Scrolled ${args.direction} ${amount}px. Interactive elements now:\n${freshSnapshot}`
               break
             }
@@ -771,10 +784,10 @@ async function runAgentLoop(opts: {
                 const locator = refLocator(page, args.ref)
                 await locator.scrollIntoViewIfNeeded({ timeout: 20000 })
                 await new Promise(r => setTimeout(r, 500))
-                const fresh = await snapshotPage(opts.userId, opts.tabKey, true)
+                const fresh = await snapshotPage(opts.userId, opts.tabKey, false)
                 result = `Scrolled ${args.ref} into view. Interactive elements:\n${fresh}`
               } catch (err) {
-                const fresh = await snapshotPage(opts.userId, opts.tabKey, true)
+                const fresh = await snapshotPage(opts.userId, opts.tabKey, false)
                 result = `Could not scroll to ${args.ref}: ${toAIFriendlyError(err, args.ref)}\nCurrent elements:\n${fresh}`
               }
               break
