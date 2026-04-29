@@ -233,28 +233,34 @@ async function clickRef(userId: string, ref: string): Promise<void> {
   await new Promise(r => setTimeout(r, 300))
 }
 
-async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
+async function typeInRef(userId: string, ref: string, text: string, slowly = false): Promise<void> {
   const { page } = await getBrowser(userId)
   restoreRoleRefsForTarget(userId, page)
-
-  // Try role-based locator first
+  const locator = refLocator(page, ref)
+  const timeout = 8000
   try {
-    const locator = refLocator(page, ref)
-    await locator.fill(text, { timeout: 5000 })
-    return
-  } catch {}
-
-  // Fallback: find any visible input/textarea on the page
-  try {
-    const input = page.locator('input:visible, textarea:visible').first()
-    await input.fill(text, { timeout: 5000 })
-    return
-  } catch {}
-
-  // Last resort: focus and type
-  const input = page.locator('input, textarea').first()
-  await input.click({ timeout: 5000 })
-  await input.fill(text, { timeout: 5000 })
+    if (slowly) {
+      // OpenClaw slowly mode — click first then type char by char
+      await locator.click({ timeout })
+      await locator.type(text, { timeout, delay: 75 })
+    } else {
+      await locator.fill(text, { timeout })
+    }
+  } catch {
+    // fill failed — try click then type (works for contenteditable and special inputs)
+    try {
+      await locator.click({ timeout })
+      await new Promise(r => setTimeout(r, 200))
+      await locator.type(text, { timeout, delay: 50 })
+    } catch {
+      // last resort — focus via JS then type
+      await page.evaluate((selector) => {
+        const el = document.querySelector(selector) as HTMLElement
+        if (el) { el.focus(); el.click() }
+      }, `input, textarea, [contenteditable]`)
+      await page.keyboard.type(text, { delay: 50 })
+    }
+  }
 }
 
 async function pressKey(key: string, userId: string): Promise<void> {
@@ -822,7 +828,8 @@ async function runAgentLoop(opts: {
                 result = `Cannot type into ref "${args.ref}" — it is a ${typeRefInfo.role}, not an input. Click it first with browser_click, then call browser_snapshot to find the textbox that appears.`
                 break
               }
-              await typeInRef(opts.userId, args.ref, args.text)
+              // Use slowly mode for better compatibility with special inputs
+              await typeInRef(opts.userId, args.ref, args.text, true)
               if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 300))
               result = `Typed "${args.text}" into ${args.ref} successfully. Call browser_snapshot if you need to see the updated page.`
