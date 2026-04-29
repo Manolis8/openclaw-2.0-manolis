@@ -530,7 +530,7 @@ export async function ensureChromeExtensionRelayServer(opts: {
       }
     };
 
-    const server = createServer((req, res) => {
+    const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", info.baseUrl);
       const path = url.pathname;
       const origin = getHeader(req, "origin");
