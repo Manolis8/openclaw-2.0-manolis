@@ -236,8 +236,25 @@ async function clickRef(userId: string, ref: string): Promise<void> {
 async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
   const { page } = await getBrowser(userId)
   restoreRoleRefsForTarget(userId, page)
-  const locator = refLocator(page, ref)
-  await locator.fill(text, { timeout: 8000 })
+
+  // Try role-based locator first
+  try {
+    const locator = refLocator(page, ref)
+    await locator.fill(text, { timeout: 5000 })
+    return
+  } catch {}
+
+  // Fallback: find any visible input/textarea on the page
+  try {
+    const input = page.locator('input:visible, textarea:visible').first()
+    await input.fill(text, { timeout: 5000 })
+    return
+  } catch {}
+
+  // Last resort: focus and type
+  const input = page.locator('input, textarea').first()
+  await input.click({ timeout: 5000 })
+  await input.fill(text, { timeout: 5000 })
 }
 
 async function pressKey(key: string, userId: string): Promise<void> {
