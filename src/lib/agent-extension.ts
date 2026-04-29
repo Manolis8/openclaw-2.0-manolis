@@ -181,6 +181,7 @@ async function snapshotPage(userId: string, tabKey: string, interactiveOnly = fa
   // Try relay AI snapshot first — uses Accessibility.getFullAXTree via extension
   const aiRaw = await snapshotViaRelay(userId)
   if (aiRaw) {
+    console.log(`[snapshot:relay:raw] first 500 chars: ${aiRaw.slice(0, 500)}`)
     const limit = interactiveOnly ? INTERACTIVE_SNAPSHOT_MAX_CHARS : EFFICIENT_SNAPSHOT_MAX_CHARS
     const truncated = aiRaw.length > limit ? aiRaw.slice(0, limit) + '\n\n[...TRUNCATED]' : aiRaw
     const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(truncated)
