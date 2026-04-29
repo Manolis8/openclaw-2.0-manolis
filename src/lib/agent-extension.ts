@@ -736,7 +736,8 @@ async function runAgentLoop(opts: {
             case 'browser_snapshot': {
               consecutiveSnapshots++
               await opts.onProgress('📸 Reading page...')
-              const snap = await snapshotPage(opts.userId, opts.tabKey, true)
+              // Always use full snapshot so no elements get hidden
+              const snap = await snapshotPage(opts.userId, opts.tabKey, false)
               if (consecutiveSnapshots >= 3) {
                 result = snap + `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, or call task_failed.`
               } else {
