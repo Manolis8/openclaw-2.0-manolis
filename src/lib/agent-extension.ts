@@ -510,6 +510,19 @@ If it fails twice — try a completely different ref or call task_failed.
 Call draft_content BEFORE navigating to any social platform
 Wait for user approval then navigate and post
 
+## Typing vs Clicking — Critical Distinction
+Before calling browser_type on a ref, verify the ref is an input element:
+- textbox, searchbox, combobox → these accept browser_type
+- button, link, menuitem → these need browser_click, never browser_type
+
+If you need to type text and the current snapshot shows no textbox:
+1. First click the button that should reveal the input
+2. Call browser_snapshot to get the new refs
+3. Find the textbox ref in the NEW snapshot
+4. Call browser_type on that textbox ref
+
+Never type into a button ref — always click buttons, type into textboxes only.
+
 ## Permissions
 Call ask_permission before: Send, Post, Publish, Buy, Delete, Remove
 After approval — act immediately, do not ask again`
@@ -750,6 +763,16 @@ async function runAgentLoop(opts: {
             case 'browser_type': {
               consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
+              // Guard: check ref is actually an input element
+              const { page: typePage } = await getBrowser(opts.userId)
+              restoreRoleRefsForTarget(opts.userId, typePage)
+              const typeState = pageStates.get(typePage)
+              const typeRefInfo = typeState?.roleRefs?.[args.ref]
+              const inputRoles = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton'])
+              if (typeRefInfo && !inputRoles.has(typeRefInfo.role)) {
+                result = `Cannot type into ref "${args.ref}" — it is a ${typeRefInfo.role}, not an input. Click it first with browser_click, then call browser_snapshot to find the textbox that appears.`
+                break
+              }
               await typeInRef(opts.userId, args.ref, args.text)
               if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 300))
