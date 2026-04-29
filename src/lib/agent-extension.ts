@@ -275,29 +275,75 @@ async function typeInRef(userId: string, ref: string, text: string, slowly = fal
   restoreRoleRefsForTarget(userId, page)
   const locator = refLocator(page, ref)
   const timeout = 8000
+
+  // Step 1: click to focus the input first
   try {
-    if (slowly) {
-      // OpenClaw slowly mode — click first then type char by char
-      await locator.click({ timeout })
+    await locator.click({ timeout })
+  } catch {
+    // ignore focus errors
+  }
+  await new Promise(r => setTimeout(r, 150))
+
+  // Step 2: try standard fill
+  try {
+    await locator.fill(text, { timeout })
+  } catch {
+    // if fill fails try type char by char
+    try {
       await locator.type(text, { timeout, delay: 75 })
-    } else {
-      await locator.fill(text, { timeout })
+    } catch {}
+  }
+  await new Promise(r => setTimeout(r, 150))
+
+  // Step 3: React-aware value setter — forces React state update
+  // This is required for React-controlled inputs where fill/type bypass React's synthetic events
+  try {
+    await locator.evaluate((el, value) => {
+      // Use native setter to bypass React's value override
+      const input = el as HTMLInputElement | HTMLTextAreaElement
+      const nativeInputSetter = Object.getOwnPropertyDescriptor(
+        input.tagName === 'TEXTAREA'
+          ? window.HTMLTextAreaElement.prototype
+          : window.HTMLInputElement.prototype,
+        'value'
+      )?.set
+      if (nativeInputSetter) {
+        nativeInputSetter.call(input, value)
+      } else {
+        input.value = value
+      }
+      // Dispatch all events React listens to
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+      input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }))
+      input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }))
+    }, text)
+  } catch {
+    // best effort
+  }
+
+  // Step 4: verify the value actually registered
+  await new Promise(r => setTimeout(r, 200))
+  try {
+    const actual = await locator.inputValue().catch(() => null)
+    if (actual !== null && actual !== text) {
+      // Value didn't register — try keyboard typing as last resort
+      await locator.click({ timeout })
+      await page.keyboard.selectAll()
+      await page.keyboard.type(text, { delay: 50 })
+      await new Promise(r => setTimeout(r, 100))
+      // Fire React events one more time
+      await locator.evaluate((el, value) => {
+        const input = el as HTMLInputElement
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+      }, text)
     }
   } catch {
-    // fill failed — try click then type (works for contenteditable and special inputs)
-    try {
-      await locator.click({ timeout })
-      await new Promise(r => setTimeout(r, 200))
-      await locator.type(text, { timeout, delay: 50 })
-    } catch {
-      // last resort — focus via JS then type
-      await page.evaluate((selector) => {
-        const el = document.querySelector(selector) as HTMLElement
-        if (el) { el.focus(); el.click() }
-      }, `input, textarea, [contenteditable]`)
-      await page.keyboard.type(text, { delay: 50 })
-    }
+    // ignore verification errors
   }
+
+  await new Promise(r => setTimeout(r, 300))
 }
 
 async function pressKey(key: string, userId: string): Promise<void> {
@@ -602,19 +648,21 @@ If you need to type text and the current snapshot shows no textbox:
 
 Never type into a button ref — always click buttons, type into textboxes only.
 
-## Multi-Stage Dialogs and Form Submissions
-Many actions have multiple stages. After EVERY click:
-1. Call browser_snapshot immediately
-2. Read what changed — new button? new input? same page?
-3. If same page and nothing changed — the button was likely disabled. Use browser_evaluate to submit:
-   fn="() => document.querySelector('button[type=submit]:not([disabled]), button[data-test-selector]')?.click()"
-4. After typing into a confirmation textbox — wait 500ms then use browser_evaluate to click submit
-   fn="() => { const btns = [...document.querySelectorAll('button')].filter(b => !b.disabled && b.offsetParent); btns[btns.length-1]?.click(); }"
+## After Typing Into Any Input
+After browser_type succeeds:
+1. Wait 500ms for the page to process the input
+2. Call browser_snapshot to get fresh refs
+3. Then click the submit/confirm button
+If the result says "value confirmed" — the text registered correctly in React
+If the result says "Warning" — use browser_evaluate to set the value:
+   fn="() => { const i = document.querySelector('input:not([disabled])'); const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set; s?.call(i,'YOUR_TEXT'); i?.dispatchEvent(new Event('input',{bubbles:true})); i?.dispatchEvent(new Event('change',{bubbles:true})); }"
 
-Pattern for any confirmation dialog:
-- See textbox → type the required text → wait 500ms → use browser_evaluate to click the submit button
-- Never assume browser_click will work on conditionally-enabled buttons
-- After browser_evaluate call → browser_snapshot to verify completion
+## After Confirmed Typing — Clicking Submit
+After value is confirmed in input:
+1. Wait 500ms
+2. Try browser_click on the submit button ref
+3. If button appears disabled or click has no effect — use browser_evaluate:
+   fn="() => { const btn = [...document.querySelectorAll('button')].find(b => !b.disabled && b.offsetParent !== null && b !== document.activeElement); btn?.click(); return btn?.textContent; }"
 
 ## Permissions
 Call ask_permission before: Send, Post, Publish, Buy, Delete, Remove
@@ -865,11 +913,24 @@ async function runAgentLoop(opts: {
                 result = `Cannot type into ref "${args.ref}" — it is a ${typeRefInfo.role}, not an input. Click it first with browser_click, then call browser_snapshot to find the textbox that appears.`
                 break
               }
-              // Use slowly mode for better compatibility with special inputs
               await typeInRef(opts.userId, args.ref, args.text, true)
               if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 300))
-              result = `Typed "${args.text}" into ${args.ref} successfully. Call browser_snapshot if you need to see the updated page.`
+
+              // Verify value registered
+              try {
+                const { page: vPage } = await getBrowser(opts.userId)
+                restoreRoleRefsForTarget(opts.userId, vPage)
+                const vLocator = refLocator(vPage, args.ref)
+                const actual = await vLocator.inputValue().catch(() => null)
+                if (actual !== null && actual !== args.text) {
+                  result = `Warning: typed "${args.text}" but input shows "${actual}". React state may not have updated. Try browser_evaluate to set value directly.`
+                } else {
+                  result = `Typed "${args.text}" into ${args.ref} successfully — value confirmed. Now wait 500ms then click the submit button.`
+                }
+              } catch {
+                result = `Typed "${args.text}" into ${args.ref}. Call browser_snapshot to verify.`
+              }
               break
             }
             case 'browser_key': {
