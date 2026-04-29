@@ -602,25 +602,19 @@ If you need to type text and the current snapshot shows no textbox:
 
 Never type into a button ref — always click buttons, type into textboxes only.
 
-## Multi-Stage Confirmation Dialogs
-Some destructive actions have multiple confirmation stages. After each click that opens a new dialog or changes the page:
-1. ALWAYS call browser_snapshot immediately to see the new state
-2. Read what the new page/dialog is asking
-3. Complete that specific stage before moving to the next
-4. Never assume what comes next — always snapshot first
+## Multi-Stage Dialogs and Form Submissions
+Many actions have multiple stages. After EVERY click:
+1. Call browser_snapshot immediately
+2. Read what changed — new button? new input? same page?
+3. If same page and nothing changed — the button was likely disabled. Use browser_evaluate to submit:
+   fn="() => document.querySelector('button[type=submit]:not([disabled]), button[data-test-selector]')?.click()"
+4. After typing into a confirmation textbox — wait 500ms then use browser_evaluate to click submit
+   fn="() => { const btns = [...document.querySelectorAll('button')].filter(b => !b.disabled && b.offsetParent); btns[btns.length-1]?.click(); }"
 
-Signs you are in a multi-stage dialog:
-- Page shows a warning message with a button to proceed
-- After clicking proceed, a text input appears
-- After typing, another button appears to confirm
-
-Each stage requires: snapshot → understand → act → snapshot again
-
-## Clicking Disabled or Protected Buttons
-If browser_click fails on a button that should be clickable (e.g. after filling a form):
-- The button may be conditionally disabled until a form field matches
-- Use browser_evaluate with: (el) => el.click() to bypass the disabled check
-- Example: browser_evaluate fn="() => document.querySelector('button[type=submit]')?.click()"
+Pattern for any confirmation dialog:
+- See textbox → type the required text → wait 500ms → use browser_evaluate to click the submit button
+- Never assume browser_click will work on conditionally-enabled buttons
+- After browser_evaluate call → browser_snapshot to verify completion
 
 ## Permissions
 Call ask_permission before: Send, Post, Publish, Buy, Delete, Remove
@@ -840,18 +834,18 @@ async function runAgentLoop(opts: {
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
               try {
                 await clickRef(opts.userId, args.ref)
-                await new Promise(r => setTimeout(r, 800))
-                result = `Clicked ${args.ref} successfully. IMPORTANT: Call browser_snapshot now to see if a new dialog, modal, or input field appeared.`
+                await new Promise(r => setTimeout(r, 1000))
+
+                result = `Clicked ${args.ref} successfully. IMPORTANT: Call browser_snapshot now to see if a new dialog, modal, or input field appeared. If the page looks the same and nothing changed — use browser_evaluate to click via JS: fn="() => { const el = document.querySelector('[aria-disabled=false] button, button:not([disabled])'); el?.click(); return !!el; }"`
               } catch (err) {
                 try {
                   const { page } = await getBrowser(opts.userId)
                   restoreRoleRefsForTarget(opts.userId, page)
                   const locator = refLocator(page, args.ref)
-                  await locator.scrollIntoViewIfNeeded({ timeout: 5000 })
-                  await new Promise(r => setTimeout(r, 400))
-                  await locator.click({ timeout: 8000 })
+                  // Try JS click for disabled/intercepted elements
+                  await locator.evaluate((el: HTMLElement) => el.click())
                   await new Promise(r => setTimeout(r, 800))
-                  result = `Clicked ${args.ref} after scrolling into view. Call browser_snapshot to verify the result.`
+                  result = `Clicked ${args.ref} via JS. Call browser_snapshot to verify result.`
                 } catch (err2) {
                   result = toAIFriendlyError(err2, args.ref)
                 }
