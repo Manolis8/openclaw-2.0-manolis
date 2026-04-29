@@ -157,42 +157,47 @@ type WithSnapshotForAI = {
   _snapshotForAI?: (options?: SnapshotForAIOptions) => Promise<SnapshotForAIResult>
 }
 
+async function snapshotViaRelay(userId: string): Promise<string | null> {
+  try {
+    const port = getRelayPortForUser(userId)
+    const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+    const relayToken = await deriveRelayToken(token, port)
+    const res = await fetch(`http://127.0.0.1:${port}/ai-snapshot`, {
+      headers: { 'x-openclaw-relay-token': relayToken },
+      signal: AbortSignal.timeout(6000)
+    })
+    if (!res.ok) return null
+    const data = await res.json() as { ok?: boolean; snapshot?: string }
+    return data.snapshot || null
+  } catch {
+    return null
+  }
+}
+
 async function snapshotPage(userId: string, tabKey: string, interactiveOnly = false): Promise<string> {
   const { page } = await getBrowser(userId)
   const url = page.url()
 
-  // OpenClaw exact pattern — cast to unknown first then to WithSnapshotForAI
-  const maybe = page as unknown as WithSnapshotForAI
-  if (maybe._snapshotForAI) {
-    try {
-      const result = await maybe._snapshotForAI({
-        timeout: 5000,
-        track: 'response'
-      })
-      let raw = String(result?.full ?? '')
-      const limit = interactiveOnly ? INTERACTIVE_SNAPSHOT_MAX_CHARS : EFFICIENT_SNAPSHOT_MAX_CHARS
-      if (raw.length > limit) {
-        raw = raw.slice(0, limit) + '\n\n[...TRUNCATED]'
-      }
-      const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(raw)
-      storeRoleRefsForTarget(userId, page, refs)
-      if (interactiveOnly) {
-        const lines = snapshot.split('\n').filter(l => l.includes('[ref='))
-        const text = `URL: ${url}\n${lines.join('\n')}`
-        console.log(`[snapshot:ai:interactive] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
-        return text
-      }
-      const text = `URL: ${url}\n${snapshot}`
-      console.log(`[snapshot:ai] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
+  // Try relay AI snapshot first — uses Accessibility.getFullAXTree via extension
+  const aiRaw = await snapshotViaRelay(userId)
+  if (aiRaw) {
+    const limit = interactiveOnly ? INTERACTIVE_SNAPSHOT_MAX_CHARS : EFFICIENT_SNAPSHOT_MAX_CHARS
+    const truncated = aiRaw.length > limit ? aiRaw.slice(0, limit) + '\n\n[...TRUNCATED]' : aiRaw
+    const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(truncated)
+    storeRoleRefsForTarget(userId, page, refs)
+    if (interactiveOnly) {
+      const lines = snapshot.split('\n').filter(l => l.includes('[ref='))
+      const text = `URL: ${url}\n${lines.join('\n')}`
+      console.log(`[snapshot:relay:interactive] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
       return text
-    } catch (err) {
-      console.log(`[snapshot:ai:failed] ${err}`)
     }
-  } else {
-    console.log(`[snapshot:ai:unavailable] _snapshotForAI not found on page object`)
+    const text = `URL: ${url}\n${snapshot}`
+    console.log(`[snapshot:relay] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
+    return text
   }
 
-  // Fallback: ariaSnapshot
+  // Fallback: ariaSnapshot via Playwright
+  console.log(`[snapshot:fallback] relay snapshot failed, using ariaSnapshot`)
   const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
   const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(String(ariaRaw ?? ''))
   storeRoleRefsForTarget(userId, page, refs)

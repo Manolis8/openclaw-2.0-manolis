@@ -631,6 +631,102 @@ export async function ensureChromeExtensionRelayServer(opts: {
         return;
       }
 
+      // AI Snapshot endpoint — returns structured accessibility snapshot
+      if (path === '/ai-snapshot' && req.method === 'GET') {
+        // Auth check — same token as relay
+        const token = getRelayAuthTokenFromRequest(req, new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`))
+        const acceptedTokens = await resolveRelayAcceptedTokensForPort(info.port).catch(() => [] as string[])
+        const validTokens = new Set(acceptedTokens)
+        if (validTokens.size > 0 && (!token || !validTokens.has(token))) {
+          res.writeHead(401, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Unauthorized' }))
+          return
+        }
+
+        if (!extensionConnected()) {
+          res.writeHead(503, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Extension not connected' }))
+          return
+        }
+
+        try {
+          // Enable accessibility
+          await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'Accessibility.enable', params: {} }
+          }).catch(() => {})
+
+          // Get full AX tree
+          const axResult = await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'Accessibility.getFullAXTree', params: {} }
+          }) as { nodes?: Array<{
+            nodeId?: string
+            role?: { value?: string }
+            name?: { value?: string }
+            description?: { value?: string }
+            value?: { value?: string }
+            parentId?: string
+            childIds?: string[]
+            ignored?: boolean
+          }> }
+
+          const nodes = axResult?.nodes ?? []
+
+          // Build depth map
+          const nodeMap = new Map<string, typeof nodes[0]>()
+          for (const n of nodes) {
+            if (n.nodeId) nodeMap.set(n.nodeId, n)
+          }
+
+          const depthMap = new Map<string, number>()
+          function getDepth(nodeId: string, visited = new Set<string>()): number {
+            if (depthMap.has(nodeId)) return depthMap.get(nodeId)!
+            if (visited.has(nodeId)) return 0
+            visited.add(nodeId)
+            const node = nodeMap.get(nodeId)
+            if (!node?.parentId) {
+              depthMap.set(nodeId, 0)
+              return 0
+            }
+            const d = getDepth(node.parentId, visited) + 1
+            depthMap.set(nodeId, d)
+            return d
+          }
+          for (const n of nodes) {
+            if (n.nodeId) getDepth(n.nodeId)
+          }
+
+          // Format as indented text — same format buildRoleSnapshotFromAriaSnapshot expects
+          const SKIP_ROLES = new Set(['none', 'presentation', 'generic', 'InlineTextBox', 'StaticText'])
+          const lines: string[] = []
+
+          for (const n of nodes) {
+            if (!n.nodeId) continue
+            if (n.ignored) continue
+            const role = String(n.role?.value ?? '').trim()
+            if (!role || SKIP_ROLES.has(role)) continue
+            const name = String(n.name?.value ?? '').trim()
+            const depth = depthMap.get(n.nodeId) ?? 0
+            const indent = '  '.repeat(Math.min(depth, 10))
+            let line = `${indent}- ${role}`
+            if (name) line += ` "${name}"`
+            lines.push(line)
+          }
+
+          const snapshot = lines.join('\n') || '(empty)'
+
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, snapshot }))
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+        return
+      }
+
       const handleTargetActionRoute = (
         match: RegExpMatchArray | null,
         cdpMethod: "Target.activateTarget" | "Target.closeTarget",
