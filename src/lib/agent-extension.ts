@@ -736,8 +736,7 @@ async function runAgentLoop(opts: {
             case 'browser_snapshot': {
               consecutiveSnapshots++
               await opts.onProgress('📸 Reading page...')
-              // Always use full snapshot so no elements get hidden
-              const snap = await snapshotPage(opts.userId, opts.tabKey, false)
+              const snap = await snapshotPage(opts.userId, opts.tabKey, true)
               if (consecutiveSnapshots >= 3) {
                 result = snap + `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, or call task_failed.`
               } else {
@@ -757,9 +756,8 @@ async function runAgentLoop(opts: {
               try {
                 await clickRef(opts.userId, args.ref)
                 await new Promise(r => setTimeout(r, 800))
-                result = `Clicked ${args.ref} successfully. IMPORTANT: Call browser_snapshot now to see if a new dialog, modal, or form appeared that requires your next action.`
+                result = `Clicked ${args.ref} successfully. IMPORTANT: Call browser_snapshot now to see if a new dialog, modal, or input field appeared.`
               } catch (err) {
-                // Try scroll into view then click once more
                 try {
                   const { page } = await getBrowser(opts.userId)
                   restoreRoleRefsForTarget(opts.userId, page)
