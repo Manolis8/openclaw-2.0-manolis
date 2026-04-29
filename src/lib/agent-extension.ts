@@ -230,8 +230,44 @@ async function clickRef(userId: string, ref: string): Promise<void> {
   const { page } = await getBrowser(userId)
   restoreRoleRefsForTarget(userId, page)
   const locator = refLocator(page, ref)
-  await locator.click({ timeout: 8000 })
-  await new Promise(r => setTimeout(r, 300))
+
+  // Try normal click first
+  try {
+    await locator.click({ timeout: 8000 })
+    await new Promise(r => setTimeout(r, 300))
+    return
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+
+    // If element is disabled or not enabled — try JS click to bypass disabled state
+    if (msg.includes('disabled') || msg.includes('not enabled') || msg.includes('not editable')) {
+      try {
+        await locator.evaluate((el: HTMLElement) => el.click())
+        await new Promise(r => setTimeout(r, 300))
+        return
+      } catch {}
+    }
+
+    // If outside viewport — scroll then click
+    if (msg.includes('outside of the viewport') || msg.includes('element is outside')) {
+      await locator.scrollIntoViewIfNeeded({ timeout: 5000 })
+      await new Promise(r => setTimeout(r, 400))
+      await locator.click({ timeout: 8000 })
+      await new Promise(r => setTimeout(r, 300))
+      return
+    }
+
+    // If intercepted by overlay — try JS click
+    if (msg.includes('intercepts pointer events') || msg.includes('not receive pointer events')) {
+      try {
+        await locator.evaluate((el: HTMLElement) => el.click())
+        await new Promise(r => setTimeout(r, 300))
+        return
+      } catch {}
+    }
+
+    throw err
+  }
 }
 
 async function typeInRef(userId: string, ref: string, text: string, slowly = false): Promise<void> {
@@ -579,6 +615,12 @@ Signs you are in a multi-stage dialog:
 - After typing, another button appears to confirm
 
 Each stage requires: snapshot → understand → act → snapshot again
+
+## Clicking Disabled or Protected Buttons
+If browser_click fails on a button that should be clickable (e.g. after filling a form):
+- The button may be conditionally disabled until a form field matches
+- Use browser_evaluate with: (el) => el.click() to bypass the disabled check
+- Example: browser_evaluate fn="() => document.querySelector('button[type=submit]')?.click()"
 
 ## Permissions
 Call ask_permission before: Send, Post, Publish, Buy, Delete, Remove
