@@ -151,18 +151,29 @@ const EFFICIENT_SNAPSHOT_MAX_CHARS = 12000
 const INTERACTIVE_SNAPSHOT_MAX_CHARS = 8000
 const CDP_URL = () => `ws://127.0.0.1:${18792}/cdp` // relay port
 
+type SnapshotForAIResult = { full: string; incremental?: string }
+type SnapshotForAIOptions = { timeout?: number; track?: string }
+type WithSnapshotForAI = {
+  _snapshotForAI?: (options?: SnapshotForAIOptions) => Promise<SnapshotForAIResult>
+}
+
 async function snapshotPage(userId: string, tabKey: string, interactiveOnly = false): Promise<string> {
   const { page } = await getBrowser(userId)
   const url = page.url()
-  const maybeAI = page as any
 
-  const snapshotFn = maybeAI._snapshotForAI || maybeAI['_snapshotForAI']
-  if (typeof snapshotFn === 'function') {
+  // OpenClaw exact pattern — cast to unknown first then to WithSnapshotForAI
+  const maybe = page as unknown as WithSnapshotForAI
+  if (maybe._snapshotForAI) {
     try {
-      const result = await snapshotFn.call(page, { timeout: 5000, track: 'response' })
+      const result = await maybe._snapshotForAI({
+        timeout: 5000,
+        track: 'response'
+      })
       let raw = String(result?.full ?? '')
       const limit = interactiveOnly ? INTERACTIVE_SNAPSHOT_MAX_CHARS : EFFICIENT_SNAPSHOT_MAX_CHARS
-      if (raw.length > limit) raw = raw.slice(0, limit) + '\n\n[...TRUNCATED]'
+      if (raw.length > limit) {
+        raw = raw.slice(0, limit) + '\n\n[...TRUNCATED]'
+      }
       const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(raw)
       storeRoleRefsForTarget(userId, page, refs)
       if (interactiveOnly) {
@@ -175,10 +186,13 @@ async function snapshotPage(userId: string, tabKey: string, interactiveOnly = fa
       console.log(`[snapshot:ai] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
       return text
     } catch (err) {
-      console.log(`[snapshot:ai:failed] ${err} — falling back to ariaSnapshot`)
+      console.log(`[snapshot:ai:failed] ${err}`)
     }
+  } else {
+    console.log(`[snapshot:ai:unavailable] _snapshotForAI not found on page object`)
   }
 
+  // Fallback: ariaSnapshot
   const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
   const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(String(ariaRaw ?? ''))
   storeRoleRefsForTarget(userId, page, refs)
