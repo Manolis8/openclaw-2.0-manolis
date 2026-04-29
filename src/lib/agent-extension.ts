@@ -523,6 +523,20 @@ If you need to type text and the current snapshot shows no textbox:
 
 Never type into a button ref — always click buttons, type into textboxes only.
 
+## Multi-Stage Confirmation Dialogs
+Some destructive actions have multiple confirmation stages. After each click that opens a new dialog or changes the page:
+1. ALWAYS call browser_snapshot immediately to see the new state
+2. Read what the new page/dialog is asking
+3. Complete that specific stage before moving to the next
+4. Never assume what comes next — always snapshot first
+
+Signs you are in a multi-stage dialog:
+- Page shows a warning message with a button to proceed
+- After clicking proceed, a text input appears
+- After typing, another button appears to confirm
+
+Each stage requires: snapshot → understand → act → snapshot again
+
 ## Permissions
 Call ask_permission before: Send, Post, Publish, Buy, Delete, Remove
 After approval — act immediately, do not ask again`
@@ -742,7 +756,7 @@ async function runAgentLoop(opts: {
               try {
                 await clickRef(opts.userId, args.ref)
                 await new Promise(r => setTimeout(r, 800))
-                result = `Clicked ${args.ref} successfully. If this should have opened a modal or changed the page — call browser_snapshot to verify.`
+                result = `Clicked ${args.ref} successfully. IMPORTANT: Call browser_snapshot now to see if a new dialog, modal, or form appeared that requires your next action.`
               } catch (err) {
                 // Try scroll into view then click once more
                 try {
