@@ -630,21 +630,17 @@ If you need to type text and the current snapshot shows no textbox:
 
 Never type into a button ref — always click buttons, type into textboxes only.
 
-## After Typing Into Any Input
-After browser_type succeeds:
-1. Wait 500ms for the page to process the input
-2. Call browser_snapshot to get fresh refs
-3. Then click the submit/confirm button
-If the result says "value confirmed" — the text registered correctly in React
-If the result says "Warning" — use browser_evaluate to set the value:
-   fn="() => { const i = document.querySelector('input:not([disabled])'); const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set; s?.call(i,'YOUR_TEXT'); i?.dispatchEvent(new Event('input',{bubbles:true})); i?.dispatchEvent(new Event('change',{bubbles:true})); }"
+## Multi-Stage Dialogs — Critical Rule
+After EVERY browser_click, you automatically receive the new page state in the result.
+Read the refs in that result carefully — they are the ONLY valid refs for your next action.
+NEVER use refs from a previous snapshot after a click.
 
-## After Confirmed Typing — Clicking Submit
-After value is confirmed in input:
-1. Wait 500ms
-2. Try browser_click on the submit button ref
-3. If button appears disabled or click has no effect — use browser_evaluate:
-   fn="() => { const btn = [...document.querySelectorAll('button')].find(b => !b.disabled && b.offsetParent !== null && b !== document.activeElement); btn?.click(); return btn?.textContent; }"
+For confirmation dialogs with multiple stages:
+Stage 1: Click the first button → read refs in result → click next button from result refs
+Stage 2: Click proceed button → read refs in result → find textbox ref → type into it
+Stage 3: After typing → click submit button using ref from the SAME snapshot as the textbox
+
+The textbox and submit button will be in the same snapshot result after Stage 2 click.
 
 ## Permissions
 Call ask_permission before: Send, Post, Publish, Buy, Delete, Remove
@@ -865,17 +861,18 @@ async function runAgentLoop(opts: {
               try {
                 await clickRef(opts.userId, args.ref)
                 await new Promise(r => setTimeout(r, 1000))
-
-                result = `Clicked ${args.ref} successfully. IMPORTANT: Call browser_snapshot now to see if a new dialog, modal, or input field appeared. If the page looks the same and nothing changed — use browser_evaluate to click via JS: fn="() => { const el = document.querySelector('[aria-disabled=false] button, button:not([disabled])'); el?.click(); return !!el; }"`
+                // Auto-snapshot after click — agent sees new state immediately
+                const postSnap = await snapshotPage(opts.userId, opts.tabKey, true)
+                result = `Clicked ${args.ref}. Current page state:\n${postSnap}\n\nUse refs from THIS snapshot for your next action.`
               } catch (err) {
                 try {
                   const { page } = await getBrowser(opts.userId)
                   restoreRoleRefsForTarget(opts.userId, page)
                   const locator = refLocator(page, args.ref)
-                  // Try JS click for disabled/intercepted elements
                   await locator.evaluate((el: HTMLElement) => el.click())
                   await new Promise(r => setTimeout(r, 800))
-                  result = `Clicked ${args.ref} via JS. Call browser_snapshot to verify result.`
+                  const postSnap = await snapshotPage(opts.userId, opts.tabKey, true)
+                  result = `Clicked ${args.ref} via JS. Current page state:\n${postSnap}\n\nUse refs from THIS snapshot for your next action.`
                 } catch (err2) {
                   result = toAIFriendlyError(err2, args.ref)
                 }
