@@ -1,126 +1,205 @@
 import WebSocket from "ws";
-import { isLoopbackHost, rawDataToString } from "./stubs.js";
+import { isLoopbackHost } from "../gateway/net.js";
+import { rawDataToString } from "../infra/ws.js";
+import { getDirectAgentForCdp, withNoProxyForCdpUrl } from "./cdp-proxy-bypass.js";
+import { CDP_HTTP_REQUEST_TIMEOUT_MS, CDP_WS_HANDSHAKE_TIMEOUT_MS } from "./cdp-timeouts.js";
+import { getChromeExtensionRelayAuthHeaders } from "./extension-relay.js";
+
+export { isLoopbackHost };
+
+type CdpResponse = {
+  id: number;
+  result?: unknown;
+  error?: { message?: string };
+};
+
+type Pending = {
+  resolve: (value: unknown) => void;
+  reject: (err: Error) => void;
+};
+
+export type CdpSendFn = (
+  method: string,
+  params?: Record<string, unknown>,
+  sessionId?: string,
+) => Promise<unknown>;
+
+export function getHeadersWithAuth(url: string, headers: Record<string, string> = {}) {
+  const relayHeaders = getChromeExtensionRelayAuthHeaders(url);
+  const mergedHeaders = { ...relayHeaders, ...headers };
+  try {
+    const parsed = new URL(url);
+    const hasAuthHeader = Object.keys(mergedHeaders).some(
+      (key) => key.toLowerCase() === "authorization",
+    );
+    if (hasAuthHeader) {
+      return mergedHeaders;
+    }
+    if (parsed.username || parsed.password) {
+      const auth = Buffer.from(`${parsed.username}:${parsed.password}`).toString("base64");
+      return { ...mergedHeaders, Authorization: `Basic ${auth}` };
+    }
+  } catch {
+    // ignore
+  }
+  return mergedHeaders;
+}
 
 export function appendCdpPath(cdpUrl: string, path: string): string {
   const url = new URL(cdpUrl);
-  url.pathname = url.pathname.replace(/\/$/, "") + path;
+  const basePath = url.pathname.replace(/\/$/, "");
+  const suffix = path.startsWith("/") ? path : `/${path}`;
+  url.pathname = `${basePath}${suffix}`;
   return url.toString();
 }
 
-export async function fetchJson<T>(url: string, timeout = 5000): Promise<T | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) {
-      return null;
-    }
-    return await res.json() as T;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
+function createCdpSender(ws: WebSocket) {
+  let nextId = 1;
+  const pending = new Map<number, Pending>();
 
-export function fetchOk(url: string, timeout = 5000): Promise<boolean> {
-  return fetchJson<unknown>(url, timeout).then((r) => r !== null);
-}
-
-export function getHeadersWithAuth(token?: string): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+  const send: CdpSendFn = (
+    method: string,
+    params?: Record<string, unknown>,
+    sessionId?: string,
+  ) => {
+    const id = nextId++;
+    const msg = { id, method, params, sessionId };
+    ws.send(JSON.stringify(msg));
+    return new Promise<unknown>((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+    });
   };
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
+
+  const closeWithError = (err: Error) => {
+    for (const [, p] of pending) {
+      p.reject(err);
+    }
+    pending.clear();
+    try {
+      ws.close();
+    } catch {
+      // ignore
+    }
+  };
+
+  ws.on("error", (err) => {
+    closeWithError(err instanceof Error ? err : new Error(String(err)));
+  });
+
+  ws.on("message", (data) => {
+    try {
+      const parsed = JSON.parse(rawDataToString(data)) as CdpResponse;
+      if (typeof parsed.id !== "number") {
+        return;
+      }
+      const p = pending.get(parsed.id);
+      if (!p) {
+        return;
+      }
+      pending.delete(parsed.id);
+      if (parsed.error?.message) {
+        p.reject(new Error(parsed.error.message));
+        return;
+      }
+      p.resolve(parsed.result);
+    } catch {
+      // ignore
+    }
+  });
+
+  ws.on("close", () => {
+    closeWithError(new Error("CDP socket closed"));
+  });
+
+  return { send, closeWithError };
+}
+
+export async function fetchJson<T>(
+  url: string,
+  timeoutMs = CDP_HTTP_REQUEST_TIMEOUT_MS,
+  init?: RequestInit,
+): Promise<T> {
+  const res = await fetchCdpChecked(url, timeoutMs, init);
+  return (await res.json()) as T;
+}
+
+export async function fetchCdpChecked(
+  url: string,
+  timeoutMs = CDP_HTTP_REQUEST_TIMEOUT_MS,
+  init?: RequestInit,
+): Promise<Response> {
+  const ctrl = new AbortController();
+  const t = setTimeout(ctrl.abort.bind(ctrl), timeoutMs);
+  try {
+    const headers = getHeadersWithAuth(url, (init?.headers as Record<string, string>) || {});
+    const res = await withNoProxyForCdpUrl(url, () =>
+      fetch(url, { ...init, headers, signal: ctrl.signal }),
+    );
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return res;
+  } finally {
+    clearTimeout(t);
   }
-  return headers;
+}
+
+export async function fetchOk(
+  url: string,
+  timeoutMs = CDP_HTTP_REQUEST_TIMEOUT_MS,
+  init?: RequestInit,
+): Promise<void> {
+  await fetchCdpChecked(url, timeoutMs, init);
+}
+
+export function openCdpWebSocket(
+  wsUrl: string,
+  opts?: { headers?: Record<string, string>; handshakeTimeoutMs?: number },
+): WebSocket {
+  const headers = getHeadersWithAuth(wsUrl, opts?.headers ?? {});
+  const handshakeTimeoutMs =
+    typeof opts?.handshakeTimeoutMs === "number" && Number.isFinite(opts.handshakeTimeoutMs)
+      ? Math.max(1, Math.floor(opts.handshakeTimeoutMs))
+      : CDP_WS_HANDSHAKE_TIMEOUT_MS;
+  const agent = getDirectAgentForCdp(wsUrl);
+  return new WebSocket(wsUrl, undefined, {
+    handshakeTimeout: handshakeTimeoutMs,
+    ...(Object.keys(headers).length ? { headers } : {}),
+    ...(agent ? { agent } : {}),
+  });
 }
 
 export async function withCdpSocket<T>(
   wsUrl: string,
-  fn: (send: (method: string, params?: unknown) => Promise<unknown>) => Promise<T>,
+  fn: (send: CdpSendFn) => Promise<T>,
+  opts?: { headers?: Record<string, string>; handshakeTimeoutMs?: number },
 ): Promise<T> {
-  return new Promise((resolve, reject) => {
-    let ws: WebSocket | null = null;
-    let id = 0;
-    const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-    let isClosed = false;
+  const ws = openCdpWebSocket(wsUrl, opts);
+  const { send, closeWithError } = createCdpSender(ws);
 
-    const cleanup = () => {
-      if (ws) {
-        try {
-          ws.close();
-        } catch {
-          // ignore
-        }
-        ws = null;
-      }
-    };
-
-    const send = async (method: string, params?: unknown): Promise<unknown> => {
-      if (isClosed || !ws || ws.readyState !== WebSocket.OPEN) {
-        throw new Error("CDP socket not connected");
-      }
-      const msgId = ++id;
-      const promise = new Promise<unknown>((res, rej) => {
-        pending.set(msgId, { resolve: res, reject: rej });
-      });
-      ws.send(JSON.stringify({ id: msgId, method, params }));
-      return promise;
-    };
-
-    try {
-      ws = new WebSocket(wsUrl);
-
-      ws.on("open", async () => {
-        try {
-          const result = await fn(send);
-          isClosed = true;
-          cleanup();
-          resolve(result);
-        } catch (err) {
-          isClosed = true;
-          cleanup();
-          reject(err);
-        }
-      });
-
-      ws.on("message", (data) => {
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.id && pending.has(msg.id)) {
-            const p = pending.get(msg.id)!;
-            pending.delete(msg.id);
-            if (msg.error) {
-              p.reject(new Error(msg.error.message || "CDP error"));
-            } else {
-              p.resolve(msg.result);
-            }
-          }
-        } catch {
-          // ignore parse errors
-        }
-      });
-
-      ws.on("error", (err) => {
-        if (!isClosed) {
-          isClosed = true;
-          cleanup();
-          reject(err);
-        }
-      });
-
-      ws.on("close", () => {
-        if (!isClosed) {
-          isClosed = true;
-          cleanup();
-          reject(new Error("CDP socket closed unexpectedly"));
-        }
-      });
-    } catch (err) {
-      cleanup();
-      reject(err);
-    }
+  const openPromise = new Promise<void>((resolve, reject) => {
+    ws.once("open", () => resolve());
+    ws.once("error", (err) => reject(err));
+    ws.once("close", () => reject(new Error("CDP socket closed")));
   });
+
+  try {
+    await openPromise;
+  } catch (err) {
+    closeWithError(err instanceof Error ? err : new Error(String(err)));
+    throw err;
+  }
+
+  try {
+    return await fn(send);
+  } catch (err) {
+    closeWithError(err instanceof Error ? err : new Error(String(err)));
+    throw err;
+  } finally {
+    try {
+      ws.close();
+    } catch {
+      // ignore
+    }
+  }
 }
