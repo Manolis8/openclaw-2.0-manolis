@@ -162,7 +162,7 @@ export function openCdpWebSocket(
       ? Math.max(1, Math.floor(opts.handshakeTimeoutMs))
       : CDP_WS_HANDSHAKE_TIMEOUT_MS;
   const agent = getDirectAgentForCdp(wsUrl);
-  return new WebSocket(wsUrl, undefined, {
+  return new WebSocket(wsUrl, {
     handshakeTimeout: handshakeTimeoutMs,
     ...(Object.keys(headers).length ? { headers } : {}),
     ...(agent ? { agent } : {}),
