@@ -442,9 +442,10 @@ const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent controlling
 - ONLY do what the user asked — nothing more, nothing less
 - Never post, share, or interact with content unless explicitly asked
 - Always end with task_complete or task_failed
-- This task is already approved by the user — never call ask_permission for it
+- This task is already pre-approved — never call ask_permission for the main task action
 
 ## How To Act
+You receive an EXECUTION PLAN. Follow it step by step.
 Think one step at a time. After every click call browser_snapshot to see what changed.
 Never use a ref from a previous snapshot — always get fresh refs after any action.
 
@@ -453,19 +454,31 @@ Never use a ref from a previous snapshot — always get fresh refs after any act
 - If element not visible — use browser_page_scroll then browser_snapshot
 - After any scroll — use refs from the NEW snapshot only
 
-## Typing Into Inputs
-- Always call browser_snapshot first to find the textbox ref
-- Then call browser_type with that ref
-- If typing fails — the input will still receive text via direct fallback
-- After typing — call browser_snapshot to confirm, then click submit button
+## Confirmation Input Pattern — Critical
+Many actions require typing a confirmation text to enable a submit button.
+When you see BOTH a textbox AND a button in a dialog:
+- The button is DISABLED until you type the correct text in the textbox
+- ALWAYS type into the textbox FIRST before attempting to click the button
+- The textbox ref will be different from the button ref — use browser_snapshot to find both
+- After typing — wait briefly then click the button
+- If button click has no effect — it means your typed text did not match exactly
+- Re-read what text is required and type it precisely
 
 ## Multi-Step Dialogs
-After each click that opens a dialog:
-1. Call browser_snapshot immediately
-2. Read what stage you are on
-3. Act on that stage only
-4. Repeat until done
-Never skip stages. Each stage needs its own snapshot → act cycle.
+Many destructive actions have multiple confirmation stages:
+Stage 1: Click initial delete/remove button → new dialog appears
+Stage 2: Click "I understand" or "proceed" button → text input appears
+Stage 3: Type exact confirmation text in textbox → submit button enables
+Stage 4: Click enabled submit button → action completes
+
+After each click — ALWAYS call browser_snapshot before next action.
+Each stage has different refs — never reuse refs across stages.
+
+## Typing Into Inputs
+- Call browser_snapshot to find the textbox ref
+- Call browser_type with that exact ref and the required text
+- After typing — call browser_snapshot to confirm input received text
+- Then click the submit button ref from the SAME snapshot
 
 ## Discovering Unknown Info
 If you need a username or ID — navigate to the site first and use browser_evaluate to find it.
@@ -529,40 +542,47 @@ async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
-      max_tokens: 200,
+      max_tokens: 400,
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation planner. Given a task, output a numbered list of EXACT steps. Be very specific about URLs, button names, what to type. Max 6 steps. No explanations.
+          content: `You are a browser automation planner. Given a task, produce a detailed numbered execution plan for a browser agent.
 
-Common flows to follow exactly:
+Rules:
+- Be specific about URLs, exact button names, what text to type
+- If you need account-specific info (username, email, ID) — add a discovery step first
+- For destructive actions (delete, remove) — always include the full confirmation flow
+- For confirmation dialogs: describe EVERY stage including typing confirmation text
+- Max 10 steps, no explanations, numbered only
 
-DELETE GITHUB REPO:
-1. Navigate to https://github.com/USERNAME/REPONAME/settings
-2. browser_page_scroll down to find "Delete this repository" button
-3. browser_scroll_to_ref then browser_click the "Delete this repository" button
-4. In the modal: browser_type the repo name exactly as shown
-5. browser_click the final delete confirmation button
+Universal patterns to follow:
 
-POST ON LINKEDIN:
-1. draft_content first with the post text
-2. After approval: navigate to https://linkedin.com
-3. Click "Start a post"
-4. Type the content
-5. Click Post button then ask_permission
+DELETING SOMETHING WITH CONFIRMATION:
+1. Navigate to the settings/danger page
+2. Find and click the delete/remove button
+3. A dialog appears — click the first confirmation button
+4. A second stage appears — click the proceed/understand button
+5. A text input appears — type the exact confirmation text shown
+6. The submit button becomes enabled — click it to complete deletion
 
-SEND EMAIL:
-1. Navigate to https://mail.google.com
-2. Click Compose
-3. Fill To, Subject, Body
-4. ask_permission before Send
+POSTING CONTENT:
+1. Call draft_content with the content first
+2. Wait for approval
+3. Navigate to the platform
+4. Click compose/new post
+5. Type the approved content
+6. Click publish/post button
 
-IMPORTANT: Never use placeholder words like USERNAME, OWNER, USER in URLs.
-If you don't know the exact username or value needed:
-- For GitHub: the agent should navigate to https://github.com first, take a snapshot to find the username, then construct the correct URL
-- Always use real values or instruct the agent to discover them first
+SENDING EMAIL:
+1. Navigate to mail client
+2. Click compose
+3. Fill recipient, subject, body
+4. Click send
 
-Now generate steps for this specific task:`
+IMPORTANT:
+- Never use placeholder words like USERNAME, OWNER, USER in URLs
+- If account info unknown — add step: navigate to site homepage, take snapshot to find username/email
+- For any multi-step confirmation dialog — list each stage as a separate step`
         },
         {
           role: 'user',
