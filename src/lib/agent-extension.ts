@@ -103,9 +103,33 @@ function refLocator(page: Page, ref: string) {
   if (!info) {
     throw new Error(`Unknown ref "${ref}". Run a new snapshot and use a ref from that snapshot.`)
   }
-  const locator = info.name
-    ? page.getByRole(info.role as any, { name: info.name, exact: true })
-    : page.getByRole(info.role as any)
+
+  // Try exact match first
+  if (info.name) {
+    try {
+      const locator = page.getByRole(info.role as any, { name: info.name, exact: true })
+      const result = info.nth !== undefined ? locator.nth(info.nth) : locator
+      return result
+    } catch {
+      // fall through
+    }
+  }
+
+  // Fallback 1: match by role + partial name (handles special chars like quotes)
+  if (info.name) {
+    try {
+      // Strip quotes and use partial match
+      const cleanName = info.name.replace(/['"]/g, '').slice(0, 30)
+      const locator = page.getByRole(info.role as any, { name: cleanName })
+      const result = info.nth !== undefined ? locator.nth(info.nth) : locator
+      return result
+    } catch {
+      // fall through
+    }
+  }
+
+  // Fallback 2: role only with nth
+  const locator = page.getByRole(info.role as any)
   return info.nth !== undefined ? locator.nth(info.nth) : locator
 }
 
@@ -229,27 +253,29 @@ async function navigateTo(url: string, userId: string): Promise<void> {
 async function clickRef(userId: string, ref: string): Promise<void> {
   const { page } = await getBrowser(userId)
   restoreRoleRefsForTarget(userId, page)
-  const locator = refLocator(page, ref)
 
-  // Try normal click first
+  // Try normal refLocator click
   try {
+    const locator = refLocator(page, ref)
     await locator.click({ timeout: 8000 })
     await new Promise(r => setTimeout(r, 300))
     return
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
 
-    // If element is disabled or not enabled — try JS click to bypass disabled state
-    if (msg.includes('disabled') || msg.includes('not enabled') || msg.includes('not editable')) {
+    // JS click fallback for disabled/intercepted elements
+    if (msg.includes('disabled') || msg.includes('intercepts pointer') || msg.includes('not receive pointer')) {
       try {
+        const locator = refLocator(page, ref)
         await locator.evaluate((el: HTMLElement) => el.click())
         await new Promise(r => setTimeout(r, 300))
         return
       } catch {}
     }
 
-    // If outside viewport — scroll then click
-    if (msg.includes('outside of the viewport') || msg.includes('element is outside')) {
+    // Scroll into view fallback
+    if (msg.includes('outside of the viewport') || msg.includes('outside viewport')) {
+      const locator = refLocator(page, ref)
       await locator.scrollIntoViewIfNeeded({ timeout: 5000 })
       await new Promise(r => setTimeout(r, 400))
       await locator.click({ timeout: 8000 })
@@ -257,13 +283,14 @@ async function clickRef(userId: string, ref: string): Promise<void> {
       return
     }
 
-    // If intercepted by overlay — try JS click
-    if (msg.includes('intercepts pointer events') || msg.includes('not receive pointer events')) {
-      try {
-        await locator.evaluate((el: HTMLElement) => el.click())
-        await new Promise(r => setTimeout(r, 300))
-        return
-      } catch {}
+    // Unknown ref or strict mode — try role-only match
+    const info = pageStates.get(page)?.roleRefs?.[ref]
+    if (info?.role) {
+      const fallback = page.getByRole(info.role as any)
+      const locator = info.nth !== undefined ? fallback.nth(info.nth) : fallback.first()
+      await locator.click({ timeout: 8000 })
+      await new Promise(r => setTimeout(r, 300))
+      return
     }
 
     throw err
@@ -273,20 +300,31 @@ async function clickRef(userId: string, ref: string): Promise<void> {
 async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
   const { page } = await getBrowser(userId)
   restoreRoleRefsForTarget(userId, page)
-  const locator = refLocator(page, ref)
-  const timeout = 8000
 
-  // Click to focus first
-  await locator.click({ timeout })
+  // First try: use refLocator
+  try {
+    const locator = refLocator(page, ref)
+    await locator.click({ timeout: 5000 })
+    await new Promise(r => setTimeout(r, 200))
+    await locator.type(text, { timeout: 8000, delay: 50 })
+    await new Promise(r => setTimeout(r, 300))
+    return
+  } catch {
+    // fall through to direct input finder
+  }
+
+  // Second try: find any visible input/textarea directly
+  // This works when refLocator fails due to special chars in name
+  const info = pageStates.get(page)?.roleRefs?.[ref]
+  const role = info?.role || 'textbox'
+
+  const directLocator = role === 'searchbox'
+    ? page.locator('input[type="search"]:visible, input[role="searchbox"]:visible').first()
+    : page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):visible, textarea:visible').first()
+
+  await directLocator.click({ timeout: 5000 })
   await new Promise(r => setTimeout(r, 200))
-
-  // Clear existing value
-  await page.keyboard.selectAll()
-  await page.keyboard.press('Backspace')
-  await new Promise(r => setTimeout(r, 100))
-
-  // Type char by char with delay — fires real keyboard events React picks up
-  await locator.type(text, { timeout, delay: 75 })
+  await directLocator.type(text, { timeout: 8000, delay: 50 })
   await new Promise(r => setTimeout(r, 300))
 }
 
