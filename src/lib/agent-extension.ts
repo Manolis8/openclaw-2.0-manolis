@@ -7,29 +7,24 @@ import { getRelayPortForUser } from '../index.js'
 import { detectLoop } from '../routes/tasks.js'
 
 // Use OpenClaw's exact functions from src/browser/
-import { buildRoleSnapshotFromAriaSnapshot } from '../browser/pw-role-snapshot.js'
+import { snapshotRoleViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
+import { typeViaPlaywright, clickViaPlaywright, hoverViaPlaywright, selectOptionViaPlaywright } from '../browser/pw-tools-core.interactions.js'
+
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const runningTasks = new Set<string>()
 
 // ─── Types (from OpenClaw pw-session.ts) ─────────────────────────────────────
 
-type RoleRef = { role: string; name?: string; nth?: number }
-type RoleRefMap = Record<string, RoleRef>
 
-type PageState = {
-  roleRefs: RoleRefMap
-  roleRefsMode: 'role'
-}
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-const pageStates = new WeakMap<Page, PageState>()
-const roleRefsByTarget = new Map<string, RoleRefMap>()
-const MAX_ROLE_REFS_CACHE = 50
+
 
 type ConnectedBrowser = { browser: Browser; port: number }
 const connections = new Map<string, ConnectedBrowser>()
+const targetIds = new Map<string, string>() // userId → targetId
 
 // ─── Browser connection ───────────────────────────────────────────────────────
 
@@ -43,95 +38,52 @@ async function deriveRelayToken(gatewayToken: string, port: number): Promise<str
   return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
-async function getBrowser(userId: string): Promise<{ browser: Browser; page: Page }> {
+async function getBrowser(userId: string): Promise<{ browser: Browser; page: Page; cdpUrl: string; targetId: string }> {
   const port = getRelayPortForUser(userId)
   const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
   const relayToken = await deriveRelayToken(token, port)
+  const cdpUrl = `ws://127.0.0.1:${port}/cdp`
 
   let conn = connections.get(userId)
   if (!conn || conn.port !== port) {
     try { if (conn) conn.browser.close().catch(() => {}) } catch {}
-    const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${port}/cdp`, {
+    const browser = await chromium.connectOverCDP(cdpUrl, {
       headers: { 'x-openclaw-relay-token': relayToken }
     })
     conn = { browser, port }
     connections.set(userId, conn)
     browser.on('disconnected', () => {
-      if (connections.get(userId) === conn) connections.delete(userId)
+      if (connections.get(userId) === conn) {
+        connections.delete(userId)
+        targetIds.delete(userId)
+      }
     })
   }
 
   const pages = conn.browser.contexts().flatMap(c => c.pages())
   if (!pages.length) throw new Error('No pages found in browser.')
   const page = pages.find(p => p.url() !== 'about:blank') ?? pages[0]
-  return { browser: conn.browser, page }
+
+  // Get and cache targetId
+  let targetId = targetIds.get(userId) || ''
+  if (!targetId) {
+    try {
+      const session = await page.context().newCDPSession(page)
+      const info = await session.send('Target.getTargetInfo') as any
+      targetId = String(info?.targetInfo?.targetId || '').trim()
+      await session.detach().catch(() => {})
+      if (targetId) targetIds.set(userId, targetId)
+    } catch {}
+  }
+
+  return { browser: conn.browser, page, cdpUrl: `http://127.0.0.1:${port}`, targetId }
 }
 
 // ─── Page state (from OpenClaw pw-session.ts) ────────────────────────────────
 
-function ensurePageState(page: Page): PageState {
-  let state = pageStates.get(page)
-  if (!state) {
-    state = { roleRefs: {}, roleRefsMode: 'role' }
-    pageStates.set(page, state)
-  }
-  return state
-}
 
-function storeRoleRefsForTarget(userId: string, page: Page, refs: RoleRefMap) {
-  const state = ensurePageState(page)
-  state.roleRefs = refs
-  roleRefsByTarget.set(userId, refs)
-  if (roleRefsByTarget.size > MAX_ROLE_REFS_CACHE) {
-    const first = roleRefsByTarget.keys().next().value
-    if (first) roleRefsByTarget.delete(first)
-  }
-}
 
-function restoreRoleRefsForTarget(userId: string, page: Page) {
-  const state = ensurePageState(page)
-  if (state.roleRefs && Object.keys(state.roleRefs).length > 0) return
-  const cached = roleRefsByTarget.get(userId)
-  if (cached) state.roleRefs = cached
-}
 
-// ─── Ref locator (from OpenClaw pw-session.ts refLocator) ───────────────────
-
-function refLocator(page: Page, ref: string) {
-  const state = pageStates.get(page)
-  const info = state?.roleRefs?.[ref]
-  if (!info) {
-    throw new Error(`Unknown ref "${ref}". Run a new snapshot and use a ref from that snapshot.`)
-  }
-
-  // Try exact match first
-  if (info.name) {
-    try {
-      const locator = page.getByRole(info.role as any, { name: info.name, exact: true })
-      const result = info.nth !== undefined ? locator.nth(info.nth) : locator
-      return result
-    } catch {
-      // fall through
-    }
-  }
-
-  // Fallback 1: match by role + partial name (handles special chars like quotes)
-  if (info.name) {
-    try {
-      // Strip quotes and use partial match
-      const cleanName = info.name.replace(/['"]/g, '').slice(0, 30)
-      const locator = page.getByRole(info.role as any, { name: cleanName })
-      const result = info.nth !== undefined ? locator.nth(info.nth) : locator
-      return result
-    } catch {
-      // fall through
-    }
-  }
-
-  // Fallback 2: role only with nth
-  const locator = page.getByRole(info.role as any)
-  return info.nth !== undefined ? locator.nth(info.nth) : locator
-}
 
 // ─── AI-friendly errors (from OpenClaw pw-tools-core.shared.ts) ─────────────
 
@@ -173,70 +125,35 @@ const CONTENT_ROLES = new Set([
 
 const EFFICIENT_SNAPSHOT_MAX_CHARS = 12000
 const INTERACTIVE_SNAPSHOT_MAX_CHARS = 8000
-const CDP_URL = () => `ws://127.0.0.1:${18792}/cdp` // relay port
 
-type SnapshotForAIResult = { full: string; incremental?: string }
-type SnapshotForAIOptions = { timeout?: number; track?: string }
-type WithSnapshotForAI = {
-  _snapshotForAI?: (options?: SnapshotForAIOptions) => Promise<SnapshotForAIResult>
-}
 
-async function snapshotViaRelay(userId: string): Promise<string | null> {
-  try {
-    const port = getRelayPortForUser(userId)
-    const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
-    const relayToken = await deriveRelayToken(token, port)
-    const res = await fetch(`http://127.0.0.1:${port}/ai-snapshot`, {
-      headers: { 'x-openclaw-relay-token': relayToken },
-      signal: AbortSignal.timeout(6000)
-    })
-    if (!res.ok) return null
-    const data = await res.json() as { ok?: boolean; snapshot?: string }
-    return data.snapshot || null
-  } catch {
-    return null
-  }
-}
+
 
 async function snapshotPage(userId: string, tabKey: string, interactiveOnly = false): Promise<string> {
-  const { page } = await getBrowser(userId)
+  const { page, cdpUrl, targetId } = await getBrowser(userId)
   const url = page.url()
 
-  // Try relay AI snapshot first — uses Accessibility.getFullAXTree via extension
-  const aiRaw = await snapshotViaRelay(userId)
-  if (aiRaw) {
-    console.log(`[snapshot:relay:raw] first 500 chars: ${aiRaw.slice(0, 500)}`)
-    const limit = interactiveOnly ? INTERACTIVE_SNAPSHOT_MAX_CHARS : EFFICIENT_SNAPSHOT_MAX_CHARS
-    const truncated = aiRaw.length > limit ? aiRaw.slice(0, limit) + '\n\n[...TRUNCATED]' : aiRaw
-    const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(truncated)
-    storeRoleRefsForTarget(userId, page, refs)
-    if (interactiveOnly) {
-      const lines = snapshot.split('\n').filter(l => l.includes('[ref='))
-      const text = `URL: ${url}\n${lines.join('\n')}`
-      console.log(`[snapshot:relay:interactive] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
-      return text
-    }
-    const text = `URL: ${url}\n${snapshot}`
-    console.log(`[snapshot:relay] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
-    return text
-  }
+  try {
+    // Use OpenClaw's exact snapshotRoleViaPlaywright with role mode
+    // This uses Playwright's native ariaSnapshot which includes [ref=eN] tags
+    const result = await snapshotRoleViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      refsMode: 'role',
+      options: { interactive: interactiveOnly, compact: true }
+    })
 
-  // Fallback: ariaSnapshot via Playwright
-  console.log(`[snapshot:fallback] relay snapshot failed, using ariaSnapshot`)
-  const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
-  const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(String(ariaRaw ?? ''))
-  storeRoleRefsForTarget(userId, page, refs)
-  if (interactiveOnly) {
-    const lines = snapshot.split('\n').filter(l => l.includes('[ref='))
-    const text = `URL: ${url}\n${lines.join('\n')}`
-    console.log(`[snapshot:aria:interactive] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
-    return text.length > INTERACTIVE_SNAPSHOT_MAX_CHARS
-      ? text.slice(0, INTERACTIVE_SNAPSHOT_MAX_CHARS) + '\n...(truncated)' : text
+    const text = `URL: ${url}\n${result.snapshot}`
+    console.log(`[snapshot:openclaw] url=${url} refs=${Object.keys(result.refs).length} chars=${text.length} interactive=${interactiveOnly}`)
+    return text
+  } catch (err) {
+    console.log(`[snapshot:openclaw:failed] ${err}`)
+    // Fallback to ariaSnapshot
+    const ariaRaw = await (page.locator(':root') as any).ariaSnapshot()
+    const { buildRoleSnapshotFromAriaSnapshot } = await import('../browser/pw-role-snapshot.js')
+    const { snapshot, refs } = buildRoleSnapshotFromAriaSnapshot(String(ariaRaw ?? ''))
+    return `URL: ${url}\n${snapshot}`
   }
-  const text = `URL: ${url}\n${snapshot}`
-  console.log(`[snapshot:aria] url=${url} refs=${Object.keys(refs).length} chars=${text.length}`)
-  return text.length > EFFICIENT_SNAPSHOT_MAX_CHARS
-    ? text.slice(0, EFFICIENT_SNAPSHOT_MAX_CHARS) + '\n...(truncated)' : text
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -246,86 +163,29 @@ async function navigateTo(url: string, userId: string): Promise<void> {
   await page.goto(url, { timeout: 30000, waitUntil: 'domcontentloaded' })
   const isGoogle = url.includes('google.com')
   await new Promise(r => setTimeout(r, isGoogle ? 2000 : 1000))
-  const state = pageStates.get(page)
-  if (state) state.roleRefs = {}
+
 }
 
 async function clickRef(userId: string, ref: string): Promise<void> {
-  const { page } = await getBrowser(userId)
-  restoreRoleRefsForTarget(userId, page)
-
-  // Try normal refLocator click
-  try {
-    const locator = refLocator(page, ref)
-    await locator.click({ timeout: 8000 })
-    await new Promise(r => setTimeout(r, 300))
-    return
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-
-    // JS click fallback for disabled/intercepted elements
-    if (msg.includes('disabled') || msg.includes('intercepts pointer') || msg.includes('not receive pointer')) {
-      try {
-        const locator = refLocator(page, ref)
-        await locator.evaluate((el: HTMLElement) => el.click())
-        await new Promise(r => setTimeout(r, 300))
-        return
-      } catch {}
-    }
-
-    // Scroll into view fallback
-    if (msg.includes('outside of the viewport') || msg.includes('outside viewport')) {
-      const locator = refLocator(page, ref)
-      await locator.scrollIntoViewIfNeeded({ timeout: 5000 })
-      await new Promise(r => setTimeout(r, 400))
-      await locator.click({ timeout: 8000 })
-      await new Promise(r => setTimeout(r, 300))
-      return
-    }
-
-    // Unknown ref or strict mode — try role-only match
-    const info = pageStates.get(page)?.roleRefs?.[ref]
-    if (info?.role) {
-      const fallback = page.getByRole(info.role as any)
-      const locator = info.nth !== undefined ? fallback.nth(info.nth) : fallback.first()
-      await locator.click({ timeout: 8000 })
-      await new Promise(r => setTimeout(r, 300))
-      return
-    }
-
-    throw err
-  }
+  const { cdpUrl, targetId } = await getBrowser(userId)
+  await clickViaPlaywright({
+    cdpUrl,
+    targetId: targetId || undefined,
+    ref,
+    timeoutMs: 8000
+  })
 }
 
 async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
-  const { page } = await getBrowser(userId)
-  restoreRoleRefsForTarget(userId, page)
-
-  // First try: use refLocator
-  try {
-    const locator = refLocator(page, ref)
-    await locator.click({ timeout: 5000 })
-    await new Promise(r => setTimeout(r, 200))
-    await locator.type(text, { timeout: 8000, delay: 50 })
-    await new Promise(r => setTimeout(r, 300))
-    return
-  } catch {
-    // fall through to direct input finder
-  }
-
-  // Second try: find any visible input/textarea directly
-  // This works when refLocator fails due to special chars in name
-  const info = pageStates.get(page)?.roleRefs?.[ref]
-  const role = info?.role || 'textbox'
-
-  const directLocator = role === 'searchbox'
-    ? page.locator('input[type="search"]:visible, input[role="searchbox"]:visible').first()
-    : page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):visible, textarea:visible').first()
-
-  await directLocator.click({ timeout: 5000 })
-  await new Promise(r => setTimeout(r, 200))
-  await directLocator.type(text, { timeout: 8000, delay: 50 })
-  await new Promise(r => setTimeout(r, 300))
+  const { cdpUrl, targetId } = await getBrowser(userId)
+  await typeViaPlaywright({
+    cdpUrl,
+    targetId: targetId || undefined,
+    ref,
+    text,
+    slowly: true,
+    timeoutMs: 8000
+  })
 }
 
 async function pressKey(key: string, userId: string): Promise<void> {
@@ -378,18 +238,25 @@ async function evaluatePage(userId: string, fn: string): Promise<unknown> {
 
 // From OpenClaw selectOptionViaPlaywright
 async function selectOption(userId: string, ref: string, values: string[]): Promise<void> {
-  const { page } = await getBrowser(userId)
-  restoreRoleRefsForTarget(userId, page)
-  const locator = refLocator(page, ref)
-  await locator.selectOption(values, { timeout: 8000 })
+  const { cdpUrl, targetId } = await getBrowser(userId)
+  await selectOptionViaPlaywright({
+    cdpUrl,
+    targetId: targetId || undefined,
+    ref,
+    values,
+    timeoutMs: 8000
+  })
 }
 
 // From OpenClaw hoverViaPlaywright
 async function hoverRef(userId: string, ref: string): Promise<void> {
-  const { page } = await getBrowser(userId)
-  restoreRoleRefsForTarget(userId, page)
-  const locator = refLocator(page, ref)
-  await locator.hover({ timeout: 8000 })
+  const { cdpUrl, targetId } = await getBrowser(userId)
+  await hoverViaPlaywright({
+    cdpUrl,
+    targetId: targetId || undefined,
+    ref,
+    timeoutMs: 8000
+  })
 }
 
 async function readPage(userId: string): Promise<string> {
@@ -575,76 +442,38 @@ const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent controlling
 - ONLY do what the user asked — nothing more, nothing less
 - Never post, share, or interact with content unless explicitly asked
 - Always end with task_complete or task_failed
+- This task is already approved by the user — never call ask_permission for it
 
-## Discovering Unknown Information
-If you need information to complete a task (like a GitHub username, account name, or ID):
-- Navigate to the main site first (e.g. github.com)
-- Take a snapshot or use browser_evaluate to find the info
-- Then construct the correct URL with real values
-Never navigate to a URL with placeholder text like USERNAME or OWNER
-
-## Reasoning — Do This Before Every Single Action
-Before calling any tool write one line starting with "→" describing what you see and what you will do:
-→ I can see the settings page. The plan says scroll to find Delete button. I will browser_page_scroll down 2000px.
-→ I can see a modal with a text input ref e34. I will type the repo name.
-→ I clicked the button but nothing changed. I will browser_snapshot to check current state.
-
-This reasoning is NOT shown to the user — it is for your own clarity.
-
-## After Every Click
-If the click was supposed to open a modal, dialog, or new page — call browser_snapshot immediately to verify it worked.
-If nothing changed after a click — try browser_scroll_to_ref on the same ref and click again once.
-If it fails twice — try a completely different ref or call task_failed.
-
-## Tool Usage
-- browser_navigate — go to URL, returns URL only
-- browser_snapshot — get ALL elements with refs including off-screen ones
-- browser_read — read page text content
-- browser_click — click by ref from snapshot
-- browser_type — type into ref
-- browser_scroll_to_ref — scroll element into view by ref, then click it
-- browser_page_scroll — scroll page, returns fresh snapshot with new refs
-- browser_wait_for — wait for element after action
-- browser_evaluate — run JS to read data or check state
+## How To Act
+Think one step at a time. After every click call browser_snapshot to see what changed.
+Never use a ref from a previous snapshot — always get fresh refs after any action.
 
 ## Finding Elements
-- browser_snapshot returns ALL refs including off-screen — check if the element is there before scrolling
-- If element ref is in snapshot but off-screen — use browser_scroll_to_ref then browser_click
-- If element not in snapshot at all — use browser_page_scroll to reveal more, then browser_snapshot again
-- Max 5 page scrolls then call task_failed
+- browser_snapshot returns ALL interactive elements with refs
+- If element not visible — use browser_page_scroll then browser_snapshot
+- After any scroll — use refs from the NEW snapshot only
+
+## Typing Into Inputs
+- Always call browser_snapshot first to find the textbox ref
+- Then call browser_type with that ref
+- If typing fails — the input will still receive text via direct fallback
+- After typing — call browser_snapshot to confirm, then click submit button
+
+## Multi-Step Dialogs
+After each click that opens a dialog:
+1. Call browser_snapshot immediately
+2. Read what stage you are on
+3. Act on that stage only
+4. Repeat until done
+Never skip stages. Each stage needs its own snapshot → act cycle.
+
+## Discovering Unknown Info
+If you need a username or ID — navigate to the site first and use browser_evaluate to find it.
+Never use placeholder text like USERNAME in URLs.
 
 ## Content Publishing
-Call draft_content BEFORE navigating to any social platform
-Wait for user approval then navigate and post
-
-## Typing vs Clicking — Critical Distinction
-Before calling browser_type on a ref, verify the ref is an input element:
-- textbox, searchbox, combobox → these accept browser_type
-- button, link, menuitem → these need browser_click, never browser_type
-
-If you need to type text and the current snapshot shows no textbox:
-1. First click the button that should reveal the input
-2. Call browser_snapshot to get the new refs
-3. Find the textbox ref in the NEW snapshot
-4. Call browser_type on that textbox ref
-
-Never type into a button ref — always click buttons, type into textboxes only.
-
-## Multi-Stage Dialogs — Critical Rule
-After EVERY browser_click, you automatically receive the new page state in the result.
-Read the refs in that result carefully — they are the ONLY valid refs for your next action.
-NEVER use refs from a previous snapshot after a click.
-
-For confirmation dialogs with multiple stages:
-Stage 1: Click the first button → read refs in result → click next button from result refs
-Stage 2: Click proceed button → read refs in result → find textbox ref → type into it
-Stage 3: After typing → click submit button using ref from the SAME snapshot as the textbox
-
-The textbox and submit button will be in the same snapshot result after Stage 2 click.
-
-## Permissions
-Call ask_permission before: Send, Post, Publish, Buy, Delete, Remove
-After approval — act immediately, do not ask again`
+Call draft_content BEFORE navigating to any social platform.
+Wait for approval then navigate and post.`
 
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
@@ -796,13 +625,19 @@ async function runAgentLoop(opts: {
         model: 'gpt-4o',
         messages: trimMessages(messages),
         tools: browserTools,
-        tool_choice: 'required',
-        max_tokens: 300,
+        tool_choice: 'auto',
+        max_tokens: 1000,
       })
 
       const msg = response.choices[0].message
       messages.push(msg)
-      if (!msg.tool_calls?.length) return { success: false, summary: 'Agent stopped unexpectedly' }
+      if (!msg.tool_calls?.length) {
+        if (msg.content) {
+          // Agent responded with text — continue loop
+          continue
+        }
+        return { success: false, summary: 'Agent stopped unexpectedly' }
+      }
 
       const toolResults: OpenAI.ChatCompletionToolMessageParam[] = []
 
@@ -860,38 +695,17 @@ async function runAgentLoop(opts: {
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
               try {
                 await clickRef(opts.userId, args.ref)
-                await new Promise(r => setTimeout(r, 1000))
-                // Auto-snapshot after click — agent sees new state immediately
-                const postSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-                result = `Clicked ${args.ref}. Current page state:\n${postSnap}\n\nUse refs from THIS snapshot for your next action.`
+                await new Promise(r => setTimeout(r, 800))
+                result = `Clicked ${args.ref} successfully. Call browser_snapshot to see updated page.`
               } catch (err) {
-                try {
-                  const { page } = await getBrowser(opts.userId)
-                  restoreRoleRefsForTarget(opts.userId, page)
-                  const locator = refLocator(page, args.ref)
-                  await locator.evaluate((el: HTMLElement) => el.click())
-                  await new Promise(r => setTimeout(r, 800))
-                  const postSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-                  result = `Clicked ${args.ref} via JS. Current page state:\n${postSnap}\n\nUse refs from THIS snapshot for your next action.`
-                } catch (err2) {
-                  result = toAIFriendlyError(err2, args.ref)
-                }
+                result = toAIFriendlyError(err, args.ref)
               }
               break
             }
             case 'browser_type': {
               consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
-              // Guard: check ref is actually an input element
-              const { page: typePage } = await getBrowser(opts.userId)
-              restoreRoleRefsForTarget(opts.userId, typePage)
-              const typeState = pageStates.get(typePage)
-              const typeRefInfo = typeState?.roleRefs?.[args.ref]
-              const inputRoles = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton'])
-              if (typeRefInfo && !inputRoles.has(typeRefInfo.role)) {
-                result = `Cannot type into ref "${args.ref}" — it is a ${typeRefInfo.role}, not an input. Click it first with browser_click, then call browser_snapshot to find the textbox that appears.`
-                break
-              }
+
               await typeInRef(opts.userId, args.ref, args.text)
               if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 500))
@@ -917,23 +731,7 @@ async function runAgentLoop(opts: {
               result = `Scrolled ${args.direction} ${amount}px. Interactive elements now:\n${freshSnapshot}`
               break
             }
-            case 'browser_scroll_to_ref': {
-              consecutiveSnapshots = 0
-              await opts.onProgress(`🔍 Scrolling to ${args.ref}...`)
-              const { page } = await getBrowser(opts.userId)
-              restoreRoleRefsForTarget(opts.userId, page)
-              try {
-                const locator = refLocator(page, args.ref)
-                await locator.scrollIntoViewIfNeeded({ timeout: 20000 })
-                await new Promise(r => setTimeout(r, 500))
-                const fresh = await snapshotPage(opts.userId, opts.tabKey, false)
-                result = `Scrolled ${args.ref} into view. Interactive elements:\n${fresh}`
-              } catch (err) {
-                const fresh = await snapshotPage(opts.userId, opts.tabKey, false)
-                result = `Could not scroll to ${args.ref}: ${toAIFriendlyError(err, args.ref)}\nCurrent elements:\n${fresh}`
-              }
-              break
-            }
+
             case 'browser_dismiss_cookie': {
               consecutiveSnapshots = 0
               await opts.onProgress('🍪 Dismissing cookie popup...')
