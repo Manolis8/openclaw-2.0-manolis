@@ -270,79 +270,23 @@ async function clickRef(userId: string, ref: string): Promise<void> {
   }
 }
 
-async function typeInRef(userId: string, ref: string, text: string, slowly = false): Promise<void> {
+async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
   const { page } = await getBrowser(userId)
   restoreRoleRefsForTarget(userId, page)
   const locator = refLocator(page, ref)
   const timeout = 8000
 
-  // Step 1: click to focus the input first
-  try {
-    await locator.click({ timeout })
-  } catch {
-    // ignore focus errors
-  }
-  await new Promise(r => setTimeout(r, 150))
-
-  // Step 2: try standard fill
-  try {
-    await locator.fill(text, { timeout })
-  } catch {
-    // if fill fails try type char by char
-    try {
-      await locator.type(text, { timeout, delay: 75 })
-    } catch {}
-  }
-  await new Promise(r => setTimeout(r, 150))
-
-  // Step 3: React-aware value setter — forces React state update
-  // This is required for React-controlled inputs where fill/type bypass React's synthetic events
-  try {
-    await locator.evaluate((el, value) => {
-      // Use native setter to bypass React's value override
-      const input = el as HTMLInputElement | HTMLTextAreaElement
-      const nativeInputSetter = Object.getOwnPropertyDescriptor(
-        input.tagName === 'TEXTAREA'
-          ? window.HTMLTextAreaElement.prototype
-          : window.HTMLInputElement.prototype,
-        'value'
-      )?.set
-      if (nativeInputSetter) {
-        nativeInputSetter.call(input, value)
-      } else {
-        input.value = value
-      }
-      // Dispatch all events React listens to
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-      input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }))
-      input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }))
-    }, text)
-  } catch {
-    // best effort
-  }
-
-  // Step 4: verify the value actually registered
+  // Click to focus first
+  await locator.click({ timeout })
   await new Promise(r => setTimeout(r, 200))
-  try {
-    const actual = await locator.inputValue().catch(() => null)
-    if (actual !== null && actual !== text) {
-      // Value didn't register — try keyboard typing as last resort
-      await locator.click({ timeout })
-      await page.keyboard.selectAll()
-      await page.keyboard.type(text, { delay: 50 })
-      await new Promise(r => setTimeout(r, 100))
-      // Fire React events one more time
-      await locator.evaluate((el, value) => {
-        const input = el as HTMLInputElement
-        input.dispatchEvent(new Event('input', { bubbles: true }))
-        input.dispatchEvent(new Event('change', { bubbles: true }))
-      }, text)
-    }
-  } catch {
-    // ignore verification errors
-  }
 
+  // Clear existing value
+  await page.keyboard.selectAll()
+  await page.keyboard.press('Backspace')
+  await new Promise(r => setTimeout(r, 100))
+
+  // Type char by char with delay — fires real keyboard events React picks up
+  await locator.type(text, { timeout, delay: 75 })
   await new Promise(r => setTimeout(r, 300))
 }
 
@@ -913,24 +857,10 @@ async function runAgentLoop(opts: {
                 result = `Cannot type into ref "${args.ref}" — it is a ${typeRefInfo.role}, not an input. Click it first with browser_click, then call browser_snapshot to find the textbox that appears.`
                 break
               }
-              await typeInRef(opts.userId, args.ref, args.text, true)
+              await typeInRef(opts.userId, args.ref, args.text)
               if (args.submit) await pressKey('Enter', opts.userId)
-              await new Promise(r => setTimeout(r, 300))
-
-              // Verify value registered
-              try {
-                const { page: vPage } = await getBrowser(opts.userId)
-                restoreRoleRefsForTarget(opts.userId, vPage)
-                const vLocator = refLocator(vPage, args.ref)
-                const actual = await vLocator.inputValue().catch(() => null)
-                if (actual !== null && actual !== args.text) {
-                  result = `Warning: typed "${args.text}" but input shows "${actual}". React state may not have updated. Try browser_evaluate to set value directly.`
-                } else {
-                  result = `Typed "${args.text}" into ${args.ref} successfully — value confirmed. Now wait 500ms then click the submit button.`
-                }
-              } catch {
-                result = `Typed "${args.text}" into ${args.ref}. Call browser_snapshot to verify.`
-              }
+              await new Promise(r => setTimeout(r, 500))
+              result = `Typed "${args.text}" into ${args.ref}. Wait 500ms then click the submit button.`
               break
             }
             case 'browser_key': {
