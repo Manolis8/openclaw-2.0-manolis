@@ -177,42 +177,26 @@ async function clickRef(userId: string, ref: string): Promise<void> {
       ref,
       timeoutMs: 8000
     })
-    await new Promise(r => setTimeout(r, 300))
+    await new Promise(r => setTimeout(r, 800))
     return
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.log(`[clickRef] aria click failed for ${ref}: ${msg} — trying JS fallback`)
   }
 
-  // Fallback: find element by role+name from stored refs and click via JS
+  // Fallback: scroll into view then click
   try {
-    const { snapshot: _snap, refs } = await snapshotRoleViaPlaywright({
-      cdpUrl,
-      targetId: targetId || undefined,
-      refsMode: 'role',
-      options: { interactive: true }
-    })
-    const info = refs[ref]
-    if (info?.name) {
-      const clicked = await page.evaluate((name) => {
-        const all = Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"], input[type="submit"]'))
-        const match = all.find(el => el.textContent?.trim().includes(name.slice(0, 30)))
-        if (match) { (match as HTMLElement).click(); return true }
-        return false
-      }, info.name)
-      if (clicked) {
-        await new Promise(r => setTimeout(r, 300))
-        return
-      }
-    }
+    const { page: p } = await getBrowser(userId)
+    const locator = p.locator(`button, a, [role="button"]`).filter({ hasText: /.+/ }).last()
+    await locator.scrollIntoViewIfNeeded({ timeout: 3000 })
+    await locator.click({ timeout: 5000 })
+    await new Promise(r => setTimeout(r, 300))
+    return
   } catch {}
 
-  // Last resort: JS click on any visible button
-  await page.evaluate(() => {
-    const buttons = Array.from(document.querySelectorAll('button:not([disabled])'))
-      .filter(b => (b as HTMLElement).offsetParent !== null)
-    if (buttons.length > 0) (buttons[buttons.length - 1] as HTMLElement).click()
-  })
+  // Last resort: press Enter — works for most confirmation dialogs
+  const { page: p2 } = await getBrowser(userId)
+  await p2.keyboard.press('Enter')
   await new Promise(r => setTimeout(r, 300))
 }
 
