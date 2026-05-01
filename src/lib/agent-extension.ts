@@ -200,10 +200,29 @@ async function clickRef(userId: string, ref: string): Promise<void> {
   await new Promise(r => setTimeout(r, 300))
 }
 
-async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
-  const { page, cdpUrl, targetId } = await getBrowser(userId)
+async function typeViaCDP(userId: string, text: string, selector?: string): Promise<void> {
+  const port = getRelayPortForUser(userId)
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+  const relayToken = await deriveRelayToken(token, port)
+  const res = await fetch(`http://127.0.0.1:${port}/type-input`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-openclaw-relay-token': relayToken
+    },
+    body: JSON.stringify({ text, selector }),
+    signal: AbortSignal.timeout(10000)
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText })) as { error: string }
+    throw new Error(`typeViaCDP failed: ${err.error}`)
+  }
+}
 
-  // Try OpenClaw's typeViaPlaywright first — click then type with delay
+async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
+  const { cdpUrl, targetId } = await getBrowser(userId)
+
+  // Try OpenClaw's typeViaPlaywright first
   try {
     await typeViaPlaywright({
       cdpUrl,
@@ -211,45 +230,17 @@ async function typeInRef(userId: string, ref: string, text: string): Promise<voi
       ref,
       text,
       slowly: true,
-      timeoutMs: 8000
+      timeoutMs: 5000
     })
     await new Promise(r => setTimeout(r, 300))
     return
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.log(`[typeInRef] aria type failed for ${ref}: ${msg} — trying CSS fallback`)
+    console.log(`[typeInRef] playwright failed: ${err instanceof Error ? err.message.slice(0, 100) : err} — trying CDP`)
   }
 
-  // Fallback: find any visible text input via CSS, click it, then keyboard type
-  // This works for aria-invalid inputs, React controlled inputs, any special input
-  try {
-    const input = page.locator([
-      'dialog input[type="text"]:not([disabled])',
-      'dialog input[type="email"]:not([disabled])',
-      'dialog input:not([type]):not([disabled])',
-      '[role="dialog"] input[type="text"]:not([disabled])',
-      'input[type="text"]:not([disabled]):not([type="hidden"])',
-      'input:not([type="hidden"]):not([disabled]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])',
-      'textarea:not([disabled])'
-    ].join(', ')).first()
-
-    // Click first to focus
-    await input.click({ timeout: 5000 })
-    await new Promise(r => setTimeout(r, 200))
-
-    // Clear existing value
-    await page.keyboard.press('Control+a')
-    await page.keyboard.press('Backspace')
-    await new Promise(r => setTimeout(r, 100))
-
-    // Type char by char — fires real keyboard events React picks up
-    await page.keyboard.type(text, { delay: 50 })
-    await new Promise(r => setTimeout(r, 300))
-    return
-  } catch (err) {
-    console.log(`[typeInRef] CSS fallback also failed: ${err}`)
-    throw err
-  }
+  // Fallback: type via CDP Input.insertText — works for dialogs, React inputs, any input
+  await typeViaCDP(userId, text)
+  await new Promise(r => setTimeout(r, 300))
 }
 
 async function pressKey(key: string, userId: string): Promise<void> {

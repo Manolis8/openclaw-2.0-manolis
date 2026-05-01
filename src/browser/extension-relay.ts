@@ -729,6 +729,92 @@ export async function ensureChromeExtensionRelayServer(opts: {
         return
       }
 
+      // Type input via CDP — bypasses Playwright relay limitations for dialog inputs
+      if (path === '/type-input' && req.method === 'POST') {
+        const token = getRelayAuthTokenFromRequest(req, new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`))
+        const acceptedTokens = await resolveRelayAcceptedTokensForPort(info.port).catch(() => [] as string[])
+        const validTokens = new Set(acceptedTokens)
+        if (validTokens.size > 0 && (!token || !validTokens.has(token))) {
+          res.writeHead(401, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Unauthorized' }))
+          return
+        }
+        if (!extensionConnected()) {
+          res.writeHead(503, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Extension not connected' }))
+          return
+        }
+        try {
+          let body = ''
+          await new Promise<void>(resolve => {
+            req.on('data', (chunk: Buffer) => { body += chunk.toString() })
+            req.on('end', resolve)
+          })
+          const { text, selector } = JSON.parse(body || '{}') as { text: string; selector?: string }
+          if (!text) {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'text required' }))
+            return
+          }
+
+          // Step 1: Get document node
+          const docResult = await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'DOM.getDocument', params: { depth: 0 } }
+          }) as { root?: { nodeId?: number } }
+          const rootNodeId = docResult?.root?.nodeId
+          if (!rootNodeId) throw new Error('Could not get document root')
+
+          // Step 2: Find the input element
+          const inputSelector = selector || 'input[name="verification_field"], dialog input[type="text"], input[data-test-selector*="confirm"]'
+          const queryResult = await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'DOM.querySelector', params: { nodeId: rootNodeId, selector: inputSelector } }
+          }) as { nodeId?: number }
+
+          const nodeId = queryResult?.nodeId
+          if (!nodeId) throw new Error(`Input not found with selector: ${inputSelector}`)
+
+          // Step 3: Focus the element
+          await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'DOM.focus', params: { nodeId } }
+          })
+          await new Promise(r => setTimeout(r, 200))
+
+          // Step 4: Clear existing value with keyboard
+          await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'a', modifiers: 8 } }
+          })
+          await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'Backspace' } }
+          })
+          await new Promise(r => setTimeout(r, 100))
+
+          // Step 5: Type text using Input.insertText — fires native input events React picks up
+          await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'Input.insertText', params: { text } }
+          })
+          await new Promise(r => setTimeout(r, 300))
+
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, typed: text }))
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+        return
+      }
+
       const handleTargetActionRoute = (
         match: RegExpMatchArray | null,
         cdpMethod: "Target.activateTarget" | "Target.closeTarget",
