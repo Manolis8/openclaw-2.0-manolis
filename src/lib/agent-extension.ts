@@ -784,9 +784,8 @@ async function runAgentLoop(opts: {
               await typeInRef(opts.userId, args.ref, args.text)
               if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 500))
-              // Auto-snapshot after typing so agent sees if button became enabled
               const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-              result = `Typed "${args.text}" into ${args.ref}. Page after typing:\n${postTypeSnap}\n\nIf you see an enabled button in this snapshot — click it now using its ref.`
+              result = `Typed "${args.text}" successfully. Page after typing:\n${postTypeSnap}\n\nIMPORTANT: Find the submit/confirm button in this snapshot and click it. If you see a button that was previously disabled it is now enabled — click it now.`
               break
             }
             case 'browser_key': {
