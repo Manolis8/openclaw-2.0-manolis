@@ -777,55 +777,28 @@ export async function ensureChromeExtensionRelayServer(opts: {
           const nodeId = queryResult?.nodeId
           if (!nodeId) throw new Error(`Input not found with selector: ${inputSelector}`)
 
-          // Step 3: Click the element first to focus it properly
-          const boxResult = await sendToExtension({
-            id: nextExtensionId++,
-            method: 'forwardCDPCommand',
-            params: { method: 'DOM.getBoxModel', params: { nodeId } }
-          }) as { model?: { content?: number[] } }
-
-          const content = boxResult?.model?.content
-          if (content && content.length >= 2) {
-            const x = (content[0] + content[4]) / 2
-            const y = (content[1] + content[5]) / 2
-            // Mouse press
-            await sendToExtension({
-              id: nextExtensionId++,
-              method: 'forwardCDPCommand',
-              params: { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } }
-            })
-            await new Promise(r => setTimeout(r, 50))
-            // Mouse release
-            await sendToExtension({
-              id: nextExtensionId++,
-              method: 'forwardCDPCommand',
-              params: { method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } }
-            })
-            await new Promise(r => setTimeout(r, 100))
-          } else {
-            // Fallback to DOM.focus if no box model
-            await sendToExtension({
-              id: nextExtensionId++,
-              method: 'forwardCDPCommand',
-              params: { method: 'DOM.focus', params: { nodeId } }
-            })
-          }
-          await new Promise(r => setTimeout(r, 200))
-
-          // Step 4: Clear existing value with keyboard
+          // Step 3: Focus directly via DOM.focus — no box model needed
           await sendToExtension({
             id: nextExtensionId++,
             method: 'forwardCDPCommand',
-            params: { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'a', modifiers: 8 } }
+            params: { method: 'DOM.focus', params: { nodeId } }
+          })
+          await new Promise(r => setTimeout(r, 300))
+
+          // Step 4: Clear with select all + delete
+          await sendToExtension({
+            id: nextExtensionId++,
+            method: 'forwardCDPCommand',
+            params: { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 8, windowsVirtualKeyCode: 65 } }
           })
           await sendToExtension({
             id: nextExtensionId++,
             method: 'forwardCDPCommand',
-            params: { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'Backspace' } }
+            params: { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 8, windowsVirtualKeyCode: 65 } }
           })
           await new Promise(r => setTimeout(r, 100))
 
-          // Step 5: Type text using Input.insertText — fires native input events React picks up
+          // Step 5: Type via Input.insertText
           await sendToExtension({
             id: nextExtensionId++,
             method: 'forwardCDPCommand',
