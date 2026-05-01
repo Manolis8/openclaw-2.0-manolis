@@ -713,6 +713,8 @@ export async function ensureChromeExtensionRelayServer(opts: {
             const indent = '  '.repeat(Math.min(depth, 10))
             let line = `${indent}- ${role}`
             if (name) line += ` "${name}"`
+            const isDisabled = (n as any).disabled?.value === true
+            if (isDisabled) line += ` [disabled]`
             lines.push(line)
           }
 

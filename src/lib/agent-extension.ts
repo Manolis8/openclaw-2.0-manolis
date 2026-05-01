@@ -167,25 +167,105 @@ async function navigateTo(url: string, userId: string): Promise<void> {
 }
 
 async function clickRef(userId: string, ref: string): Promise<void> {
-  const { cdpUrl, targetId } = await getBrowser(userId)
-  await clickViaPlaywright({
-    cdpUrl,
-    targetId: targetId || undefined,
-    ref,
-    timeoutMs: 8000
+  const { page, cdpUrl, targetId } = await getBrowser(userId)
+
+  // Try OpenClaw's clickViaPlaywright first
+  try {
+    await clickViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      ref,
+      timeoutMs: 8000
+    })
+    await new Promise(r => setTimeout(r, 300))
+    return
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.log(`[clickRef] aria click failed for ${ref}: ${msg} — trying JS fallback`)
+  }
+
+  // Fallback: find element by role+name from stored refs and click via JS
+  try {
+    const { snapshot: _snap, refs } = await snapshotRoleViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      refsMode: 'role',
+      options: { interactive: true }
+    })
+    const info = refs[ref]
+    if (info?.name) {
+      const clicked = await page.evaluate((name) => {
+        const all = Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"], input[type="submit"]'))
+        const match = all.find(el => el.textContent?.trim().includes(name.slice(0, 30)))
+        if (match) { (match as HTMLElement).click(); return true }
+        return false
+      }, info.name)
+      if (clicked) {
+        await new Promise(r => setTimeout(r, 300))
+        return
+      }
+    }
+  } catch {}
+
+  // Last resort: JS click on any visible button
+  await page.evaluate(() => {
+    const buttons = Array.from(document.querySelectorAll('button:not([disabled])'))
+      .filter(b => (b as HTMLElement).offsetParent !== null)
+    if (buttons.length > 0) (buttons[buttons.length - 1] as HTMLElement).click()
   })
+  await new Promise(r => setTimeout(r, 300))
 }
 
 async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
-  const { cdpUrl, targetId } = await getBrowser(userId)
-  await typeViaPlaywright({
-    cdpUrl,
-    targetId: targetId || undefined,
-    ref,
-    text,
-    slowly: true,
-    timeoutMs: 8000
-  })
+  const { page, cdpUrl, targetId } = await getBrowser(userId)
+
+  // Try OpenClaw's typeViaPlaywright first — click then type with delay
+  try {
+    await typeViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      ref,
+      text,
+      slowly: true,
+      timeoutMs: 8000
+    })
+    await new Promise(r => setTimeout(r, 300))
+    return
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.log(`[typeInRef] aria type failed for ${ref}: ${msg} — trying CSS fallback`)
+  }
+
+  // Fallback: find any visible text input via CSS, click it, then keyboard type
+  // This works for aria-invalid inputs, React controlled inputs, any special input
+  try {
+    const input = page.locator([
+      'dialog input[type="text"]:not([disabled])',
+      'dialog input[type="email"]:not([disabled])',
+      'dialog input:not([type]):not([disabled])',
+      '[role="dialog"] input[type="text"]:not([disabled])',
+      'input[type="text"]:not([disabled]):not([type="hidden"])',
+      'input:not([type="hidden"]):not([disabled]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])',
+      'textarea:not([disabled])'
+    ].join(', ')).first()
+
+    // Click first to focus
+    await input.click({ timeout: 5000 })
+    await new Promise(r => setTimeout(r, 200))
+
+    // Clear existing value
+    await page.keyboard.press('Control+a')
+    await page.keyboard.press('Backspace')
+    await new Promise(r => setTimeout(r, 100))
+
+    // Type char by char — fires real keyboard events React picks up
+    await page.keyboard.type(text, { delay: 50 })
+    await new Promise(r => setTimeout(r, 300))
+    return
+  } catch (err) {
+    console.log(`[typeInRef] CSS fallback also failed: ${err}`)
+    throw err
+  }
 }
 
 async function pressKey(key: string, userId: string): Promise<void> {
@@ -491,9 +571,9 @@ Wait for approval then navigate and post.`
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
 function trimMessages(messages: any[]): any[] {
-  if (messages.length <= 14) return messages
+  if (messages.length <= 20) return messages
   const system = messages[0]
-  let rest = messages.slice(1).slice(-12)
+  let rest = messages.slice(1).slice(-18)
 
   // Find first complete pair — never start with a tool message
   while (rest.length > 0 && rest[0].role === 'tool') rest = rest.slice(1)
@@ -729,7 +809,9 @@ async function runAgentLoop(opts: {
               await typeInRef(opts.userId, args.ref, args.text)
               if (args.submit) await pressKey('Enter', opts.userId)
               await new Promise(r => setTimeout(r, 500))
-              result = `Typed "${args.text}" into ${args.ref}. Wait 500ms then click the submit button.`
+              // Auto-snapshot after typing so agent sees if button became enabled
+              const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
+              result = `Typed "${args.text}" into ${args.ref}. Page after typing:\n${postTypeSnap}\n\nIf you see an enabled button in this snapshot — click it now using its ref.`
               break
             }
             case 'browser_key': {
