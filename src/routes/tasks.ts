@@ -338,6 +338,18 @@ tasksRouter.post('/chat', async (req, res) => {
   const message = sanitizeString(rawMessage, 2000)
   const userId = sanitizeString(rawUserId, 100)
   const sessionId = sanitizeString(rawSessionId, 100)
+
+  // Verify userId exists in our database — prevents unauthorized access
+  const { data: userExists } = await supabase
+    .from('api_keys')
+    .select('user_id')
+    .eq('user_id', userId)
+    .single()
+
+  if (!userExists) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+
   if (!message || !userId || !sessionId) {
     return res.status(400).json({ error: 'Missing required fields' })
   }
@@ -418,10 +430,7 @@ tasksRouter.post('/chat', async (req, res) => {
   }
 
   if ((count || 0) >= DAILY_LIMIT) {
-    return res.json({
-      reply: `You have reached your daily limit of ${DAILY_LIMIT} tasks. Come back tomorrow!`,
-      usesBrowser: false
-    })
+    return res.status(429).json({ error: 'Daily limit reached', limitReached: true })
   }
 
   // Step 1: classify if destructive BEFORE creating task or opening browser
@@ -522,6 +531,18 @@ tasksRouter.post('/create-task', async (req, res) => {
   const { prompt: rawPrompt, userId: rawUserId, useApiMode, keepTabOpen } = req.body
   const prompt = sanitizeString(rawPrompt, 2000)
   const userId = sanitizeString(rawUserId, 100)
+
+  // Verify userId exists in our database — prevents unauthorized access
+  const { data: userExists } = await supabase
+    .from('api_keys')
+    .select('user_id')
+    .eq('user_id', userId)
+    .single()
+
+  if (!userExists) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+
   if (!prompt || !userId) {
     return res.status(400).json({ error: 'Missing or invalid prompt or userId' })
   }
@@ -535,11 +556,9 @@ tasksRouter.post('/create-task', async (req, res) => {
      .gte('created_at', `${today}T00:00:00.000Z`)
 
    const DAILY_LIMIT = 10
-   if ((count || 0) >= DAILY_LIMIT) {
-     return res.status(429).json({
-       error: `Daily limit reached. You can run up to ${DAILY_LIMIT} tasks per day.`
-     })
-   }
+    if ((count || 0) >= DAILY_LIMIT) {
+      return res.status(429).json({ error: 'Daily limit reached', limitReached: true })
+    }
 
   console.log(`Create task: userId=${userId}, extensionConnected=${isExtensionConnected(userId)}`)
   console.log(`All connected extensions: ${[...extensionConnections.keys()].join(', ')}`)
