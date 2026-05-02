@@ -696,13 +696,27 @@ async function runAgentLoop(opts: {
       if (opts.abortSignal?.aborted) return { success: false, summary: 'Task stopped by user.' }
       iterations++
 
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: trimMessages(messages),
-        tools: browserTools,
-        tool_choice: 'auto',
-        max_tokens: 500,
-      })
+      // Wrap the openai call with retry on rate limit
+      let response
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: trimMessages(messages),
+            tools: browserTools,
+            tool_choice: 'auto',
+            max_tokens: 500,
+          })
+          break
+        } catch (err: any) {
+          if (err?.status === 429 && attempt < 2) {
+            await new Promise(r => setTimeout(r, 2000))
+            continue
+          }
+          throw err
+        }
+      }
+      if (!response) throw new Error('Failed after retries')
 
       const msg = response.choices[0].message
       messages.push(msg)
