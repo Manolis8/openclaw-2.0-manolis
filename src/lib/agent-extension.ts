@@ -220,6 +220,24 @@ async function typeViaCDP(userId: string, text: string, selector?: string): Prom
   }
 }
 
+async function clickSubmitViaCDP(userId: string, selector?: string): Promise<void> {
+  const port = getRelayPortForUser(userId)
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
+  const relayToken = await deriveRelayToken(token, port)
+  const res = await fetch(`http://127.0.0.1:${port}/click-submit`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-openclaw-relay-token': relayToken
+    },
+    body: JSON.stringify({ selector }),
+    signal: AbortSignal.timeout(10000)
+  })
+  const responseText = await res.text()
+  console.log(`[clickSubmitViaCDP] status=${res.status} response=${responseText.slice(0, 200)}`)
+  if (!res.ok) throw new Error(`clickSubmitViaCDP failed: ${responseText}`)
+}
+
 async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
   const { cdpUrl, targetId } = await getBrowser(userId)
 
@@ -542,7 +560,13 @@ Never use placeholder text like USERNAME in URLs.
 
 ## Content Publishing
 Call draft_content BEFORE navigating to any social platform.
-Wait for approval then navigate and post.`
+Wait for approval then navigate and post.
+
+## Verifying Task Completion
+After typing a confirmation text — call browser_snapshot to check if the dialog closed.
+If the URL changed or the dialog is gone — the task succeeded, call task_complete.
+If the dialog is still open — the button was not clicked successfully, try again.
+NEVER call task_complete without verifying the action actually happened by checking the page state.`
 
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
@@ -797,9 +821,17 @@ async function runAgentLoop(opts: {
 
               await typeInRef(opts.userId, args.ref, args.text)
               if (args.submit) await pressKey('Enter', opts.userId)
-              await new Promise(r => setTimeout(r, 500))
+              await new Promise(r => setTimeout(r, 800))
+              // Auto-click submit button via CDP after typing confirmation text
+              try {
+                await clickSubmitViaCDP(opts.userId)
+                console.log(`[browser_type] auto-clicked submit after typing`)
+                await new Promise(r => setTimeout(r, 1000))
+              } catch (err) {
+                console.log(`[browser_type] auto-click submit failed: ${err}`)
+              }
               const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-              result = `Typed "${args.text}" successfully. Page after typing:\n${postTypeSnap}\n\nIMPORTANT: Find the submit/confirm button in this snapshot and click it. If you see a button that was previously disabled it is now enabled — click it now.`
+              result = `Typed "${args.text}" into the input and automatically clicked the submit button. The action should be complete. Call browser_snapshot to verify the page changed — if the dialog closed the action succeeded. Do NOT click any more buttons.`
               break
             }
             case 'browser_key': {

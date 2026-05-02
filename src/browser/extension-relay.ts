@@ -798,6 +798,62 @@ export async function ensureChromeExtensionRelayServer(opts: {
         return
       }
 
+      if (path === '/click-submit' && req.method === 'POST') {
+        const token = getRelayAuthTokenFromRequest(req, new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`))
+        const acceptedTokens = await resolveRelayAcceptedTokensForPort(info.port).catch(() => [] as string[])
+        const validTokens = new Set(acceptedTokens)
+        if (validTokens.size > 0 && (!token || !validTokens.has(token))) {
+          res.writeHead(401, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Unauthorized' }))
+          return
+        }
+        if (!extensionConnected()) {
+          res.writeHead(503, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Extension not connected' }))
+          return
+        }
+        try {
+          let body = ''
+          await new Promise<void>(resolve => {
+            req.on('data', (chunk: Buffer) => { body += chunk.toString() })
+            req.on('end', resolve)
+          })
+          const { selector } = JSON.parse(body || '{}') as { selector?: string }
+          const target = Array.from(connectedTargets.values())[0]
+          if (!target) throw new Error('No connected tab')
+          const tabIdResult = await sendToExtension({
+            id: nextExtensionId++,
+            method: 'getTabIdForTarget' as any,
+            params: { targetId: target.targetId }
+          } as any) as any
+          const tabId = tabIdResult?.tabId
+          if (!tabId) throw new Error('Could not get tabId')
+          const cmdId = nextExtensionId++
+          const result = await new Promise<any>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              pendingExtension.delete(cmdId)
+              reject(new Error('clickSubmit timeout'))
+            }, 10000)
+            pendingExtension.set(cmdId, {
+              resolve: (v: unknown) => { clearTimeout(timer); resolve(v) },
+              reject: (e: Error) => { clearTimeout(timer); reject(e) },
+              timer
+            })
+            extensionWs!.send(JSON.stringify({
+              id: cmdId,
+              method: 'clickSubmitDebugger',
+              params: { tabId, selector }
+            }))
+          })
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, result }))
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+        return
+      }
+
       const handleTargetActionRoute = (
         match: RegExpMatchArray | null,
         cdpMethod: "Target.activateTarget" | "Target.closeTarget",
