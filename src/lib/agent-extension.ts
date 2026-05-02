@@ -123,7 +123,7 @@ const CONTENT_ROLES = new Set([
 ])
 
 
-const EFFICIENT_SNAPSHOT_MAX_CHARS = 12000
+const EFFICIENT_SNAPSHOT_MAX_CHARS = 6000
 const INTERACTIVE_SNAPSHOT_MAX_CHARS = 8000
 
 
@@ -701,7 +701,7 @@ async function runAgentLoop(opts: {
         messages: trimMessages(messages),
         tools: browserTools,
         tool_choice: 'auto',
-        max_tokens: 1000,
+        max_tokens: 500,
       })
 
       const msg = response.choices[0].message
