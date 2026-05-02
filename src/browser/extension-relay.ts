@@ -757,57 +757,41 @@ export async function ensureChromeExtensionRelayServer(opts: {
             return
           }
 
-          // Step 1: Get document node
-          const docResult = await sendToExtension({
+          // Get tabId from connected targets
+          const target = Array.from(connectedTargets.values())[0]
+          if (!target) throw new Error('No connected tab')
+
+          // Get the Chrome tab ID via Target.getTargetInfo
+          const targetInfo = await sendToExtension({
             id: nextExtensionId++,
             method: 'forwardCDPCommand',
-            params: { method: 'DOM.getDocument', params: { depth: 0 } }
-          }) as { root?: { nodeId?: number } }
-          const rootNodeId = docResult?.root?.nodeId
-          if (!rootNodeId) throw new Error('Could not get document root')
+            params: { method: 'Target.getTargetInfo', params: { targetId: target.targetId } }
+          }) as any
+          const tabId = targetInfo?.targetInfo?.tabId
+          if (!tabId) throw new Error('Could not get tabId from target')
 
-          // Step 2: Find the input element
-          const inputSelector = selector || 'input[name="verification_field"], dialog input[type="text"], input[data-test-selector*="confirm"]'
-          const queryResult = await sendToExtension({
-            id: nextExtensionId++,
-            method: 'forwardCDPCommand',
-            params: { method: 'DOM.querySelector', params: { nodeId: rootNodeId, selector: inputSelector } }
-          }) as { nodeId?: number }
-
-          const nodeId = queryResult?.nodeId
-          if (!nodeId) throw new Error(`Input not found with selector: ${inputSelector}`)
-
-          // Step 3: Focus directly via DOM.focus — no box model needed
-          await sendToExtension({
-            id: nextExtensionId++,
-            method: 'forwardCDPCommand',
-            params: { method: 'DOM.focus', params: { nodeId } }
+          // Send executeDebugger message to extension
+          // Extension uses chrome.debugger.sendCommand directly — bypasses relay
+          const cmdId = nextExtensionId++
+          const result = await new Promise<any>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              pendingExtension.delete(cmdId)
+              reject(new Error('executeDebugger timeout after 15s'))
+            }, 15000)
+            pendingExtension.set(cmdId, {
+              resolve: (v: unknown) => { clearTimeout(timer); resolve(v) },
+              reject: (e: Error) => { clearTimeout(timer); reject(e) },
+              timer
+            })
+            extensionWs!.send(JSON.stringify({
+              id: cmdId,
+              method: 'executeDebugger',
+              params: { tabId, selector, text }
+            }))
           })
-          await new Promise(r => setTimeout(r, 300))
-
-          // Step 4: Clear with select all + delete
-          await sendToExtension({
-            id: nextExtensionId++,
-            method: 'forwardCDPCommand',
-            params: { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 8, windowsVirtualKeyCode: 65 } }
-          })
-          await sendToExtension({
-            id: nextExtensionId++,
-            method: 'forwardCDPCommand',
-            params: { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 8, windowsVirtualKeyCode: 65 } }
-          })
-          await new Promise(r => setTimeout(r, 100))
-
-          // Step 5: Type via Input.insertText
-          await sendToExtension({
-            id: nextExtensionId++,
-            method: 'forwardCDPCommand',
-            params: { method: 'Input.insertText', params: { text } }
-          })
-          await new Promise(r => setTimeout(r, 300))
 
           res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, typed: text }))
+          res.end(JSON.stringify({ ok: true, typed: text, result }))
         } catch (err) {
           res.writeHead(500, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ error: String(err) }))
