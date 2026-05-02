@@ -761,13 +761,12 @@ export async function ensureChromeExtensionRelayServer(opts: {
           const target = Array.from(connectedTargets.values())[0]
           if (!target) throw new Error('No connected tab')
 
-          // Get the Chrome tab ID via Target.getTargetInfo
-          const targetInfo = await sendToExtension({
+          const tabIdResult = await sendToExtension({
             id: nextExtensionId++,
-            method: 'forwardCDPCommand',
-            params: { method: 'Target.getTargetInfo', params: { targetId: target.targetId } }
-          }) as any
-          const tabId = targetInfo?.targetInfo?.tabId
+            method: 'getTabIdForTarget' as any,
+            params: { targetId: target.targetId }
+          } as any) as any
+          const tabId = tabIdResult?.tabId
           if (!tabId) throw new Error('Could not get tabId from target')
 
           // Send executeDebugger message to extension
