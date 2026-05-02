@@ -213,9 +213,10 @@ async function typeViaCDP(userId: string, text: string, selector?: string): Prom
     body: JSON.stringify({ text, selector }),
     signal: AbortSignal.timeout(10000)
   })
+  const responseText = await res.text()
+  console.log(`[typeViaCDP] status=${res.status} response=${responseText.slice(0, 200)}`)
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText })) as { error: string }
-    throw new Error(`typeViaCDP failed: ${err.error}`)
+    throw new Error(`typeViaCDP failed: ${responseText}`)
   }
 }
 
