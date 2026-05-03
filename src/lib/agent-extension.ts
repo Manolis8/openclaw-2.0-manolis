@@ -700,6 +700,7 @@ IMPORTANT:
         }
       ]
     })
+    console.log(`[tokens] model=${response.model} prompt=${response.usage?.prompt_tokens} completion=${response.usage?.completion_tokens} total=${response.usage?.total_tokens}`)
     return response.choices[0].message.content?.trim() ?? ''
   } catch {
     return ''
@@ -768,6 +769,7 @@ async function runAgentLoop(opts: {
           throw err
         }
       }
+      console.log(`[tokens] model=${response.model} prompt=${response.usage?.prompt_tokens} completion=${response.usage?.completion_tokens} total=${response.usage?.total_tokens}`)
       if (!response) throw new Error('Failed after retries')
 
       const msg = response.choices[0].message
