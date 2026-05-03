@@ -308,7 +308,16 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
     }).eq('id', taskId)
 
     await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.status === 429 || err?.message?.includes('Rate limit')) {
+      const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+      await supabase.from('tasks').update({
+        status: 'done',
+        output: (data?.output || '') + '\n✅ Done: Unclawned is a bit busy right now. Please try again in a moment!'
+      }).eq('id', taskId)
+      await createMessage(userId, taskId, '✅ Task complete: Unclawned is a bit busy right now. Please try again in a moment!')
+      return
+    }
     const realErrorMessage = String(err)
     const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
     await supabase.from('tasks').update({
@@ -348,6 +357,14 @@ tasksRouter.post('/chat', async (req, res) => {
 
   if (!userExists) {
     return res.status(401).json({ error: 'Unauthorized' })
+  }
+
+  // Check if user already has a running task
+  if (runningTasksPerUser.get(userId)) {
+    return res.status(429).json({
+      error: 'You already have a task running. Please wait for it to finish.',
+      taskAlreadyRunning: true
+    })
   }
 
   if (!message || !userId || !sessionId) {
@@ -541,6 +558,14 @@ tasksRouter.post('/create-task', async (req, res) => {
 
   if (!userExists) {
     return res.status(401).json({ error: 'Unauthorized' })
+  }
+
+  // Check if user already has a running task
+  if (runningTasksPerUser.get(userId)) {
+    return res.status(429).json({
+      error: 'You already have a task running. Please wait for it to finish.',
+      taskAlreadyRunning: true
+    })
   }
 
   if (!prompt || !userId) {
