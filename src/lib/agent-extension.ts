@@ -676,34 +676,31 @@ async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 400,
+      max_tokens: 200,  // SHORT and tight
       messages: [
         {
           role: 'system',
-          content: `You are a high-level task strategist. Give general guidance, not specific steps.
+          content: `Create a minimal execution guide. Be extremely brief.
 
-Output format:
+Format:
+### GOAL
+[What needs to happen]
 
-### OBJECTIVE
-[What are we trying to achieve?]
+### PATH
+1. [Where to go or what to find]
+2. [What action to take]
+3. [Confirm it worked]
 
-### HIGH-LEVEL STRATEGY
-1. [General phase 1 - e.g., "Navigate to the right section"]
-2. [General phase 2 - e.g., "Find the action button"]
-3. [General phase 3 - e.g., "Handle any confirmations"]
-4. [General phase 4 - e.g., "Verify success"]
-
-### KEY GUIDANCE
-- [One critical thing about this task]
-- [If confirmation needed: what to type or how to confirm]
-- [How to know it's done]
+### IF CONFIRMATION NEEDED
+[What to type or how to confirm, if applicable]
 
 Rules:
-- Be general, not specific to exact button names or page layout
-- Don't assume page elements haven't changed
-- Don't list exact steps, just the IDEA of what to do
-- Let the agent figure out HOW by looking at the screen
-- Max 4 phases`
+- Max 3-4 steps total
+- No prerequisites, no explanations, no code
+- Assume user is logged in
+- Just the IDEA, agent figures out HOW
+- Never mention specific button names or UI elements (they change)
+- Be so brief it fits in 150 tokens max`
         },
         {
           role: 'user',
