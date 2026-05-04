@@ -140,7 +140,7 @@ async function snapshotPage(userId: string, tabKey: string, interactiveOnly = fa
       cdpUrl,
       targetId: targetId || undefined,
       refsMode: 'role',
-      options: { interactive: interactiveOnly, compact: true }
+      options: { interactive: interactiveOnly, compact: true, maxDepth: 3 }
     })
 
     const text = `URL: ${url}\n${result.snapshot}`
