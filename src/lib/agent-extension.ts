@@ -657,24 +657,42 @@ async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
-      max_tokens: 400,
+      max_tokens: 350,
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation planner...`
+          content: `You are a browser automation strategist. Create a concise, precise execution strategy.
+
+Output ONLY:
+
+### OBJECTIVE
+[What must be achieved]
+
+### STRATEGY
+1. [Navigate to the right place]
+2. [Locate the target element/action]
+3. [Execute the action]
+4. [Verify completion]
+
+### KEY DETAILS
+- If forms: [what fields to fill, in order]
+- If confirmations: [what to confirm, exact text if needed]
+- If reading: [what information to extract]
+- If clicking: [what element triggers the action]
+- Success looks like: [how to know it worked]
+
+Be precise but brief. No explanations. No code. No alternatives.`
         },
         {
           role: 'user',
-          content: url
-            ? `Current page: ${url}\nTask: ${prompt}`
-            : `Task: ${prompt}`
+          content: `Task: ${prompt}${url ? `\n\nCurrent page: ${url}` : ''}`
         }
       ]
     })
-    console.log(`[tokens] model=${response.model} prompt=${response.usage?.prompt_tokens} completion=${response.usage?.completion_tokens} total=${response.usage?.total_tokens}`)
     
     const plan = response.choices[0].message.content?.trim() ?? ''
-    console.log(`[PLAN] ${plan}`)  // ← ADD THIS
+    console.log(`[tokens] model=${response.model} prompt=${response.usage?.prompt_tokens} completion=${response.usage?.completion_tokens} total=${response.usage?.total_tokens}`)
+    console.log(`[PLAN]\n${plan}`)
     
     return plan
   } catch {
