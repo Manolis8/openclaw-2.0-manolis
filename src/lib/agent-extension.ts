@@ -1186,13 +1186,27 @@ export async function runAgentWithExtension(
     return err instanceof Error ? err.message : String(err)
   } finally {
     runningTasks.delete(taskKey)
-    if (!keepTabOpen && newTabId) {
+    
+    // Check user preference for auto-close
+    let autoCloseTab = false
+    try {
+      const { data } = await supabase
+        .from('user_preferences')
+        .select('auto_close_tabs')
+        .eq('user_id', userId)
+        .single()
+      autoCloseTab = data?.auto_close_tabs ?? false
+    } catch {}
+  
+    if (autoCloseTab && newTabId) {
+      // Auto-close after 5 seconds
       try {
-        await new Promise(r => setTimeout(r, 500))
+        await new Promise(r => setTimeout(r, 5000))
         const { sendExtensionMessage } = await import('../index.js')
         await sendExtensionMessage(userId, 'closeTab', { tabId: newTabId })
       } catch {}
-    } else if (keepTabOpen && newTabId) {
+    } else if (!autoCloseTab && newTabId) {
+      // Keep tab open
       try {
         const { sendExtensionMessage } = await import('../index.js')
         await sendExtensionMessage(userId, 'detachTab', { tabId: newTabId })
