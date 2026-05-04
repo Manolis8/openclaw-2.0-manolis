@@ -656,7 +656,7 @@ function cleanContext(context?: string): string {
 async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: ' gpt-4.1-mini',
       max_tokens: 400,
       messages: [
         {
@@ -978,9 +978,9 @@ async function runAgentLoop(opts: {
                 result = 'User already approved this action. Proceed immediately.'
                 break
               }
-
+            
               await opts.onProgress(`🔐 Asking permission: ${args.action}`)
-
+            
               // Check if user has auto-approve enabled
               const { data: pref } = await supabase
                 .from('user_memories')
@@ -988,12 +988,12 @@ async function runAgentLoop(opts: {
                 .eq('user_id', opts.userId)
                 .ilike('fact', '%auto_approve_all%')
                 .single()
-
+            
               if (pref) {
                 result = 'User has auto-approve enabled. Proceed.'
                 break
               }
-
+            
               // Store permission request
               try {
                 await supabase.from('task_permissions').insert({
@@ -1005,41 +1005,66 @@ async function runAgentLoop(opts: {
                   status: 'pending'
                 })
               } catch {}
-
+            
               // Update task status so frontend knows to show permission card
               await supabase.from('tasks').update({ status: 'waiting_permission' }).eq('id', opts.taskId)
-
-              // Poll for response — max 5 minutes
+            
+              // Poll for response — max 10 minutes, check every 2 seconds
               let permissionResult = 'timeout'
-              for (let i = 0; i < 150; i++) {
+              const maxAttempts = 300  // 10 minutes
+              for (let i = 0; i < maxAttempts; i++) {
                 await new Promise(r => setTimeout(r, 2000))
+                
                 if (opts.abortSignal?.aborted) {
                   permissionResult = 'denied'
                   break
                 }
-                const { data } = await supabase
-                  .from('task_permissions')
-                  .select('status')
-                  .eq('task_id', opts.taskId)
-                  .eq('status', 'pending')
-                  .order('created_at', { ascending: false })
-                  .limit(1)
-                  .single()
-
-                if (!data) { permissionResult = 'approved'; break }
-                if (data?.status === 'approved') { permissionResult = 'approved'; break }
-                if (data?.status === 'denied') { permissionResult = 'denied'; break }
+            
+                try {
+                  const { data } = await supabase
+                    .from('task_permissions')
+                    .select('status')
+                    .eq('task_id', opts.taskId)
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .single()
+            
+                  if (!data) {
+                    // Record not found — means it was deleted (approved)
+                    permissionResult = 'approved'
+                    break
+                  }
+            
+                  if (data.status === 'approved') {
+                    permissionResult = 'approved'
+                    break
+                  }
+            
+                  if (data.status === 'denied') {
+                    permissionResult = 'denied'
+                    break
+                  }
+            
+                  // Still pending — continue waiting
+                  console.log(`[ask_permission] still waiting... attempt ${i + 1}/${maxAttempts}`)
+                } catch (err) {
+                  console.error(`[ask_permission] poll error:`, err)
+                  // Continue polling even if error
+                }
               }
-
-              // Resume task status
-              await supabase.from('tasks').update({ status: 'running' }).eq('id', opts.taskId)
-
+            
+              // Resume task status ONLY if we got a response
+              if (permissionResult !== 'timeout') {
+                await supabase.from('tasks').update({ status: 'running' }).eq('id', opts.taskId)
+              }
+            
               if (permissionResult === 'approved') {
                 result = 'User approved. Proceed with the action now.'
               } else if (permissionResult === 'denied') {
                 return { success: false, summary: 'User cancelled the action.' }
               } else {
-                return { success: false, summary: 'Permission request timed out. Action was not taken.' }
+                // Timeout — don't return, keep waiting or fail properly
+                return { success: false, summary: 'Permission request timed out after 10 minutes. Action was not taken.' }
               }
               break
             }
