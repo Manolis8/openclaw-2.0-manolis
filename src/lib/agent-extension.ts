@@ -656,48 +656,12 @@ function cleanContext(context?: string): string {
 async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
-      model: ' gpt-4o',
+      model: 'gpt-4o',
       max_tokens: 400,
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation planner. Given a task, produce a detailed numbered execution plan for a browser agent.
-
-Rules:
-- Be specific about URLs, exact button names, what text to type
-- If you need account-specific info (username, email, ID) — add a discovery step first
-- For destructive actions (delete, remove) — always include the full confirmation flow
-- For confirmation dialogs: describe EVERY stage including typing confirmation text
-- Max 10 steps, no explanations, numbered only
-
-Universal patterns to follow:
-
-DELETING SOMETHING WITH CONFIRMATION:
-1. Navigate to the settings/danger page
-2. Find and click the delete/remove button
-3. A dialog appears — click the first confirmation button
-4. A second stage appears — click the proceed/understand button
-5. A text input appears — type the exact confirmation text shown
-6. The submit button becomes enabled — click it to complete deletion
-
-POSTING CONTENT:
-1. Call draft_content with the content first
-2. Wait for approval
-3. Navigate to the platform
-4. Click compose/new post
-5. Type the approved content
-6. Click publish/post button
-
-SENDING EMAIL:
-1. Navigate to mail client
-2. Click compose
-3. Fill recipient, subject, body
-4. Click send
-
-IMPORTANT:
-- Never use placeholder words like USERNAME, OWNER, USER in URLs
-- If account info unknown — add step: navigate to site homepage, take snapshot to find username/email
-- For any multi-step confirmation dialog — list each stage as a separate step`
+          content: `You are a browser automation planner...`
         },
         {
           role: 'user',
@@ -708,7 +672,11 @@ IMPORTANT:
       ]
     })
     console.log(`[tokens] model=${response.model} prompt=${response.usage?.prompt_tokens} completion=${response.usage?.completion_tokens} total=${response.usage?.total_tokens}`)
-    return response.choices[0].message.content?.trim() ?? ''
+    
+    const plan = response.choices[0].message.content?.trim() ?? ''
+    console.log(`[PLAN] ${plan}`)  // ← ADD THIS
+    
+    return plan
   } catch {
     return ''
   }
