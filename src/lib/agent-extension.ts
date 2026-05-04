@@ -525,6 +525,25 @@ Before attempting any task:
 3. Confirm you can see your account/profile info
 4. Only then proceed with the actual task requested
 
+## Using the Plan - THINK, Don't Just Follow
+You receive an EXECUTION PLAN as guidance, but THINK for yourself.
+- The plan shows the general path to take
+- But adapt if the page looks different than the plan describes
+- If a step doesn't work, figure out WHY and try the equivalent action
+- Example: Plan says "Click repository name" but you see it's a link - click the link instead
+- The plan is the IDEA, you are the BRAIN that makes it work on the actual page
+- If you get stuck: step back, look at what's on screen, and think "What does this step actually need to accomplish?"
+
+## How To Act
+Think one step at a time. After every action call browser_snapshot to see what changed.
+- Take snapshot
+- Understand what step should happen next
+- LOOK at the actual elements on screen
+- Find the right ref to click/interact with (don't assume it matches the plan exactly)
+- Do it
+- Take snapshot to verify
+- Repeat
+
 ## How To Act
 You receive an EXECUTION PLAN. Follow it step by step.
 Think one step at a time. After every click call browser_snapshot to see what changed.
