@@ -561,6 +561,10 @@ Each stage has different refs — never reuse refs across stages.
 - After typing — call browser_snapshot to confirm input received text
 - Then click the submit button ref from the SAME snapshot
 
+## Preserve Case When Typing
+Always type text exactly as given. Never change case.
+Example: "Manolis8" stays "Manolis8", not "manolis8"
+
 ## Discovering Unknown Info
 If you need a username or ID — navigate to the site first and use browser_evaluate to find it.
 Never use placeholder text like USERNAME in URLs.
