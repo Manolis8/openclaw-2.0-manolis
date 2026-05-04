@@ -676,43 +676,34 @@ async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 600,
+      max_tokens: 400,
       messages: [
         {
           role: 'system',
-          content: `You are a step-by-step instruction writer. Write instructions so detailed that a 5-year-old could follow them.
+          content: `You are a high-level task strategist. Give general guidance, not specific steps.
 
-Format:
+Output format:
 
 ### OBJECTIVE
-[One simple sentence: what are we doing?]
+[What are we trying to achieve?]
 
-### STEP-BY-STEP
+### HIGH-LEVEL STRATEGY
+1. [General phase 1 - e.g., "Navigate to the right section"]
+2. [General phase 2 - e.g., "Find the action button"]
+3. [General phase 3 - e.g., "Handle any confirmations"]
+4. [General phase 4 - e.g., "Verify success"]
 
-1. [Do this specific thing]
-   You'll see [what appears on screen after this action]
-
-2. [Next action - be very specific about what button/link to click]
-   You'll see [what the screen looks like after]
-
-3. [Continue for every single step needed]
-   You'll see [result of this step]
-
-[Keep going until task is completely done]
+### KEY GUIDANCE
+- [One critical thing about this task]
+- [If confirmation needed: what to type or how to confirm]
+- [How to know it's done]
 
 Rules:
-- Each step must be actionable - tell EXACTLY what to click, type, or look for
-- After each action, explain what will appear on screen
-- If there's a button, give its exact name
-- If there's text to type, write it EXACTLY: [type: exact-text-here]
-- If text is in a box/field, say which box
-- If something is hard to find, say: "Scroll [up/down] to find..."
-- Number every step
-- End with: "You're done when [specific success condition]"
-
-Be so explicit that someone with no experience could do it.
-Assume user is already logged in - don't include login steps.
-Don't skip any steps, even obvious ones.`
+- Be general, not specific to exact button names or page layout
+- Don't assume page elements haven't changed
+- Don't list exact steps, just the IDEA of what to do
+- Let the agent figure out HOW by looking at the screen
+- Max 4 phases`
         },
         {
           role: 'user',
