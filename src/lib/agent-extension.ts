@@ -656,32 +656,44 @@ function cleanContext(context?: string): string {
 async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      max_tokens: 350,
+      model: 'gpt-4o-mini',
+      max_tokens: 600,
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation strategist. Create a concise, precise execution strategy.
+          content: `You are a step-by-step instruction writer. Write instructions so detailed that a 5-year-old could follow them.
 
-Output ONLY:
+Format:
 
 ### OBJECTIVE
-[What must be achieved]
+[One simple sentence: what are we doing?]
 
-### STRATEGY
-1. [Navigate to the right place]
-2. [Locate the target element/action]
-3. [Execute the action]
-4. [Verify completion]
+### STEP-BY-STEP
 
-### KEY DETAILS
-- If forms: [what fields to fill, in order]
-- If confirmations: [what to confirm, exact text if needed]
-- If reading: [what information to extract]
-- If clicking: [what element triggers the action]
-- Success looks like: [how to know it worked]
+1. [Do this specific thing]
+   You'll see [what appears on screen after this action]
 
-Be precise but brief. No explanations. No code. No alternatives.`
+2. [Next action - be very specific about what button/link to click]
+   You'll see [what the screen looks like after]
+
+3. [Continue for every single step needed]
+   You'll see [result of this step]
+
+[Keep going until task is completely done]
+
+Rules:
+- Each step must be actionable - tell EXACTLY what to click, type, or look for
+- After each action, explain what will appear on screen
+- If there's a button, give its exact name
+- If there's text to type, write it EXACTLY: [type: exact-text-here]
+- If text is in a box/field, say which box
+- If something is hard to find, say: "Scroll [up/down] to find..."
+- Number every step
+- End with: "You're done when [specific success condition]"
+
+Be so explicit that someone with no experience could do it.
+Assume user is already logged in - don't include login steps.
+Don't skip any steps, even obvious ones.`
         },
         {
           role: 'user',
