@@ -511,6 +511,18 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
 
 const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent controlling the user's real Chrome browser.
 
+## PRIMARY RULE - Follow the Plan Exactly
+You will receive a detailed EXECUTION PLAN with numbered steps.
+FOLLOW EVERY STEP IN ORDER. Do not deviate.
+- Do not search unless the plan says to search
+- Do not explore the page unless the plan says to explore
+- Do not click on other people's content, recommendations, or feeds
+- Click ONLY what the plan tells you to click
+- Type ONLY what the plan tells you to type
+- Stop when the plan says the task is complete
+
+The plan is detailed for a reason - trust it and follow it exactly.
+
 ## Critical Rules
 - User is already logged into all accounts — never call task_failed for authentication
 - ONLY do what the user asked — nothing more, nothing less
@@ -525,28 +537,15 @@ Before attempting any task:
 3. Confirm you can see your account/profile info
 4. Only then proceed with the actual task requested
 
-## Using the Plan - THINK, Don't Just Follow
-You receive an EXECUTION PLAN as guidance, but THINK for yourself.
-- The plan shows the general path to take
-- But adapt if the page looks different than the plan describes
-- If a step doesn't work, figure out WHY and try the equivalent action
-- Example: Plan says "Click repository name" but you see it's a link - click the link instead
-- The plan is the IDEA, you are the BRAIN that makes it work on the actual page
-- If you get stuck: step back, look at what's on screen, and think "What does this step actually need to accomplish?"
-
 ## How To Act
 Think one step at a time. After every action call browser_snapshot to see what changed.
 - Take snapshot
-- Understand what step should happen next
-- LOOK at the actual elements on screen
-- Find the right ref to click/interact with (don't assume it matches the plan exactly)
-- Do it
+- Read the NEXT STEP from the plan
+- Find that exact element on screen using the snapshot
+- Click/type/interact with it
 - Take snapshot to verify
-- Repeat
+- Move to next step
 
-## How To Act
-You receive an EXECUTION PLAN. Follow it step by step.
-Think one step at a time. After every click call browser_snapshot to see what changed.
 Never use a ref from a previous snapshot — always get fresh refs after any action.
 
 ## Finding Elements
@@ -676,31 +675,43 @@ async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 200,  // SHORT and tight
+      max_tokens: 600,
       messages: [
         {
           role: 'system',
-          content: `Create a minimal execution guide. Be extremely brief.
+          content: `You are a step-by-step instruction writer. Write instructions so detailed that a 5-year-old could follow them.
 
 Format:
-### GOAL
-[What needs to happen]
 
-### PATH
-1. [Where to go or what to find]
-2. [What action to take]
-3. [Confirm it worked]
+### OBJECTIVE
+[One simple sentence: what are we doing?]
 
-### IF CONFIRMATION NEEDED
-[What to type or how to confirm, if applicable]
+### STEP-BY-STEP
+
+1. [Do this specific thing]
+   You'll see [what appears on screen after this action]
+
+2. [Next action - be very specific about what button/link to click]
+   You'll see [what the screen looks like after]
+
+3. [Continue for every single step needed]
+   You'll see [result of this step]
+
+[Keep going until task is completely done]
 
 Rules:
-- Max 3-4 steps total
-- No prerequisites, no explanations, no code
-- Assume user is logged in
-- Just the IDEA, agent figures out HOW
-- Never mention specific button names or UI elements (they change)
-- Be so brief it fits in 150 tokens max`
+- Each step must be actionable - tell EXACTLY what to click, type, or look for
+- After each action, explain what will appear on screen
+- If there's a button, give its exact name
+- If there's text to type, write it EXACTLY: [type: exact-text-here]
+- If text is in a box/field, say which box
+- If something is hard to find, say: "Scroll [up/down] to find..."
+- Number every step
+- End with: "You're done when [specific success condition]"
+
+Be so explicit that someone with no experience could do it.
+Assume user is already logged in - don't include login steps.
+Don't skip any steps, even obvious ones.`
         },
         {
           role: 'user',
@@ -718,6 +729,7 @@ Rules:
     return ''
   }
 }
+
 
 async function runAgentLoop(opts: {
   userId: string
