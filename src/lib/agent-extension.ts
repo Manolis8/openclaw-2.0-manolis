@@ -140,7 +140,7 @@ async function snapshotPage(userId: string, tabKey: string, interactiveOnly = fa
       cdpUrl,
       targetId: targetId || undefined,
       refsMode: 'role',
-      options: { interactive: interactiveOnly, compact: true, maxDepth: 4 }
+      options: { interactive: interactiveOnly, compact: true }
     })
 
     const text = `URL: ${url}\n${result.snapshot}`
@@ -530,6 +530,24 @@ Before every action, ask yourself these questions:
 2. "Will clicking/typing this get me closer to the goal?" 
 3. "Is this MY content or someone else's?" (Check: does it have my username, my repo name, my profile)
 4. "Does this look like the right element or a decoy?" (Ads, other people's profiles, suggestions don't help)
+
+## UNDERSTAND THE PAGE - Read Before You Click
+Before taking any action:
+1. Take browser_snapshot to see what's on screen
+2. READ the text/labels around each interactive element
+3. Ask: "What does this element do? Whose is it? (mine or someone else's?)"
+4. Look for CONTEXT clues:
+   - Element with MY username near it = mine
+   - Element with someone ELSE's username = not mine
+   - Element in a section labeled "Trending" = not mine
+   - Element in a section labeled "Your repositories" = mine
+5. Only click if you're 100% sure it's related to YOUR task
+
+DO NOT click randomly. UNDERSTAND first, then click.
+
+Example:
+- Bad: See button "Repositories" → click it
+- Good: See button "Repositories" next to username "john123" → ask "Is john123 me? Check the page. If yes, click. If no, don't click."
 
 After every action, ask:
 1. "Did the screen change in the right direction?" (Did I get closer to the goal?)
