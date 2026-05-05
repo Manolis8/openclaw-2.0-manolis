@@ -523,6 +523,24 @@ FOLLOW EVERY STEP IN ORDER. Do not deviate.
 
 The plan is detailed for a reason - trust it and follow it exactly.
 
+
+## THINK LIKE A HUMAN - Safety First
+Before every action, ask yourself these questions:
+1. "What is my goal right now?" (delete this repo, find this link, type this text)
+2. "Will clicking/typing this get me closer to the goal?" 
+3. "Is this MY content or someone else's?" (Check: does it have my username, my repo name, my profile)
+4. "Does this look like the right element or a decoy?" (Ads, other people's profiles, suggestions don't help)
+
+After every action, ask:
+1. "Did the screen change in the right direction?" (Did I get closer to the goal?)
+2. "If not, was the plan wrong or did I click the wrong element?"
+
+If the plan is outdated:
+- The GOAL stays the same (delete the repo)
+- But HOW you achieve it might change
+- If you can't find what the plan describes, look for the equivalent action that serves the same purpose
+- Example: Plan says "Click dropdown" but you see "Link to repositories" → that's the same thing, click the link
+
 ## Critical Rules
 - User is already logged into all accounts — never call task_failed for authentication
 - ONLY do what the user asked — nothing more, nothing less
@@ -675,43 +693,44 @@ async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 600,
+      max_tokens: 700,
       messages: [
         {
           role: 'system',
-          content: `You are a step-by-step instruction writer. Write instructions so detailed that a 5-year-old could follow them.
+          content: `You are writing a task plan where the agent must VERIFY each action before doing it.
 
 Format:
 
 ### OBJECTIVE
-[One simple sentence: what are we doing?]
+[What are we trying to do?]
 
-### STEP-BY-STEP
+### STEP-BY-STEP (with verification)
 
-1. [Do this specific thing]
-   You'll see [what appears on screen after this action]
+1. [Action to take]
+   Before you do this, verify: [What should you see that proves this is the right element?]
+   After you do this, verify: [What should change on screen to prove it worked?]
 
-2. [Next action - be very specific about what button/link to click]
-   You'll see [what the screen looks like after]
+2. [Next action]
+   Before you do this, verify: [What proves this is correct?]
+   After you do this, verify: [What should happen?]
 
-3. [Continue for every single step needed]
-   You'll see [result of this step]
-
-[Keep going until task is completely done]
+[Continue for all steps]
 
 Rules:
-- Each step must be actionable - tell EXACTLY what to click, type, or look for
-- After each action, explain what will appear on screen
-- If there's a button, give its exact name
-- If there's text to type, write it EXACTLY: [type: exact-text-here]
-- If text is in a box/field, say which box
-- If something is hard to find, say: "Scroll [up/down] to find..."
-- Number every step
-- End with: "You're done when [specific success condition]"
+- EVERY step must have BEFORE and AFTER verification
+- BEFORE verification: Describe what proves you found the RIGHT element (not a decoy)
+  - Right element: Has your username, repo name, or clear label
+  - Decoy: Someone else's profile, ads, recommendations
+- AFTER verification: Describe exactly what the screen should look like after success
+- If you don't see the expected result → something went wrong, tell the agent to take a snapshot and reconsider
+- Be VERY specific about location on screen (top right, bottom of page, etc.)
+- If the plan might be outdated: "If you can't find this element, look for [alternative that serves same purpose]"
 
-Be so explicit that someone with no experience could do it.
-Assume user is already logged in - don't include login steps.
-Don't skip any steps, even obvious ones.`
+Example:
+
+1. Click on your profile picture in the top right corner
+   Before: Look for a small circular image with your face in the very top right corner of the page
+   After: A dropdown menu should appear with options like "Your repositories" or "Settings"`
         },
         {
           role: 'user',
@@ -729,7 +748,6 @@ Don't skip any steps, even obvious ones.`
     return ''
   }
 }
-
 
 async function runAgentLoop(opts: {
   userId: string
