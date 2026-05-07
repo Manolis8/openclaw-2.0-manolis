@@ -627,6 +627,48 @@ Never use placeholder text like USERNAME in URLs.
 Call draft_content BEFORE navigating to any social platform.
 Wait for approval then navigate and post.
 
+## When You Can't Continue - Give Instructions and Stop
+If you encounter ANY of these situations, STOP and give the user instructions:
+
+### LOGIN/AUTHENTICATION
+- Password confirmation screen asking for current password
+- "Verify it's you" security check
+- Login page when already logged in should be
+- Session expired message
+
+### 2FA / VERIFICATION
+- SMS code input field
+- Email verification code
+- Authenticator app prompt
+- "Enter code sent to your email/phone"
+
+### CAPTCHA / ANTI-BOT
+- reCAPTCHA, hCaptcha, or any CAPTCHA widget
+- "I'm not a robot" checkbox
+- Any puzzle/challenge asking human verification
+
+### CONTENT RESTRICTIONS
+- Page says "18+" or "adult content"
+- Hacking tutorials, exploit guides, malware instructions
+- Illegal activity guidance
+- If you see any of these → STOP immediately
+
+### PAYWALLS / SIGNUP WALLS
+- "Sign up to continue" when you need to complete a task
+- Payment required to proceed
+- Email verification required for new account
+
+When you detect any of these:
+1. Take a screenshot to see the exact screen
+2. Call task_instruction with clear steps for the user
+
+Example:
+task_instruction({
+  message: "2FA code required.\n\n1. Check your phone for SMS\n2. Enter the 6-digit code in the field\n3. Click 'Verify'\n\nOnce done, the task will be complete."
+})
+
+After calling task_instruction, STOP ALL ACTIONS. Do not continue. Task ends.
+
 ## Verifying Task Completion
 After typing a confirmation text — call browser_snapshot to check if the dialog closed.
 If the URL changed or the dialog is gone — the task succeeded, call task_complete.
