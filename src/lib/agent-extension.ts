@@ -727,7 +727,7 @@ function trimMessages(messages: any[]): any[] {
     rest = rest.slice(1)
   }
 
-  return [system, ...rest]
+  return [system, ...rest] 
 }
 
 // Only pass last user message and last assistant summary — not agent steps
