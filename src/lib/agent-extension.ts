@@ -83,8 +83,6 @@ async function getBrowser(userId: string): Promise<{ browser: Browser; page: Pag
 
 
 
-
-
 // ─── AI-friendly errors (from OpenClaw pw-tools-core.shared.ts) ─────────────
 
 function toAIFriendlyError(error: unknown, ref: string): string {
@@ -169,7 +167,6 @@ async function navigateTo(url: string, userId: string): Promise<void> {
 async function clickRef(userId: string, ref: string): Promise<void> {
   const { page, cdpUrl, targetId } = await getBrowser(userId)
 
-  // Try OpenClaw's clickViaPlaywright first
   try {
     await clickViaPlaywright({
       cdpUrl,
@@ -181,23 +178,8 @@ async function clickRef(userId: string, ref: string): Promise<void> {
     return
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    console.log(`[clickRef] aria click failed for ${ref}: ${msg} — trying JS fallback`)
+    throw new Error(`Element ${ref} not found or not clickable: ${msg}`)
   }
-
-  // Fallback: scroll into view then click
-  try {
-    const { page: p } = await getBrowser(userId)
-    const locator = p.locator(`button, a, [role="button"]`).filter({ hasText: /.+/ }).last()
-    await locator.scrollIntoViewIfNeeded({ timeout: 3000 })
-    await locator.click({ timeout: 5000 })
-    await new Promise(r => setTimeout(r, 300))
-    return
-  } catch {}
-
-  // Last resort: press Enter — works for most confirmation dialogs
-  const { page: p2 } = await getBrowser(userId)
-  await p2.keyboard.press('Enter')
-  await new Promise(r => setTimeout(r, 300))
 }
 
 async function typeViaCDP(userId: string, text: string, selector?: string): Promise<void> {
@@ -241,7 +223,6 @@ async function clickSubmitViaCDP(userId: string, selector?: string): Promise<voi
 async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
   const { cdpUrl, targetId } = await getBrowser(userId)
 
-  // Try OpenClaw's typeViaPlaywright first
   try {
     await typeViaPlaywright({
       cdpUrl,
@@ -254,12 +235,8 @@ async function typeInRef(userId: string, ref: string, text: string): Promise<voi
     await new Promise(r => setTimeout(r, 300))
     return
   } catch (err) {
-    console.log(`[typeInRef] playwright failed: ${err instanceof Error ? err.message.slice(0, 100) : err} — trying CDP`)
+    throw new Error(`Element ${ref} not found or not typeable: ${err instanceof Error ? err.message : String(err)}`)
   }
-
-  // Fallback: type via CDP Input.insertText — works for dialogs, React inputs, any input
-  await typeViaCDP(userId, text)
-  await new Promise(r => setTimeout(r, 300))
 }
 
 async function pressKey(key: string, userId: string): Promise<void> {
@@ -627,6 +604,64 @@ Never use placeholder text like USERNAME in URLs.
 Call draft_content BEFORE navigating to any social platform.
 Wait for approval then navigate and post.
 
+## When You Can't Continue - Give Instructions and Stop
+If you encounter ANY of these situations, STOP and give the user instructions:
+
+### LOGIN/AUTHENTICATION
+- Password confirmation screen asking for current password
+- "Verify it's you" security check
+- Login page when already logged in should be
+- Session expired message
+
+### 2FA / VERIFICATION
+- SMS code input field
+- Email verification code
+- Authenticator app prompt
+- "Enter code sent to your email/phone"
+
+### CAPTCHA / ANTI-BOT
+- reCAPTCHA, hCaptcha, or any CAPTCHA widget
+- "I'm not a robot" checkbox
+- Any puzzle/challenge asking human verification
+
+### CONTENT RESTRICTIONS
+- Page says "18+" or "adult content"
+- Hacking tutorials, exploit guides, malware instructions
+- Illegal activity guidance
+- If you see any of these → STOP immediately
+
+### PAYWALLS / SIGNUP WALLS
+- "Sign up to continue" when you need to complete a task
+- Payment required to proceed
+- Email verification required for new account
+
+When you detect any of these:
+1. Take a screenshot to see the exact screen
+2. Call task_instruction with clear steps for the user
+
+Example:
+task_instruction({
+  message: "2FA code required.\n\n1. Check your phone for SMS\n2. Enter the 6-digit code in the field\n3. Click 'Verify'\n\nOnce done, the task will be complete."
+})
+
+After calling task_instruction, STOP ALL ACTIONS. Do not continue. Task ends.
+
+## Task Completion — CRITICAL
+The EXECUTION PLAN tells you exactly when to stop.
+- Read the final step of the plan carefully
+- When you have completed that final step — DO NOT CLICK ANYTHING ELSE
+- Call task_complete IMMEDIATELY with what you found
+- Do NOT explore further, click settings, delete, or interact with the result
+- Do NOT click buttons you see on the page unless the plan specifically asks
+- If the plan says "find the first repository" — find it and STOP. Do not click into it or its settings.
+- If the plan says "click delete" — only then click delete. Not before.
+
+Example:
+- WRONG: Plan says "Find first repo" → You find it → You click into it → You click Settings → You delete it
+- RIGHT: Plan says "Find first repo" → You find it → You call task_complete("Found repo: X")
+
+ALWAYS verify the plan is complete BEFORE taking any new action.
+
 ## Verifying Task Completion
 After typing a confirmation text — call browser_snapshot to check if the dialog closed.
 If the URL changed or the dialog is gone — the task succeeded, call task_complete.
@@ -744,11 +779,37 @@ Rules:
 - Be VERY specific about location on screen (top right, bottom of page, etc.)
 - If the plan might be outdated: "If you can't find this element, look for [alternative that serves same purpose]"
 
-Example:
+CRITICAL: Always end the plan with a final step that tells the agent to STOP and REPORT.
+
+Example final step for "find" tasks:
+
+N. Report what you found
+   Before: Confirm you can see the item/information on screen
+   After: Call task_complete with the name/details. DO NOT click any other buttons like Settings, Delete, or Config.
+
+Example final step for "click" tasks:
+
+N. Verify the action completed
+   Before: Confirm the page shows the expected result
+   After: Call task_complete with confirmation. DO NOT explore further or click additional buttons.
+
+Example full plan:
 
 1. Click on your profile picture in the top right corner
    Before: Look for a small circular image with your face in the very top right corner of the page
-   After: A dropdown menu should appear with options like "Your repositories" or "Settings"`
+   After: A dropdown menu should appear with options like "Your repositories" or "Settings"
+
+2. Select "Your repositories"
+   Before: Look for the "Your repositories" option in the dropdown menu
+   After: You should see a list of all your repositories with names and dates
+
+3. Locate your first repository
+   Before: Ensure the list shows repositories sorted by creation date with the oldest at the bottom
+   After: Identify the first repository you created and note its name
+
+4. Report the first repository
+   Before: Confirm you can see the repository name clearly
+   After: Call task_complete("Found first repository: [name]"). DO NOT click into the repository, Settings, or Delete buttons.`
         },
         {
           role: 'user',
@@ -901,27 +962,29 @@ async function runAgentLoop(opts: {
                 await new Promise(r => setTimeout(r, 800))
                 result = `Clicked ${args.ref} successfully. Call browser_snapshot to see updated page.`
               } catch (err) {
-                result = toAIFriendlyError(err, args.ref)
+                // Element not found - force agent to get fresh snapshot and try again
+                result = `Element ${args.ref} not found or not clickable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
               break
             }
             case 'browser_type': {
               consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
-
-              await typeInRef(opts.userId, args.ref, args.text)
-              if (args.submit) await pressKey('Enter', opts.userId)
-              await new Promise(r => setTimeout(r, 800))
-              // Auto-click submit button via CDP after typing confirmation text
               try {
-                await clickSubmitViaCDP(opts.userId)
-                console.log(`[browser_type] auto-clicked submit after typing`)
-                await new Promise(r => setTimeout(r, 1000))
+                await typeInRef(opts.userId, args.ref, args.text)
+                if (args.submit) await pressKey('Enter', opts.userId)
+                await new Promise(r => setTimeout(r, 800))
+                try {
+                  await clickSubmitViaCDP(opts.userId)
+                  console.log(`[browser_type] auto-clicked submit after typing`)
+                  await new Promise(r => setTimeout(r, 1000))
+                } catch (err) {
+                  console.log(`[browser_type] auto-click submit failed: ${err}`)
+                }
+                result = `Typed "${args.text}" into the input and automatically clicked the submit button. Call browser_snapshot to verify the page changed.`
               } catch (err) {
-                console.log(`[browser_type] auto-click submit failed: ${err}`)
+                result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
-              const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-              result = `Typed "${args.text}" into the input and automatically clicked the submit button. The action should be complete. Call browser_snapshot to verify the page changed — if the dialog closed the action succeeded. Do NOT click any more buttons.`
               break
             }
             case 'browser_key': {

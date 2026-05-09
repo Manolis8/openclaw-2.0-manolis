@@ -1,0 +1,726 @@
+manolis-logs
+
+=== ls -la /path/to/openclaw/src/agents/ ===
+Directory: C:\Users\manol\openclaw-2.0-manolis\src\agents
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+d-----        26/04/2026     12:57                tools                                                                
+-a----        06/03/2026     16:33          15274 compaction.ts                                                        
+-a----        06/03/2026     16:33          32424 system-prompt.ts                                                     
+-a----        08/05/2026     16:36          19327 tool-loop-detection.ts                                               
+
+=== ls -la /path/to/openclaw/src/config/ ===
+Directory: C:\Users\manol\openclaw-2.0-manolis\src\config
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+d-----        08/05/2026     16:40                sessions                                                             
+-a----        06/03/2026     16:33           1728 agent-dirs.test.ts                                                   
+-a----        06/03/2026     16:33           3586 agent-dirs.ts                                                        
+-a----        06/03/2026     16:33            836 agent-limits.ts                                                      
+-a----        06/03/2026     16:33            934 allowed-values.test.ts                                               
+-a----        06/03/2026     16:33           2662 allowed-values.ts                                                    
+-a----        06/03/2026     16:33           3635 backup-rotation.ts                                                   
+-a----        06/03/2026     16:33            961 bindings.ts                                                          
+-a----        06/03/2026     16:33            796 byte-size.ts                                                         
+-a----        06/03/2026     16:33            771 cache-utils.ts                                                       
+-a----        06/03/2026     16:33           4028 channel-capabilities.test.ts                                         
+-a----        06/03/2026     16:33           2430 channel-capabilities.ts                                              
+-a----        06/03/2026     16:33           3811 commands.test.ts                                                     
+-a----        06/03/2026     16:33           2562 commands.ts                                                          
+-a----        06/03/2026     16:33          10952 config-misc.test.ts                                                  
+-a----        06/03/2026     16:33           2191 config-paths.ts                                                      
+-a----        06/03/2026     16:33           3548 config.acp-binding-cutover.test.ts                                   
+-a----        06/03/2026     16:33           1761 config.agent-concurrency-defaults.test.ts                            
+-a----        06/03/2026     16:33           4770 config.allowlist-requires-allowfrom.test.ts                          
+-a----        06/03/2026     16:33            574 config.backup-rotation.test-helpers.ts                               
+-a----        06/03/2026     16:33           5384 config.backup-rotation.test.ts                                       
+-a----        06/03/2026     16:33           3101 config.compaction-settings.test.ts                                   
+-a----        06/03/2026     16:33           2113 config.discord-presence.test.ts                                      
+-a----        06/03/2026     16:33           2612 config.discord.test.ts                                               
+-a----        06/03/2026     16:33           1979 config.dm-policy-alias.test.ts                                       
+-a----        06/03/2026     16:33           4491 config.env-vars.test.ts                                              
+-a----        06/03/2026     16:33           2162 config.gateway-tailscale-bind.test.ts                                
+-a----        06/03/2026     16:33           2123 config.hooks-module-paths.test.ts                                    
+-a----        06/03/2026     16:33           1679 config.identity-avatar.test.ts                                       
+-a----        06/03/2026     16:33           5735 config.identity-defaults.test.ts                                     
+-a----        06/03/2026     16:33           3478 config.irc.test.ts                                                   
+-a----        06/03/2026     16:33          14882 config.legacy-config-detection.accepts-imessage-dmpolicy.test.ts    
+-a----        06/03/2026     16:33          24552 config.legacy-config-detection.rejects-routing-allowfrom.test.ts    
+-a----        06/03/2026     16:33           1729 config.meta-timestamp-coercion.test.ts                               
+-a----        06/03/2026     16:33           1076 config.msteams.test.ts                                               
+-a----        06/03/2026     16:33           1486 config.multi-agent-agentdir-validation.test.ts                       
+-a----        06/03/2026     16:33           8899 config.nix-integration-u3-u5-u9.test.ts                              
+-a----        06/03/2026     16:33           9296 config.plugin-validation.test.ts                                     
+-a----        06/03/2026     16:33           4120 config.pruning-defaults.test.ts                                      
+-a----        06/03/2026     16:33           8819 config.sandbox-docker.test.ts                                        
+-a----        06/03/2026     16:33           4235 config.schema-regressions.test.ts                                    
+-a----        06/03/2026     16:33           4521 config.secrets-schema.test.ts                                        
+-a----        06/03/2026     16:33           1081 config.skills-entries-config.test.ts                                 
+-a----        06/03/2026     16:33           1588 config.talk-api-key-fallback.test.ts                                 
+-a----        06/03/2026     16:33           1220 config.telegram-audio-preflight.test.ts                              
+-a----        06/03/2026     16:33           1086 config.telegram-custom-commands.test.ts                              
+-a----        06/03/2026     16:33           3335 config.telegram-topic-agentid.test.ts                                
+-a----        06/03/2026     16:33           1246 config.tools-alsoAllow.test.ts                                       
+-a----        06/03/2026     16:33            607 config.ts                                                            
+-a----        06/03/2026     16:33           4078 config.web-search-provider.test.ts                                   
+-a----        06/03/2026     16:33           2440 dangerous-name-matching.ts                                           
+-a----        06/03/2026     16:33          14780 defaults.ts                                                          
+-a----        06/03/2026     16:33           4315 discord-preview-streaming.ts                                         
+-a----        06/03/2026     16:33           5964 env-preserve-io.test.ts                                              
+-a----        06/03/2026     16:33           7765 env-preserve.test.ts                                                 
+-a----        06/03/2026     16:33           4406 env-preserve.ts                                                      
+-a----        06/03/2026     16:33           9665 env-substitution.test.ts                                             
+-a----        06/03/2026     16:33           4514 env-substitution.ts                                                  
+-a----        06/03/2026     16:33           2103 env-vars.ts                                                          
+-a----        06/03/2026     16:33           2726 gateway-control-ui-origins.ts                                        
+-a----        06/03/2026     16:33           6887 group-policy.test.ts                                                 
+-a----        06/03/2026     16:33          12487 group-policy.ts                                                      
+-a----        06/03/2026     16:33            321 home-env.test-harness.ts                                             
+-a----        06/03/2026     16:33           2242 includes-scan.ts                                                     
+-a----        06/03/2026     16:33          23669 includes.test.ts                                                     
+-a----        06/03/2026     16:33          10524 includes.ts                                                          
+-a----        06/03/2026     16:33           5645 io.compat.test.ts                                                    
+-a----        06/03/2026     16:33           2090 io.eacces.test.ts                                                    
+-a----        06/03/2026     16:33           1776 io.owner-display-secret.test.ts                                      
+-a----        06/03/2026     16:33          45188 io.ts                                                                
+-a----        06/03/2026     16:33          17994 io.write-config.test.ts                                              
+-a----        06/03/2026     16:33           2595 issue-format.test.ts                                                 
+-a----        06/03/2026     16:33           2054 issue-format.ts                                                      
+-a----        06/03/2026     16:33            195 legacy-migrate.test-helpers.ts                                       
+-a----        06/03/2026     16:33          11543 legacy-migrate.test.ts                                               
+-a----        06/03/2026     16:33            670 legacy-migrate.ts                                                    
+-a----        06/03/2026     16:33          19444 legacy.migrations.part-1.ts                                          
+-a----        06/03/2026     16:33          14748 legacy.migrations.part-2.ts                                          
+-a----        06/03/2026     16:33          12830 legacy.migrations.part-3.ts                                          
+-a----        06/03/2026     16:33            403 legacy.migrations.ts                                                 
+-a----        06/03/2026     16:33           7217 legacy.rules.ts                                                      
+-a----        06/03/2026     16:33            850 legacy.shared.test.ts                                                
+-a----        06/03/2026     16:33           3926 legacy.shared.ts                                                     
+-a----        06/03/2026     16:33           1892 legacy.ts                                                            
+-a----        06/03/2026     16:33            642 logging-max-file-bytes.test.ts                                       
+-a----        06/03/2026     16:33            567 logging.ts                                                           
+-a----        06/03/2026     16:33           2118 markdown-tables.ts                                                   
+-a----        06/03/2026     16:33           3831 media-audio-field-metadata.ts                                        
+-a----        06/03/2026     16:33           1029 merge-config.ts                                                      
+-a----        06/03/2026     16:33           1879 merge-patch.proto-pollution.test.ts                                  
+-a----        06/03/2026     16:33           5770 merge-patch.test.ts                                                  
+-a----        06/03/2026     16:33           2647 merge-patch.ts                                                       
+-a----        06/03/2026     16:33           4520 model-alias-defaults.test.ts                                         
+-a----        06/03/2026     16:33           1011 model-input.ts                                                       
+-a----        06/03/2026     16:33           1382 normalize-exec-safe-bin.ts                                           
+-a----        06/03/2026     16:33           2597 normalize-paths.test.ts                                              
+-a----        06/03/2026     16:33           1838 normalize-paths.ts                                                   
+-a----        06/03/2026     16:33           5899 paths.test.ts                                                        
+-a----        30/04/2026     18:15           8959 paths.ts                                                             
+-a----        06/03/2026     16:33          10396 plugin-auto-enable.test.ts                                           
+-a----        06/03/2026     16:33          15642 plugin-auto-enable.ts                                                
+-a----        06/03/2026     16:33            373 plugins-allowlist.ts                                                 
+-a----        06/03/2026     16:33           1320 plugins-runtime-boundary.test.ts                                     
+-a----        06/03/2026     16:33           1506 port-defaults.ts                                                     
+-a----        06/03/2026     16:33             65 prototype-keys.ts                                                    
+-a----        06/03/2026     16:33            915 redact-snapshot.raw.ts                                               
+-a----        06/03/2026     16:33            718 redact-snapshot.secret-ref.ts                                        
+-a----        06/03/2026     16:33          42601 redact-snapshot.test.ts                                              
+-a----        06/03/2026     16:33          21702 redact-snapshot.ts                                                   
+-a----        06/03/2026     16:33            640 runtime-group-policy-provider.ts                                     
+-a----        06/03/2026     16:33           3612 runtime-group-policy.test.ts                                         
+-a----        06/03/2026     16:33           3847 runtime-group-policy.ts                                              
+-a----        06/03/2026     16:33           2850 runtime-overrides.test.ts                                            
+-a----        06/03/2026     16:33           2469 runtime-overrides.ts                                                 
+-a----        06/03/2026     16:33          27450 schema.help.quality.test.ts                                          
+-a----        06/03/2026     16:33         153757 schema.help.ts                                                       
+-a----        06/03/2026     16:33           5614 schema.hints.test.ts                                                 
+-a----        06/03/2026     16:33           6947 schema.hints.ts                                                      
+-a----        06/03/2026     16:33           1493 schema.irc.ts                                                        
+-a----        06/03/2026     16:33          48913 schema.labels.ts                                                     
+-a----        06/03/2026     16:33           5614 schema.tags.ts                                                       
+-a----        06/03/2026     16:33          11956 schema.test.ts                                                       
+-a----        06/03/2026     16:33          20587 schema.ts                                                            
+-a----        06/03/2026     16:33           7685 sessions.cache.test.ts                                               
+-a----        06/03/2026     16:33          25070 sessions.test.ts                                                     
+-a----        06/03/2026     16:33            527 sessions.ts                                                          
+-a----        06/03/2026     16:33           2320 slack-http-config.test.ts                                            
+-a----        06/03/2026     16:33           1861 slack-token-validation.test.ts                                       
+-a----        06/03/2026     16:33           5313 talk.normalize.test.ts                                               
+-a----        06/03/2026     16:33           9607 talk.ts                                                              
+-a----        06/03/2026     16:33            762 telegram-actions-poll.test.ts                                        
+-a----        06/03/2026     16:33           2954 telegram-custom-commands.ts                                          
+-a----        06/03/2026     16:33           1244 telegram-webhook-port.test.ts                                        
+-a----        06/03/2026     16:33           2593 telegram-webhook-secret.test.ts                                      
+-a----        06/03/2026     16:33           2134 test-helpers.ts                                                      
+-a----        06/03/2026     16:33           4131 thread-bindings-config-keys.test.ts                                  
+-a----        06/03/2026     16:33           1219 types.acp.ts                                                         
+-a----        06/03/2026     16:33          14457 types.agent-defaults.ts                                              
+-a----        06/03/2026     16:33           1219 types.agents-shared.ts                                               
+-a----        06/03/2026     16:33           2846 types.agents.ts                                                      
+-a----        06/03/2026     16:33           1142 types.approvals.ts                                                   
+-a----        06/03/2026     16:33            987 types.auth.ts                                                        
+-a----        06/03/2026     16:33           8100 types.base.ts                                                        
+-a----        06/03/2026     16:33           3083 types.browser.ts                                                     
+-a----        06/03/2026     16:33           2067 types.channel-messaging-common.ts                                    
+-a----        06/03/2026     16:33           2298 types.channels.ts                                                    
+-a----        06/03/2026     16:33            347 types.cli.ts                                                         
+-a----        06/03/2026     16:33           1927 types.cron.ts                                                        
+-a----        06/03/2026     16:33          14437 types.discord.ts                                                     
+-a----        06/03/2026     16:33          13643 types.gateway.ts                                                     
+-a----        06/03/2026     16:33           4880 types.googlechat.ts                                                  
+-a----        06/03/2026     16:33           4002 types.hooks.ts                                                       
+-a----        06/03/2026     16:33           3710 types.imessage.ts                                                    
+-a----        06/03/2026     16:33            325 types.installs.ts                                                    
+-a----        06/03/2026     16:33           2255 types.irc.ts                                                         
+-a----        06/03/2026     16:33           1773 types.memory.ts                                                      
+-a----        06/03/2026     16:33           6468 types.messages.ts                                                    
+-a----        06/03/2026     16:33           1869 types.models.ts                                                      
+-a----        06/03/2026     16:33           4958 types.msteams.ts                                                     
+-a----        06/03/2026     16:33            359 types.node-host.ts                                                   
+-a----        06/03/2026     16:33           4725 types.openclaw.ts                                                    
+-a----        06/03/2026     16:33           1097 types.plugins.ts                                                     
+-a----        06/03/2026     16:33            462 types.queue.ts                                                       
+-a----        06/03/2026     16:33           3576 types.sandbox.ts                                                     
+-a----        06/03/2026     16:33           5832 types.secrets.ts                                                     
+-a----        06/03/2026     16:33           2206 types.signal.ts                                                      
+-a----        06/03/2026     16:33           1580 types.skills.ts                                                      
+-a----        06/03/2026     16:33           8080 types.slack.ts                                                       
+-a----        06/03/2026     16:33          10318 types.telegram.ts                                                    
+-a----        06/03/2026     16:33          21449 types.tools.ts                                                       
+-a----        06/03/2026     16:33           1248 types.ts                                                             
+-a----        06/03/2026     16:33           2575 types.tts.ts                                                         
+-a----        06/03/2026     16:33           4419 types.whatsapp.ts                                                    
+-a----        06/03/2026     16:33           2564 validation.allowed-values.test.ts                                    
+-a----        06/03/2026     16:33          19235 validation.ts                                                        
+-a----        06/03/2026     16:33           1295 version.ts                                                           
+-a----        06/03/2026     16:33           7090 zod-schema.agent-defaults.ts                                         
+-a----        06/03/2026     16:33            213 zod-schema.agent-model.ts                                            
+-a----        06/03/2026     16:33          25406 zod-schema.agent-runtime.ts                                          
+-a----        06/03/2026     16:33           2995 zod-schema.agents.ts                                                 
+-a----        06/03/2026     16:33           1027 zod-schema.allowdeny.ts                                              
+-a----        06/03/2026     16:33            755 zod-schema.approvals.ts                                              
+-a----        06/03/2026     16:33            238 zod-schema.channels.ts                                               
+-a----        06/03/2026     16:33          22905 zod-schema.core.ts                                                   
+-a----        06/03/2026     16:33            952 zod-schema.cron-retention.test.ts                                    
+-a----        06/03/2026     16:33           4677 zod-schema.hooks.ts                                                  
+-a----        06/03/2026     16:33            624 zod-schema.installs.ts                                               
+-a----        06/03/2026     16:33            727 zod-schema.logging-levels.test.ts                                    
+-a----        06/03/2026     16:33          55117 zod-schema.providers-core.ts                                         
+-a----        06/03/2026     16:33           5601 zod-schema.providers-whatsapp.ts                                     
+-a----        06/03/2026     16:33           1612 zod-schema.providers.ts                                              
+-a----        06/03/2026     16:33           3152 zod-schema.secret-input-validation.ts                                
+-a----        06/03/2026     16:33            192 zod-schema.sensitive.ts                                              
+-a----        06/03/2026     16:33           1502 zod-schema.session-maintenance-extensions.test.ts                    
+-a----        06/03/2026     16:33           7608 zod-schema.session.ts                                                
+-a----        06/03/2026     16:33          28978 zod-schema.ts                                                        
+-a----        06/03/2026     16:33            726 zod-schema.typing-mode.test.ts                                       
+
+=== ls -la /path/to/openclaw/src/logging/ ===
+Directory: C:\Users\manol\openclaw-2.0-manolis\src\logging
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+d-----        08/05/2026     16:41                test-helpers                                                         
+-a----        06/03/2026     16:33            712 config.ts                                                            
+-a----        06/03/2026     16:33           4504 console-capture.test.ts                                              
+-a----        06/03/2026     16:33           2716 console-settings.test.ts                                             
+-a----        06/03/2026     16:33           2973 console-timestamp.test.ts                                            
+-a----        06/03/2026     16:33          10224 console.ts                                                           
+-a----        06/03/2026     16:33           3202 diagnostic-session-state.ts                                          
+-a----        06/03/2026     16:33           4193 diagnostic.test.ts                                                   
+-a----        06/03/2026     16:33          12715 diagnostic.ts                                                        
+-a----        06/03/2026     16:33            812 env-log-level.ts                                                     
+-a----        06/03/2026     16:33            913 levels.ts                                                            
+-a----        06/03/2026     16:33           2188 log-file-size-cap.test.ts                                            
+-a----        06/03/2026     16:33           2522 logger-env.test.ts                                                   
+-a----        06/03/2026     16:33           2122 logger-settings.test.ts                                              
+-a----        06/03/2026     16:33           1350 logger-timestamp.test.ts                                             
+-a----        06/03/2026     16:33            890 logger.settings.test.ts                                              
+-a----        06/03/2026     16:33          11227 logger.ts                                                            
+-a----        06/03/2026     16:33            664 node-require.ts                                                      
+-a----        06/03/2026     16:33           1350 parse-log-line.test.ts                                               
+-a----        06/03/2026     16:33           1703 parse-log-line.ts                                                    
+-a----        06/03/2026     16:33            813 redact-bounded.ts                                                    
+-a----        06/03/2026     16:33            497 redact-identifier.ts                                                 
+-a----        06/03/2026     16:33           3708 redact.test.ts                                                       
+-a----        06/03/2026     16:33           4820 redact.ts                                                            
+-a----        06/03/2026     16:33            604 state.ts                                                             
+-a----        06/03/2026     16:33           2161 subsystem.test.ts                                                    
+-a----        06/03/2026     16:33          12112 subsystem.ts                                                         
+-a----        06/03/2026     16:33           2651 timestamps.test.ts                                                   
+-a----        06/03/2026     16:33           1073 timestamps.ts                                                        
+
+=== ls -la /path/to/openclaw/src/infra/ ===
+Directory: C:\Users\manol\openclaw-2.0-manolis\src\infra
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+d-----        30/04/2026     18:24                format-time                                                          
+d-----        30/04/2026     18:24                net                                                                  
+d-----        30/04/2026     18:24                outbound                                                             
+d-----        30/04/2026     18:24                tls                                                                  
+-a----        06/03/2026     16:33           4078 abort-pattern.test.ts                                                
+-a----        06/03/2026     16:33            858 abort-signal.test.ts                                                 
+-a----        06/03/2026     16:33            347 abort-signal.ts                                                      
+-a----        06/03/2026     16:33           2480 agent-events.test.ts                                                 
+-a----        06/03/2026     16:33           2707 agent-events.ts                                                      
+-a----        06/03/2026     16:33           1419 archive-path.test.ts                                                 
+-a----        06/03/2026     16:33           2227 archive-path.ts                                                      
+-a----        06/03/2026     16:33           9500 archive.test.ts                                                      
+-a----        06/03/2026     16:33          18024 archive.ts                                                           
+-a----        06/03/2026     16:33            740 backoff.ts                                                           
+-a----        06/03/2026     16:33            457 binaries.ts                                                          
+-a----        06/03/2026     16:33            422 bonjour-ciao.ts                                                      
+-a----        06/03/2026     16:33           9475 bonjour-discovery.test.ts                                            
+-a----        06/03/2026     16:33          16497 bonjour-discovery.ts                                                 
+-a----        06/03/2026     16:33            236 bonjour-errors.ts                                                    
+-a----        06/03/2026     16:33          10057 bonjour.test.ts                                                      
+-a----        06/03/2026     16:33           8545 bonjour.ts                                                           
+-a----        06/03/2026     16:33           5860 boundary-file-read.ts                                                
+-a----        06/03/2026     16:33           7157 boundary-path.test.ts                                                
+-a----        06/03/2026     16:33          24595 boundary-path.ts                                                     
+-a----        06/03/2026     16:33           3996 brew.test.ts                                                         
+-a----        06/03/2026     16:33           2031 brew.ts                                                              
+-a----        06/03/2026     16:33           2560 canvas-host-url.ts                                                   
+-a----        06/03/2026     16:33           1540 channel-activity.ts                                                  
+-a----        06/03/2026     16:33           2661 channel-summary.test.ts                                              
+-a----        06/03/2026     16:33           8477 channel-summary.ts                                                   
+-a----        06/03/2026     16:33            732 channels-status-issues.ts                                            
+-a----        06/03/2026     16:33            719 cli-root-options.test.ts                                             
+-a----        06/03/2026     16:33            785 cli-root-options.ts                                                  
+-a----        06/03/2026     16:33            738 clipboard.ts                                                         
+-a----        06/03/2026     16:33           7659 control-ui-assets.test.ts                                            
+-a----        06/03/2026     16:33           8518 control-ui-assets.ts                                                 
+-a----        06/03/2026     16:33           1845 dedupe.ts                                                             
+-a----        06/03/2026     16:33            826 detect-package-manager.ts                                            
+-a----        06/03/2026     16:33           2597 device-auth-store.ts                                                 
+-a----        06/03/2026     16:33            757 device-identity.state-dir.test.ts                                    
+-a----        06/03/2026     16:33           5497 device-identity.ts                                                   
+-a----        06/03/2026     16:33           8691 device-pairing.test.ts                                               
+-a----        06/03/2026     16:33          19299 device-pairing.ts                                                    
+-a----        06/03/2026     16:33           6107 diagnostic-events.ts                                                 
+-a----        06/03/2026     16:33           2268 diagnostic-flags.ts                                                  
+-a----        06/03/2026     16:33           3014 dotenv.test.ts                                                       
+-a----        06/03/2026     16:33            640 dotenv.ts                                                            
+-a----        06/03/2026     16:33           1406 env-file.ts                                                          
+-a----        06/03/2026     16:33           1613 env.test.ts                                                          
+-a----        06/03/2026     16:33           1387 env.ts                                                                
+-a----        06/03/2026     16:33           2649 errors.ts                                                             
+-a----        06/03/2026     16:33           2174 exec-allowlist-pattern.ts                                             
+-a----        06/03/2026     16:33           9866 exec-approval-forwarder.test.ts                                      
+-a----        06/03/2026     16:33          13880 exec-approval-forwarder.ts                                           
+-a----        06/03/2026     16:33           8931 exec-approvals-allow-always.test.ts                                  
+-a----        06/03/2026     16:33          15102 exec-approvals-allowlist.ts                                          
+-a----        06/03/2026     16:33          21868 exec-approvals-analysis.ts                                           
+-a----        06/03/2026     16:33           9179 exec-approvals-config.test.ts                                        
+-a----        06/03/2026     16:33           1350 exec-approvals-parity.test.ts                                        
+-a----        06/03/2026     16:33          14467 exec-approvals-safe-bins.test.ts                                     
+-a----        06/03/2026     16:33           1524 exec-approvals-test-helpers.ts                                       
+-a----        06/03/2026     16:33          29889 exec-approvals.test.ts                                               
+-a----        06/03/2026     16:33          16678 exec-approvals.ts                                                    
+-a----        06/03/2026     16:33           6262 exec-command-resolution.ts                                           
+-a----        06/03/2026     16:33           2057 exec-host.ts                                                         
+-a----        06/03/2026     16:33           6365 exec-obfuscation-detect.test.ts                                      
+-a----        06/03/2026     16:33           4580 exec-obfuscation-detect.ts                                           
+-a----        06/03/2026     16:33           8431 exec-safe-bin-policy-profiles.ts                                     
+-a----        06/03/2026     16:33           5676 exec-safe-bin-policy-validator.ts                                    
+-a----        06/03/2026     16:33           5709 exec-safe-bin-policy.test.ts                                         
+-a----        06/03/2026     16:33            443 exec-safe-bin-policy.ts                                              
+-a----        06/03/2026     16:33           4562 exec-safe-bin-runtime-policy.test.ts                                 
+-a----        06/03/2026     16:33           4321 exec-safe-bin-runtime-policy.ts                                      
+-a----        06/03/2026     16:33           3032 exec-safe-bin-trust.test.ts                                          
+-a----        06/03/2026     16:33           3668 exec-safe-bin-trust.ts                                               
+-a----        06/03/2026     16:33            964 exec-safety.ts                                                       
+-a----        06/03/2026     16:33          19173 exec-wrapper-resolution.ts                                           
+-a----        06/03/2026     16:33           2172 executable-path.ts                                                   
+-a----        06/03/2026     16:33           6795 fetch.test.ts                                                        
+-a----        06/03/2026     16:33           3447 fetch.ts                                                             
+-a----        06/03/2026     16:33           1168 file-identity.test.ts                                                
+-a----        06/03/2026     16:33            665 file-identity.ts                                                     
+-a----        06/03/2026     16:33            159 file-lock.ts                                                         
+-a----        06/03/2026     16:33           1059 fixed-window-rate-limit.test.ts                                      
+-a----        06/03/2026     16:33           1088 fixed-window-rate-limit.ts                                           
+-a----        06/03/2026     16:33          18649 fs-safe.test.ts                                                      
+-a----        30/04/2026     18:31            152 fs-safe.ts                                                           
+-a----        06/03/2026     16:33           8628 gateway-lock.test.ts                                                 
+-a----        06/03/2026     16:33           8464 gateway-lock.ts                                                      
+-a----        06/03/2026     16:33           1079 gemini-auth.ts                                                       
+-a----        06/03/2026     16:33           2677 git-commit.ts                                                        
+-a----        06/03/2026     16:33           2629 git-root.test.ts                                                     
+-a----        06/03/2026     16:33           2044 git-root.ts                                                          
+-a----        06/03/2026     16:33            930 hardlink-guards.ts                                                   
+-a----        06/03/2026     16:33           3036 heartbeat-active-hours.test.ts                                       
+-a----        06/03/2026     16:33           2865 heartbeat-active-hours.ts                                            
+-a----        06/03/2026     16:33            991 heartbeat-events-filter.test.ts                                      
+-a----        06/03/2026     16:33           3205 heartbeat-events-filter.ts                                           
+-a----        06/03/2026     16:33           1574 heartbeat-events.ts                                                  
+-a----        06/03/2026     16:33           2435 heartbeat-reason.test.ts                                             
+-a----        06/03/2026     16:33           1368 heartbeat-reason.ts                                                  
+-a----        06/03/2026     16:33           8046 heartbeat-runner.ghost-reminder.test.ts                              
+-a----        06/03/2026     16:33           6680 heartbeat-runner.model-override.test.ts                              
+-a----        06/03/2026     16:33          13204 heartbeat-runner.respects-ackmaxchars-heartbeat-acks.test.ts        
+-a----        06/03/2026     16:33          42245 heartbeat-runner.returns-default-unset.test.ts                       
+-a----        06/03/2026     16:33           7323 heartbeat-runner.scheduler.test.ts                                   
+-a----        06/03/2026     16:33           1883 heartbeat-runner.sender-prefers-delivery-target.test.ts              
+-a----        06/03/2026     16:33          1858 heartbeat-runner.test-harness.ts                                      
+-a----        06/03/2026     16:33           3204 heartbeat-runner.test-utils.ts                                       
+-a----        06/03/2026     16:33           3758 heartbeat-runner.transcript-prune.test.ts                            
+-a----        06/03/2026     16:33          40634 heartbeat-runner.ts                                                  
+-a----        06/03/2026     16:33           6536 heartbeat-visibility.test.ts                                         
+-a----        06/03/2026     16:33           2553 heartbeat-visibility.ts                                              
+-a----        06/03/2026     16:33          11241 heartbeat-wake.test.ts                                               
+-a----        06/03/2026     16:33           7657 heartbeat-wake.ts                                                    
+-a----        06/03/2026     16:33           2468 home-dir.test.ts                                                     
+-a----        06/03/2026     16:33           1986 home-dir.ts                                                          
+-a----        06/03/2026     16:33            403 host-env-security-policy.json                                        
+-a----        06/03/2026     16:33           2374 host-env-security.policy-parity.test.ts                              
+-a----        06/03/2026     16:33           5772 host-env-security.test.ts                                            
+-a----        06/03/2026     16:33           4423 host-env-security.ts                                                 
+-a----        06/03/2026     16:33           5382 http-body.test.ts                                                    
+-a----        06/03/2026     16:33           9553 http-body.ts                                                         
+-a----        06/03/2026     16:33           5216 infra-parsing.test.ts                                                
+-a----        06/03/2026     16:33          10426 infra-runtime.test.ts                                                
+-a----        06/03/2026     16:33           7551 infra-store.test.ts                                                  
+-a----        06/03/2026     16:33           4156 install-flow.test.ts                                                 
+-a----        06/03/2026     16:33           1888 install-flow.ts                                                      
+-a----        06/03/2026     16:33           1460 install-from-npm-spec.ts                                             
+-a----        06/03/2026     16:33           1343 install-mode-options.test.ts                                         
+-a----        06/03/2026     16:33            958 install-mode-options.ts                                              
+-a----        06/03/2026     16:33           5110 install-package-dir.ts                                               
+-a----        06/03/2026     16:33           2363 install-safe-path.test.ts                                            
+-a----        06/03/2026     16:33           3292 install-safe-path.ts                                                 
+-a----        06/03/2026     16:33           8739 install-source-utils.test.ts                                         
+-a----        06/03/2026     16:33           6901 install-source-utils.ts                                              
+-a----        06/03/2026     16:33           1405 install-target.ts                                                    
+-a----        06/03/2026     16:33           2041 is-main.ts                                                           
+-a----        06/03/2026     16:33            623 json-file.ts                                                         
+-a----        06/03/2026     16:33           2115 json-files.ts                                                        
+-a----        06/03/2026     16:33            600 json-utf8-bytes.test.ts                                              
+-a----        06/03/2026     16:33            196 json-utf8-bytes.ts                                                   
+-a----        06/03/2026     16:33           1451 jsonl-socket.ts                                                      
+-a----        06/03/2026     16:33           1295 machine-name.ts                                                      
+-a----        06/03/2026     16:33            330 map-size.ts                                                          
+-a----        06/03/2026     16:33            350 node-commands.ts                                                     
+-a----        06/03/2026     16:33           2677 node-pairing.test.ts                                                 
+-a----        06/03/2026     16:33           8501 node-pairing.ts                                                      
+-a----        06/03/2026     16:33            292 node-shell.ts                                                        
+-a----        06/03/2026     16:33           3345 npm-integrity.test.ts                                                
+-a----        06/03/2026     16:33           3042 npm-integrity.ts                                                     
+-a----        06/03/2026     16:33           9324 npm-pack-install.test.ts                                             
+-a----        06/03/2026     16:33           4192 npm-pack-install.ts                                                  
+-a----        06/03/2026     16:33           1381 npm-registry-spec.ts                                                 
+-a----        06/03/2026     16:33           6196 openclaw-root.test.ts                                                
+-a----        06/03/2026     16:33           3594 openclaw-root.ts                                                     
+-a----        06/03/2026     16:33            911 os-summary.ts                                                        
+-a----        06/03/2026     16:33            725 package-json.ts                                                      
+-a----        06/03/2026     16:33            399 package-tag.ts                                                       
+-a----        06/03/2026     16:33           1553 pairing-files.ts                                                     
+-a----        06/03/2026     16:33            815 pairing-pending.ts                                                   
+-a----        06/03/2026     16:33            394 pairing-token.ts                                                     
+-a----        06/03/2026     16:33           2530 path-alias-guards.test.ts                                            
+-a----        06/03/2026     16:33           1064 path-alias-guards.ts                                                 
+-a----        06/03/2026     16:33           6506 path-env.test.ts                                                     
+-a----        06/03/2026     16:33           4044 path-env.ts                                                          
+-a----        06/03/2026     16:33           1871 path-guards.ts                                                       
+-a----        06/03/2026     16:33           2121 path-prepend.ts                                                      
+-a----        06/03/2026     16:33            615 path-safety.test.ts                                                  
+-a----        06/03/2026     16:33            385 path-safety.ts                                                       
+-a----        06/03/2026     16:33            590 plain-object.test.ts                                                 
+-a----        06/03/2026     16:33            321 plain-object.ts                                                      
+-a----        06/03/2026     16:33           2393 ports-format.ts                                                      
+-a----        06/03/2026     16:33          10697 ports-inspect.ts                                                     
+-a----        06/03/2026     16:33            833 ports-lsof.ts                                                        
+-a----        06/03/2026     16:33            637 ports-probe.ts                                                       
+-a----        06/03/2026     16:33            430 ports-types.ts                                                       
+-a----        06/03/2026     16:33           5942 ports.test.ts                                                        
+-a----        06/03/2026     16:33           3060 ports.ts                                                             
+-a----        06/03/2026     16:33           5552 process-respawn.test.ts                                              
+-a----        06/03/2026     16:33           2120 process-respawn.ts                                                   
+-a----        06/03/2026     16:33            181 prototype-keys.ts                                                    
+-a----        06/03/2026     16:33          12656 provider-usage.auth.normalizes-keys.test.ts                          
+-a----        06/03/2026     16:33           7162 provider-usage.auth.ts                                               
+-a----        06/03/2026     16:33           6657 provider-usage.fetch.claude.test.ts                                  
+-a----        06/03/2026     16:33           4903 provider-usage.fetch.claude.ts                                       
+-a----        06/03/2026     16:33           3870 provider-usage.fetch.codex.test.ts                                   
+-a----        06/03/2026     16:33           3448 provider-usage.fetch.codex.ts                                        
+-a----        06/03/2026     16:33           1391 provider-usage.fetch.copilot.test.ts                                 
+-a----        06/03/2026     16:33           1764 provider-usage.fetch.copilot.ts                                      
+-a----        06/03/2026     16:33           1649 provider-usage.fetch.gemini.test.ts                                  
+-a----        06/03/2026     16:33           2082 provider-usage.fetch.gemini.ts                                       
+-a----        06/03/2026     16:33           4577 provider-usage.fetch.minimax.test.ts                                 
+-a----        06/03/2026     16:33           9378 provider-usage.fetch.minimax.ts                                      
+-a----        06/03/2026     16:33           1086 provider-usage.fetch.shared.test.ts                                  
+-a----        06/03/2026     16:33           1719 provider-usage.fetch.shared.ts                                       
+-a----        06/03/2026     16:33            410 provider-usage.fetch.ts                                              
+-a----        06/03/2026     16:33           2517 provider-usage.fetch.zai.test.ts                                     
+-a----        06/03/2026     16:33           2353 provider-usage.fetch.zai.ts                                          
+-a----        06/03/2026     16:33           3499 provider-usage.format.test.ts                                        
+-a----        06/03/2026     16:33           3777 provider-usage.format.ts                                             
+-a----        06/03/2026     16:33           2960 provider-usage.load.ts                                               
+-a----        06/03/2026     16:33           1183 provider-usage.shared.test.ts                                        
+-a----        06/03/2026     16:33           1517 provider-usage.shared.ts                                             
+-a----        06/03/2026     16:33          14718 provider-usage.test.ts                                               
+-a----        06/03/2026     16:33            389 provider-usage.ts                                                    
+-a----        06/03/2026     16:33            487 provider-usage.types.ts                                              
+-a----        06/03/2026     16:33           6668 push-apns.test.ts                                                    
+-a----        06/03/2026     16:33          14380 push-apns.ts                                                         
+-a----        06/03/2026     16:33           4915 restart-sentinel.test.ts                                             
+-a----        06/03/2026     16:33           4217 restart-sentinel.ts                                                  
+-a----        06/03/2026     16:33          33759 restart-stale-pids.test.ts                                           
+-a----        06/03/2026     16:33          11035 restart-stale-pids.ts                                                
+-a----        06/03/2026     16:33           3306 restart.test.ts                                                      
+-a----        06/03/2026     16:33          14960 restart.ts                                                           
+-a----        06/03/2026     16:33           3556 retry-policy.ts                                                      
+-a----        06/03/2026     16:33           3099 retry.test.ts                                                        
+-a----        06/03/2026     16:33           3943 retry.ts                                                             
+-a----        06/03/2026     16:33           2436 run-node.test.ts                                                     
+-a----        06/03/2026     16:33           2679 runtime-guard.test.ts                                                
+-a----        06/03/2026     16:33           2505 runtime-guard.ts                                                     
+-a----        06/03/2026     16:33            671 runtime-status.ts                                                    
+-a----        06/03/2026     16:33           1539 safe-open-sync.test.ts                                               
+-a----        06/03/2026     16:33           3333 safe-open-sync.ts                                                    
+-a----        06/03/2026     16:33            922 scp-host.test.ts                                                     
+-a----        06/03/2026     16:33           1622 scp-host.ts                                                          
+-a----        06/03/2026     16:33            605 scripts-modules.d.ts                                                 
+-a----        06/03/2026     16:33            685 secure-random.test.ts                                                
+-a----        06/03/2026     16:33            240 secure-random.ts                                                     
+-a----        06/03/2026     16:33          13723 session-cost-usage.test.ts                                           
+-a----        06/03/2026     16:33          31776 session-cost-usage.ts                                                
+-a----        06/03/2026     16:33           3600 session-cost-usage.types.ts                                          
+-a----        06/03/2026     16:33           2786 session-maintenance-warning.test.ts                                  
+-a----        06/03/2026     16:33           4014 session-maintenance-warning.ts                                       
+-a----        06/03/2026     16:33           9485 shell-env.test.ts                                                    
+-a----        06/03/2026     16:33           6801 shell-env.ts                                                         
+-a----        06/03/2026     16:33           1284 shell-inline-command.ts                                              
+-a----        06/03/2026     16:33           1005 skills-remote.test.ts                                                
+-a----        06/03/2026     16:33          10364 skills-remote.ts                                                     
+-a----        06/03/2026     16:33           2806 ssh-config.test.ts                                                   
+-a----        06/03/2026     16:33           2650 ssh-config.ts                                                        
+-a----        06/03/2026     16:33           5614 ssh-tunnel.ts                                                        
+-a----        06/03/2026     16:33           1273 stable-node-path.ts                                                  
+-a----        06/03/2026     16:33           1431 state-migrations.fs.ts                                               
+-a----        06/03/2026     16:33           1737 state-migrations.state-dir.test.ts                                   
+-a----        06/03/2026     16:33          30767 state-migrations.ts                                                  
+-a----        06/03/2026     16:33            549 supervisor-markers.ts                                                
+-a----        06/03/2026     16:33           4985 system-events.test.ts                                                
+-a----        06/03/2026     16:33           3256 system-events.ts                                                     
+-a----        06/03/2026     16:33            703 system-message.test.ts                                               
+-a----        06/03/2026     16:33            497 system-message.ts                                                    
+-a----        06/03/2026     16:33           2563 system-presence.test.ts                                              
+-a----        06/03/2026     16:33           8330 system-presence.ts                                                   
+-a----        06/03/2026     16:33           1959 system-presence.version.test.ts                                      
+-a----        06/03/2026     16:33           5914 system-run-approval-binding.ts                                       
+-a----        06/03/2026     16:33           3590 system-run-approval-context.ts                                       
+-a----        06/03/2026     16:33           1082 system-run-approval-mismatch.contract.test.ts                        
+-a----        06/03/2026     16:33           1480 system-run-command.contract.test.ts                                  
+-a----        06/03/2026     16:33           7644 system-run-command.test.ts                                           
+-a----        06/03/2026     16:33           5332 system-run-command.ts                                                
+-a----        06/03/2026     16:33            340 system-run-normalize.ts                                              
+-a----        06/03/2026     16:33           1523 tailnet.ts                                                           
+-a----        06/03/2026     16:33           7033 tailscale.test.ts                                                    
+-a----        06/03/2026     16:33          15931 tailscale.ts                                                         
+-a----        06/03/2026     16:33           9097 tmp-openclaw-dir.test.ts                                             
+-a----        06/03/2026     16:33           5227 tmp-openclaw-dir.ts                                                  
+-a----        06/03/2026     16:33           2444 transport-ready.test.ts                                              
+-a----        06/03/2026     16:33           1897 transport-ready.ts                                                   
+-a----        06/03/2026     16:33           5430 unhandled-rejections.fatal-detection.test.ts                         
+-a----        06/03/2026     16:33           6053 unhandled-rejections.test.ts                                         
+-a----        06/03/2026     16:33           6786 unhandled-rejections.ts                                              
+-a----        06/03/2026     16:33            667 update-channels.test.ts                                              
+-a----        06/03/2026     16:33           3320 update-channels.ts                                                   
+-a----        06/03/2026     16:33           2637 update-check.test.ts                                                 
+-a----        06/03/2026     16:33          13308 update-check.ts                                                      
+-a----        06/03/2026     16:33           5371 update-global.ts                                                     
+-a----        06/03/2026     16:33          21248 update-runner.test.ts                                                
+-a----        06/03/2026     16:33          26551 update-runner.ts                                                     
+-a----        06/03/2026     16:33          12472 update-startup.test.ts                                               
+-a----        06/03/2026     16:33          16137 update-startup.ts                                                    
+-a----        06/03/2026     16:33           1741 voicewake.ts                                                         
+-a----        06/03/2026     16:33           3084 warning-filter.test.ts                                               
+-a----        06/03/2026     16:33           2311 warning-filter.ts                                                    
+-a----        06/03/2026     16:33           2911 watch-node.test.ts                                                   
+-a----        06/03/2026     16:33           1741 widearea-dns.test.ts                                                 
+-a----        06/03/2026     16:33           6357 widearea-dns.ts                                                      
+-a----        06/03/2026     16:33            538 ws.ts                                                                
+-a----        06/03/2026     16:33           1460 wsl.ts                                                               
+
+=== find /path/to/openclaw -type f -name "types.tools.js" -o -name "diagnostic-session-state.js" -o -name "subsystem.js" -o -name "utils.js" | head -20 ===
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\@anthropic-ai\sdk\internal
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     12:30            653 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\@nangohq\node\dist
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        14/04/2026     17:12           1904 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\@supabase\phoenix\assets\js\phoenix
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        19/04/2026     10:54            314 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\axios\lib\platform\common
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        14/04/2026     17:12           1603 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\axios\lib
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        14/04/2026     17:12          23296 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\body-parser\lib
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20           2031 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\braces\lib
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20           2518 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\express\lib
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20           5293 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\json-schema-to-ts\lib\cjs\parse-schema\references
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     12:30            113 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\json-schema-to-ts\lib\cjs\parse-schema
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     12:30            113 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\json-schema-to-ts\lib\esm\parse-schema\references
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     12:30             44 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\json-schema-to-ts\lib\esm\parse-schema
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     12:30             44 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\json-schema-to-ts\lib\types\parse-schema\references
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     12:30             11 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\json-schema-to-ts\lib\types\parse-schema
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     12:30             11 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\openai\internal\qs
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20           7618 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\openai\internal
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20            653 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\picomatch\lib
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20           1885 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\playwright\lib\mcp\browser\tools
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20           3326 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\playwright\node_modules\playwright-core\lib
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20           6392 utils.js                                                             
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\playwright-core\lib\tools\backend
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        04/04/2026     16:20           2916 utils.js                                                             
+
+=== find /path/to/openclaw -type f -name "types.agent-defaults.js" -o -name "retry.js" -o -name "defaults.js" -o -name "session-transcript-repair.js" | head -20 ===
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\@babel\runtime\helpers\esm
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     12:30            296 defaults.js                                                          
+
+
+Directory: C:\Users\manol\openclaw-2.0-manolis\node_modules\@babel\runtime\helpers
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        23/04/2026     16:33            369 defaults.js                                                          
+
+</content>
+<parameter name="filePath">manolis-logs.txt
