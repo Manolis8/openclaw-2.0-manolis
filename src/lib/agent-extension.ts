@@ -750,66 +750,34 @@ async function planTask(prompt: string, url?: string): Promise<string> {
       messages: [
         {
           role: 'system',
-          content: `You are writing a task plan where the agent must VERIFY each action before doing it.
+          content: `
+          
+          Find my first GitHub repository.
 
-Format:
+CRITICAL:
 
-### OBJECTIVE
-[What are we trying to do?]
-
-### STEP-BY-STEP (with verification)
-
-1. [Action to take]
-   Before you do this, verify: [What should you see that proves this is the right element?]
-   After you do this, verify: [What should change on screen to prove it worked?]
-
-2. [Next action]
-   Before you do this, verify: [What proves this is correct?]
-   After you do this, verify: [What should happen?]
-
-[Continue for all steps]
-
-Rules:
-- EVERY step must have BEFORE and AFTER verification
-- BEFORE verification: Describe what proves you found the RIGHT element (not a decoy)
-  - Right element: Has your username, repo name, or clear label
-  - Decoy: Someone else's profile, ads, recommendations
-- AFTER verification: Describe exactly what the screen should look like after success
-- If you don't see the expected result → something went wrong, tell the agent to take a snapshot and reconsider
-- Be VERY specific about location on screen (top right, bottom of page, etc.)
-- If the plan might be outdated: "If you can't find this element, look for [alternative that serves same purpose]"
-
-CRITICAL: Always end the plan with a final step that tells the agent to STOP and REPORT.
-
-Example final step for "find" tasks:
-
-N. Report what you found
-   Before: Confirm you can see the item/information on screen
-   After: Call task_complete with the name/details. DO NOT click any other buttons like Settings, Delete, or Config.
-
-Example final step for "click" tasks:
-
-N. Verify the action completed
-   Before: Confirm the page shows the expected result
-   After: Call task_complete with confirmation. DO NOT explore further or click additional buttons.
-
-Example full plan:
-
-1. Click on your profile picture in the top right corner
-   Before: Look for a small circular image with your face in the very top right corner of the page
-   After: A dropdown menu should appear with options like "Your repositories" or "Settings"
-
-2. Select "Your repositories"
-   Before: Look for the "Your repositories" option in the dropdown menu
-   After: You should see a list of all your repositories with names and dates
-
-3. Locate your first repository
-   Before: Ensure the list shows repositories sorted by creation date with the oldest at the bottom
-   After: Identify the first repository you created and note its name
-
-4. Report the first repository
-   Before: Confirm you can see the repository name clearly
-   After: Call task_complete("Found first repository: [name]"). DO NOT click into the repository, Settings, or Delete buttons.`
+•
+Navigate to github.com
+•
+Click your profile
+•
+Click "Your repositories"
+•
+Sort by creation date
+•
+Find the OLDEST repository (the first one you created)
+•
+Tell me its exact name
+•
+DO NOT click into it
+•
+DO NOT access settings
+•
+DO NOT click any delete buttons
+•
+STOP immediately after finding it
+          
+          `
         },
         {
           role: 'user',
