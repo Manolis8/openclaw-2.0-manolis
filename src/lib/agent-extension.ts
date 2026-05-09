@@ -846,7 +846,7 @@ async function runAgentLoop(opts: {
       for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
         try {
           response = await grok.chat.completions.create({  // ← Use 'grok' not 'openai'
-            model: 'grok-4.1-fast',
+            model: 'grok-4-1-fast-non-reasoning',
             messages: trimMessages(messages),
             tools: browserTools,
             tool_choice: 'auto',
@@ -859,7 +859,7 @@ async function runAgentLoop(opts: {
             continue
           }
           throw err
-        }
+        } 
       }
       
       if (!response) {
