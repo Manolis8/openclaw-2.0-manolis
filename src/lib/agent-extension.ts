@@ -826,7 +826,7 @@ Example full plan:
   } catch {
     return ''
   }
-}
+} 
 
 async function runAgentLoop(opts: {
   userId: string
