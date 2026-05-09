@@ -16,7 +16,10 @@ const runningTasks = new Set<string>()
 
 // ─── Types (from OpenClaw pw-session.ts) ─────────────────────────────────────
 
-
+const grok = new OpenAI({
+  apiKey: process.env.GROK_API_KEY,
+  baseURL: 'https://api.x.ai/v1',
+})
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -839,11 +842,11 @@ async function runAgentLoop(opts: {
       if (opts.abortSignal?.aborted) return { success: false, summary: 'Task stopped by user.' }
       iterations++
 
-      let response
-      for (let attempt = 0; attempt < 3; attempt++) {
+      let response: OpenAI.Chat.ChatCompletion | undefined
+      for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
         try {
-          response = await openai.chat.completions.create({
-            model: 'gpt-4.1-mini',
+          response = await grok.chat.completions.create({  // ← Use 'grok' not 'openai'
+            model: 'grok-4.1-fast',
             messages: trimMessages(messages),
             tools: browserTools,
             tool_choice: 'auto',
@@ -851,13 +854,18 @@ async function runAgentLoop(opts: {
           })
           break
         } catch (err: any) {
-          if (err?.status === 429 && attempt < 2) {
+          if (err?.status === 429 && retryAttempt < 2) {
             await new Promise(r => setTimeout(r, 3000))
             continue
           }
           throw err
         }
       }
+      
+      if (!response) {
+        throw new Error('No response after 3 retries')
+      }
+      
       console.log(`[tokens] model=${response.model} prompt=${response.usage?.prompt_tokens} completion=${response.usage?.completion_tokens} total=${response.usage?.total_tokens}`)
       if (!response) throw new Error('Failed after retries')
 
