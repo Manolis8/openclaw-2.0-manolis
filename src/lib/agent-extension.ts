@@ -5,6 +5,7 @@ import { chromium, type Browser, type Page } from 'playwright-core'
 import { supabase } from './supabase.js'
 import { getRelayPortForUser } from '../index.js'
 import { detectLoop } from '../routes/tasks.js'
+import { compactMessages, logTokenUsage } from './compaction.js'
 
 // Use OpenClaw's exact functions from src/browser/
 import { snapshotRoleViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
@@ -24,6 +25,123 @@ const grok = new OpenAI({
 // ─── State ───────────────────────────────────────────────────────────────────
 
 
+
+
+// compaction.ts
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4)
+}
+
+function estimateMessageTokens(msg: any): number {
+  const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+  return estimateTokens(content) + (msg.tool_calls ? estimateTokens(JSON.stringify(msg.tool_calls)) : 0)
+}
+
+function estimateMessagesTokens(messages: any[]): number {
+  return messages.reduce((sum, msg) => sum + estimateMessageTokens(msg), 0)
+}
+
+function stripSnapshotDetails(messages: any[]): any[] {
+  // Remove verbose snapshot data, keep only action summaries
+  return messages.map(msg => {
+    if (msg.role === 'assistant' && typeof msg.content === 'string') {
+      // Extract key info: what action did agent take?
+      let summary = msg.content
+      
+      // Remove full snapshot data
+      summary = summary.replace(/\[snapshot:openclaw\].*/g, '[snapshot: taken]')
+      summary = summary.replace(/refs=\d+.*?interactive=true/g, '[refs available]')
+      
+      return { ...msg, content: summary }
+    }
+    return msg
+  })
+}
+
+
+
+function summarizeOldMessages(messages: any[]): string {
+  // Convert old messages to action summary
+  const actions: string[] = []
+  
+  for (const msg of messages) {
+    if (msg.role === 'assistant') {
+      const content = typeof msg.content === 'string' ? msg.content : ''
+      
+      if (content.includes('🖱️ Clicking')) {
+        const match = content.match(/Clicking (\w+)/)
+        actions.push(`Clicked ${match?.[1] || 'element'}`)
+      } else if (content.includes('⌨️ Typing')) {
+        actions.push(`Typed text into field`)
+      } else if (content.includes('🌐 Navigating')) {
+        const match = content.match(/Navigating to (.+?)\.\.\./)
+        actions.push(`Navigated to ${match?.[1] || 'page'}`)
+      } else if (content.includes('📸 Reading')) {
+        actions.push(`Read page content`)
+      } else if (content.includes('✅')) {
+        const match = content.match(/✅ (.+)/)
+        actions.push(`Completed: ${match?.[1] || 'action'}`)
+      }
+    }
+  }
+  
+  return `Prior actions: ${actions.slice(-10).join(' → ')}`
+}
+
+export function compactMessages(
+  messages: any[],
+  maxTokens: number = 8000,
+  keepRecentCount: number = 10
+): any[] {
+  if (messages.length === 0) return messages
+  
+  const totalTokens = estimateMessagesTokens(messages)
+  
+  // If under budget, return as-is (with snapshots stripped)
+  if (totalTokens <= maxTokens) {
+    return stripSnapshotDetails(messages)
+  }
+  
+  const systemMsg = messages[0]  // Always keep system prompt
+  const rest = messages.slice(1)
+  
+  // Keep last N messages (recent context)
+  const recentCount = Math.min(keepRecentCount, rest.length)
+  const recentMsgs = rest.slice(-recentCount)
+  const oldMsgs = rest.slice(0, -recentCount)
+  
+  // If no old messages to compress, just return recent ones
+  if (oldMsgs.length === 0) {
+    return [systemMsg, ...stripSnapshotDetails(recentMsgs)]
+  }
+  
+  // Summarize old messages into a single context message
+  const historySummary = summarizeOldMessages(oldMsgs)
+  
+  const compacted = [
+    systemMsg,
+    {
+      role: 'user',
+      content: historySummary
+    },
+    ...stripSnapshotDetails(recentMsgs)
+  ]
+  
+  const compactedTokens = estimateMessagesTokens(compacted)
+  
+  // If still over budget, drop older recent messages
+  if (compactedTokens > maxTokens && recentMsgs.length > 3) {
+    const furtherReduced = compacted.slice(0, 2).concat(compacted.slice(-3))
+    return furtherReduced
+  }
+  
+  return compacted
+}
+
+export function logTokenUsage(messages: any[], label: string = 'Messages'): void {
+  const tokens = estimateMessagesTokens(messages)
+  console.log(`[tokens] ${label}: ${messages.length} messages, ~${tokens} tokens`)
+}
 
 type ConnectedBrowser = { browser: Browser; port: number }
 const connections = new Map<string, ConnectedBrowser>()
@@ -745,6 +863,20 @@ function cleanContext(context?: string): string {
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
 
+const compactedMessages = compactMessages(messages, 8000, 10)
+logTokenUsage(compactedMessages, 'Compacted')
+
+response = await grok.chat.completions.create({
+  model: 'grok-4-1-fast-non-reasoning',
+  messages: compactedMessages,
+  tools: browserTools,
+  tool_choice: 'auto',
+  max_tokens: 500,
+})
+
+
+
+
 async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
@@ -753,37 +885,27 @@ async function planTask(prompt: string, url?: string): Promise<string> {
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation planner. Your job is to create a CLEAR step-by-step plan that:
+          content: `You are a browser automation planner. Create a clear step-by-step plan.
 
-1. DEFINES SUCCESS - What exactly should the agent report when done?
-2. SPECIFIES ACTIONS - Exact clicks, types, navigation
-3. ENDS WITH COMPLETION - How to call task_complete with the right result
+RULES:
+1. Be SPECIFIC about what the user wants
+2. Clarify ambiguous terms:
+   - "First" could mean oldest, newest, or top of list - clarify which
+   - "Find X" - define what information to report about X
+3. DO NOT include unnecessary steps
+4. Define SUCCESS before the plan - what exactly to report
+5. End with FINAL STEP showing exact result format
 
-Format your plan like this:
+Format:
 
 ### OBJECTIVE
-[What the user wants]
+[What user actually wants]
 
 ### SUCCESS CRITERIA
-When you complete this plan, you MUST report:
-- [Specific thing 1]
-- [Specific thing 2]
-- [How to format the result]
+Report exactly:
+[Example format]
 
-### STEP-BY-STEP ACTIONS
-1. [Navigate to X]
-2. [Click Y button]
-3. [Read the Z information]
-...
-FINAL STEP: Call task_complete("exact result here")
-
-IMPORTANT:
-- Be SPECIFIC: "Click the 'Sign In' button in the top right" not "log in"
-- Define the EXACT result format
-- Example: task_complete("Found repo: openclaw-2.0-manolis, created 2024-01-15")
-- The FINAL STEP must show EXACTLY what to pass to task_complete
-- Do NOT include vague steps like "explore" or "check for more"
-- After the FINAL STEP, the agent should STOP - no more actions`
+FINAL STEP: Call task_complete("[exact result]")`
         },
         {
           role: 'user',
@@ -847,24 +969,28 @@ async function runAgentLoop(opts: {
       iterations++
 
       let response: OpenAI.Chat.ChatCompletion | undefined
-      for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
-        try {
-          response = await grok.chat.completions.create({  // ← Use 'grok' not 'openai'
-            model: 'grok-4-1-fast-non-reasoning',
-            messages: trimMessages(messages),
-            tools: browserTools,
-            tool_choice: 'auto',
-            max_tokens: 500,
-          })
-          break
-        } catch (err: any) {
-          if (err?.status === 429 && retryAttempt < 2) {
-            await new Promise(r => setTimeout(r, 3000))
-            continue
-          }
-          throw err
-        } 
-      }
+for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
+  try {
+    // Compact messages before sending
+    const compactedMessages = compactMessages(messages, 8000, 10)
+    logTokenMetrics(compactedMessages, 'Before API call')
+    
+    response = await grok.chat.completions.create({
+      model: 'grok-4-1-fast-non-reasoning',
+      messages: compactedMessages,  // ← Use compacted, not trimMessages
+      tools: browserTools,
+      tool_choice: 'auto',
+      max_tokens: 500,
+    })
+    break
+  } catch (err: any) {
+    if (err?.status === 429 && retryAttempt < 2) {
+      await new Promise(r => setTimeout(r, 3000))
+      continue
+    }
+    throw err
+  }
+}
       
       if (!response) {
         throw new Error('No response after 3 retries')
