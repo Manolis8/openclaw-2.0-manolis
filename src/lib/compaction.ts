@@ -13,16 +13,11 @@ function estimateMessagesTokens(messages: any[]): number {
 }
 
 function stripSnapshotDetails(messages: any[]): any[] {
-  // Remove verbose snapshot data, keep only action summaries
   return messages.map(msg => {
     if (msg.role === 'assistant' && typeof msg.content === 'string') {
-      // Extract key info: what action did agent take?
       let summary = msg.content
-      
-      // Remove full snapshot data
       summary = summary.replace(/\[snapshot:openclaw\].*/g, '[snapshot: taken]')
       summary = summary.replace(/refs=\d+.*?interactive=true/g, '[refs available]')
-      
       return { ...msg, content: summary }
     }
     return msg
@@ -30,13 +25,10 @@ function stripSnapshotDetails(messages: any[]): any[] {
 }
 
 function summarizeOldMessages(messages: any[]): string {
-  // Convert old messages to action summary
   const actions: string[] = []
-  
   for (const msg of messages) {
     if (msg.role === 'assistant') {
       const content = typeof msg.content === 'string' ? msg.content : ''
-      
       if (content.includes('🖱️ Clicking')) {
         const match = content.match(/Clicking (\w+)/)
         actions.push(`Clicked ${match?.[1] || 'element'}`)
@@ -53,7 +45,6 @@ function summarizeOldMessages(messages: any[]): string {
       }
     }
   }
-  
   return `Prior actions: ${actions.slice(-10).join(' → ')}`
 }
 
@@ -61,33 +52,29 @@ export function compactMessages(
   messages: any[],
   maxTokens: number = 8000,
   keepRecentCount: number = 10
-): any[] {
+): any[] {  // ← EXPLICIT return type
   if (messages.length === 0) return messages
   
   const totalTokens = estimateMessagesTokens(messages)
   
-  // If under budget, return as-is (with snapshots stripped)
   if (totalTokens <= maxTokens) {
     return stripSnapshotDetails(messages)
   }
   
-  const systemMsg = messages[0]  // Always keep system prompt
+  const systemMsg = messages[0]
   const rest = messages.slice(1)
   
-  // Keep last N messages (recent context)
   const recentCount = Math.min(keepRecentCount, rest.length)
   const recentMsgs = rest.slice(-recentCount)
   const oldMsgs = rest.slice(0, -recentCount)
   
-  // If no old messages to compress, just return recent ones
   if (oldMsgs.length === 0) {
     return [systemMsg, ...stripSnapshotDetails(recentMsgs)]
   }
   
-  // Summarize old messages into a single context message
   const historySummary = summarizeOldMessages(oldMsgs)
   
-  const compacted = [
+  const compacted: any[] = [  // ← EXPLICIT type
     systemMsg,
     {
       role: 'user',
@@ -98,7 +85,6 @@ export function compactMessages(
   
   const compactedTokens = estimateMessagesTokens(compacted)
   
-  // If still over budget, drop older recent messages
   if (compactedTokens > maxTokens && recentMsgs.length > 3) {
     const furtherReduced = compacted.slice(0, 2).concat(compacted.slice(-3))
     return furtherReduced
