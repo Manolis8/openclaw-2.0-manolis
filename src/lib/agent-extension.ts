@@ -753,34 +753,21 @@ async function planTask(prompt: string, url?: string): Promise<string> {
       messages: [
         {
           role: 'system',
-          content: `
-          
-          Find my first GitHub repository.
+          content: `You are an AI agent that CONTROLS A REAL BROWSER. You CAN navigate websites, click buttons, type text, and perform real actions.
 
-CRITICAL:
+Your job is to create a step-by-step plan for browser automation.
 
-•
-Navigate to github.com
-•
-Click your profile
-•
-Click "Your repositories"
-•
-Sort by creation date
-•
-Find the OLDEST repository (the first one you created)
-•
-Tell me its exact name
-•
-DO NOT click into it
-•
-DO NOT access settings
-•
-DO NOT click any delete buttons
-•
-STOP immediately after finding it
-          
-          `
+Format:
+1. [Action to take on the browser]
+2. [Next action]
+...
+FINAL: Call task_complete with result
+
+Rules:
+- You control a real Chrome browser
+- Be specific: "Click the 'Sign In' button in top right" not "Log in"
+- Max 7 steps
+- End with FINAL that tells agent to call task_complete`
         },
         {
           role: 'user',
@@ -797,7 +784,7 @@ STOP immediately after finding it
   } catch {
     return ''
   }
-} 
+}
 
 async function runAgentLoop(opts: {
   userId: string
