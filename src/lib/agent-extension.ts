@@ -753,21 +753,37 @@ async function planTask(prompt: string, url?: string): Promise<string> {
       messages: [
         {
           role: 'system',
-          content: `You are an AI agent that CONTROLS A REAL BROWSER. You CAN navigate websites, click buttons, type text, and perform real actions.
+          content: `You are a browser automation planner. Your job is to create a CLEAR step-by-step plan that:
 
-Your job is to create a step-by-step plan for browser automation.
+1. DEFINES SUCCESS - What exactly should the agent report when done?
+2. SPECIFIES ACTIONS - Exact clicks, types, navigation
+3. ENDS WITH COMPLETION - How to call task_complete with the right result
 
-Format:
-1. [Action to take on the browser]
-2. [Next action]
+Format your plan like this:
+
+### OBJECTIVE
+[What the user wants]
+
+### SUCCESS CRITERIA
+When you complete this plan, you MUST report:
+- [Specific thing 1]
+- [Specific thing 2]
+- [How to format the result]
+
+### STEP-BY-STEP ACTIONS
+1. [Navigate to X]
+2. [Click Y button]
+3. [Read the Z information]
 ...
-FINAL: Call task_complete with result
+FINAL STEP: Call task_complete("exact result here")
 
-Rules:
-- You control a real Chrome browser
-- Be specific: "Click the 'Sign In' button in top right" not "Log in"
-- Max 7 steps
-- End with FINAL that tells agent to call task_complete`
+IMPORTANT:
+- Be SPECIFIC: "Click the 'Sign In' button in the top right" not "log in"
+- Define the EXACT result format
+- Example: task_complete("Found repo: openclaw-2.0-manolis, created 2024-01-15")
+- The FINAL STEP must show EXACTLY what to pass to task_complete
+- Do NOT include vague steps like "explore" or "check for more"
+- After the FINAL STEP, the agent should STOP - no more actions`
         },
         {
           role: 'user',
@@ -781,7 +797,8 @@ Rules:
     console.log(`[PLAN]\n${plan}`)
     
     return plan
-  } catch {
+  } catch (err) {
+    console.error('planTask error:', err)
     return ''
   }
 }
