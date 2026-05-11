@@ -959,28 +959,30 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
             case 'browser_type': {
               consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
+              
               try {
                 const { page } = await getBrowser(opts.userId)
                 
-                // Focus on the input field by clicking it first
-                await page.keyboard.press('Tab')  // Move focus
-                await new Promise(r => setTimeout(r, 100))
+                // 1. CLICK the input first to focus it
+                const inputLocator = page.locator('input, textarea, [contenteditable="true"]').first()
+                await inputLocator.click({ timeout: 3000 }).catch(() => {})
+                await new Promise(r => setTimeout(r, 150))
                 
-                // CLEAR any existing text before typing
+                // 2. CLEAR existing text with keyboard (Ctrl+A + Backspace)
                 await page.keyboard.press('Control+A')
-                await page.keyboard.press('Delete')
+                await page.keyboard.press('Backspace')
                 await new Promise(r => setTimeout(r, 200))
                 
-                // NOW type slowly into the cleared field
+                // 3. NOW type fresh text slowly
                 await typeInRef(opts.userId, args.ref, args.text)
                 
                 if (args.submit) {
-                  await new Promise(r => setTimeout(r, 300))
                   await pressKey('Enter', opts.userId)
                 }
                 
                 await new Promise(r => setTimeout(r, 800))
                 
+                // Auto-click submit button via CDP
                 try {
                   await clickSubmitViaCDP(opts.userId)
                   console.log(`[browser_type] auto-clicked submit after typing`)
@@ -989,7 +991,8 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
                   console.log(`[browser_type] auto-click submit failed: ${err}`)
                 }
                 
-                result = `Cleared field, typed "${args.text}" slowly into ${args.ref}. Call browser_snapshot to verify.`
+                const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
+                result = `Cleared field, typed "${args.text}" slowly into the input, and clicked submit. Call browser_snapshot to verify the page changed.`
               } catch (err) {
                 result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
