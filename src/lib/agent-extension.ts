@@ -962,18 +962,23 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
               try {
                 const { page } = await getBrowser(opts.userId)
                 
-                // Focus on the input field by clicking it first
-                await page.keyboard.press('Tab')  // Move focus
-                await new Promise(r => setTimeout(r, 100))
-                
-                // CLEAR any existing text before typing
-                await page.keyboard.press('Control+A')
-                await page.keyboard.press('Delete')
+                // Step 1: Click the input to focus it
+                await page.locator(`input, textarea, [contenteditable="true"]`).first().click({ timeout: 3000 }).catch(() => {})
                 await new Promise(r => setTimeout(r, 200))
                 
-                // NOW type slowly into the cleared field
+                // Step 2: Check if field has existing text and clear it
+                const currentValue = await page.locator('input, textarea').first().inputValue().catch(() => '')
+                if (currentValue && currentValue.length > 0) {
+                  // Field has text - clear it with Ctrl+A + Delete
+                  await page.keyboard.press('Control+A')
+                  await page.keyboard.press('Delete')
+                  await new Promise(r => setTimeout(r, 200))
+                }
+                
+                // Step 3: Type the new text slowly
                 await typeInRef(opts.userId, args.ref, args.text)
                 
+                // Step 4: Submit if requested
                 if (args.submit) {
                   await new Promise(r => setTimeout(r, 300))
                   await pressKey('Enter', opts.userId)
@@ -981,6 +986,7 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
                 
                 await new Promise(r => setTimeout(r, 800))
                 
+                // Step 5: Try to click submit button
                 try {
                   await clickSubmitViaCDP(opts.userId)
                   console.log(`[browser_type] auto-clicked submit after typing`)
@@ -989,7 +995,7 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
                   console.log(`[browser_type] auto-click submit failed: ${err}`)
                 }
                 
-                result = `Cleared field, typed "${args.text}" slowly into ${args.ref}. Call browser_snapshot to verify.`
+                result = `Clicked input, cleared existing text if any, typed "${args.text}" slowly, and submitted. Call browser_snapshot to verify the page changed.`
               } catch (err) {
                 result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
