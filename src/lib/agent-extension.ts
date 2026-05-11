@@ -960,10 +960,25 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
               await opts.onProgress('📸 Reading page...')
               const snap = await snapshotPage(opts.userId, opts.tabKey, true)
               
-              if (consecutiveSnapshots >= 3) {
+              // Get field info from the page
+              const { page } = await getBrowser(opts.userId)
+              const fieldInfo = await page.evaluate(() => {
+                const inputs = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'))
+                return inputs.map(inp => ({
+                  placeholder: (inp as any).placeholder || '',
+                  value: (inp as any).value || '',
+                  label: (inp as any).getAttribute('aria-label') || '',
+                  nearbyText: inp.parentElement?.innerText?.slice(0, 200) || ''
+                }))
+              }).catch(() => [])
+              
+              if (fieldInfo.length > 0) {
+                console.log(`[browser_snapshot] found inputs:`, fieldInfo)
+                result = snap + `\n\nINPUT FIELDS ON PAGE:\n${fieldInfo.map((f, i) => `Field ${i}: placeholder="${f.placeholder}" label="${f.label}" nearby text="${f.nearbyText}"`).join('\n')}\n\nREAD THE NEARBY TEXT to understand what format to type.`
+              } else if (consecutiveSnapshots >= 3) {
                 result = snap + `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, or call task_failed.`
               } else {
-                result = snap + `\n\nREAD THE PAGE: If there's an input field, look at the label/placeholder/instructions next to it. Type EXACTLY what it asks for. Do NOT simplify or change the format.`
+                result = snap
               }
               break
             }
