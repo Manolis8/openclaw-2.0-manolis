@@ -188,6 +188,19 @@ async function typeViaCDP(userId: string, text: string, selector?: string): Prom
   const port = getRelayPortForUser(userId)
   const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
   const relayToken = await deriveRelayToken(token, port)
+  
+  // Clear first
+  const clearRes = await fetch(`http://127.0.0.1:${port}/clear-input`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-openclaw-relay-token': relayToken
+    },
+    body: JSON.stringify({ selector }),
+    signal: AbortSignal.timeout(10000)
+  }).catch(() => null)
+  
+  // Then type
   const res = await fetch(`http://127.0.0.1:${port}/type-input`, {
     method: 'POST',
     headers: {
@@ -225,20 +238,16 @@ async function typeInRef(userId: string, ref: string, text: string): Promise<voi
   const { cdpUrl, targetId, page } = await getBrowser(userId)
 
   try {
-    // Clear first using CDP/Playwright's internal focus
-    // Let typeViaPlaywright handle the focusing
-    await typeViaPlaywright({
-      cdpUrl,
-      targetId: targetId || undefined,
-      ref,
-      text: '',  // ← Clear with empty string first
-      slowly: false,
-      timeoutMs: 5000
-    }).catch(() => {})  // Ignore if it fails
-    
+    // CLEAR the field first (in case of retry/loop)
+    await page.keyboard.press('Control+A')
+    await page.keyboard.press('Backspace')
     await new Promise(r => setTimeout(r, 100))
-    
-    // NOW type the actual text
+  } catch (err) {
+    console.log(`[typeInRef] pre-clear skipped: ${err}`)
+  }
+
+  // Try OpenClaw's typeViaPlaywright first
+  try {
     await typeViaPlaywright({
       cdpUrl,
       targetId: targetId || undefined,
@@ -250,8 +259,12 @@ async function typeInRef(userId: string, ref: string, text: string): Promise<voi
     await new Promise(r => setTimeout(r, 300))
     return
   } catch (err) {
-    throw new Error(`Element ${ref} not found or not typeable: ${err instanceof Error ? err.message : String(err)}`)
+    console.log(`[typeInRef] playwright failed: ${err instanceof Error ? err.message.slice(0, 100) : err} — trying CDP`)
   }
+
+  // Fallback: type via CDP Input.insertText
+  await typeViaCDP(userId, text)
+  await new Promise(r => setTimeout(r, 300))
 }
 
 async function pressKey(key: string, userId: string): Promise<void> {
