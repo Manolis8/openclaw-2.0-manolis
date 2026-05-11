@@ -963,19 +963,26 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
               try {
                 const { page } = await getBrowser(opts.userId)
                 
-                // Let typeInRef handle clicking the right element by ref
-                // But FIRST try to clear if there's existing text
-                try {
-                  // Try keyboard clear on focused element
+                // ONLY clear if this is a RETRY (not first attempt)
+                // Check if there's already text in the field
+                const existingText = await page.evaluate(() => {
+                  const input = document.activeElement as HTMLInputElement | HTMLTextAreaElement
+                  return input?.value || ''
+                }).catch(() => '')
+                
+                if (existingText && existingText.length > 0) {
+                  // ONLY if field has existing text, clear it
+                  // 1. Click the input first to focus
+                  await page.locator('input, textarea, [contenteditable="true"]').first().click({ timeout: 2000 }).catch(() => {})
+                  await new Promise(r => setTimeout(r, 100))
+                  
+                  // 2. NOW clear with Ctrl+A + Backspace (input is focused)
                   await page.keyboard.press('Control+A')
                   await page.keyboard.press('Backspace')
                   await new Promise(r => setTimeout(r, 100))
-                } catch {
-                  // If that fails, typeInRef will handle it
-                  console.log(`[browser_type] pre-clear skipped, typeInRef will handle`)
                 }
                 
-                // This finds the right element by ref AND focuses it
+                // 3. Type the text (typeInRef handles focus if needed)
                 await typeInRef(opts.userId, args.ref, args.text)
                 
                 if (args.submit) await pressKey('Enter', opts.userId)
@@ -990,7 +997,7 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
                 }
                 
                 const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-                result = `Typed "${args.text}" into the input and clicked submit. Call browser_snapshot to verify.`
+                result = `Typed "${args.text}" into the input and automatically clicked the submit button. Call browser_snapshot to verify the page changed.`
               } catch (err) {
                 result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
