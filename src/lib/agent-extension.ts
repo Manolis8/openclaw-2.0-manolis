@@ -960,9 +960,19 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
               consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
               try {
+                const { page } = await getBrowser(opts.userId)
+                
+                // CLEAR the field first (select all + delete)
+                await page.locator(`[data-testid="react-select-input"]`).or(page.locator('input')).first().click()
+                await page.keyboard.press('Control+A')  // or Cmd+A on Mac
+                await page.keyboard.press('Backspace')
+                await new Promise(r => setTimeout(r, 100))
+                
+                // NOW type the text
                 await typeInRef(opts.userId, args.ref, args.text)
                 if (args.submit) await pressKey('Enter', opts.userId)
                 await new Promise(r => setTimeout(r, 800))
+                
                 try {
                   await clickSubmitViaCDP(opts.userId)
                   console.log(`[browser_type] auto-clicked submit after typing`)
@@ -970,7 +980,7 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
                 } catch (err) {
                   console.log(`[browser_type] auto-click submit failed: ${err}`)
                 }
-                result = `Typed "${args.text}" into the input and automatically clicked the submit button. Call browser_snapshot to verify the page changed.`
+                result = `Cleared field, typed "${args.text}", and clicked submit. Call browser_snapshot to verify.`
               } catch (err) {
                 result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
