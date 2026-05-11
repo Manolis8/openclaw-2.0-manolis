@@ -189,18 +189,7 @@ async function typeViaCDP(userId: string, text: string, selector?: string): Prom
   const token = process.env.OPENCLAW_GATEWAY_TOKEN || ''
   const relayToken = await deriveRelayToken(token, port)
   
-  // Clear first
-  const clearRes = await fetch(`http://127.0.0.1:${port}/clear-input`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-openclaw-relay-token': relayToken
-    },
-    body: JSON.stringify({ selector }),
-    signal: AbortSignal.timeout(10000)
-  }).catch(() => null)
-  
-  // Then type
+  // Type the text (field already cleared by typeInRef)
   const res = await fetch(`http://127.0.0.1:${port}/type-input`, {
     method: 'POST',
     headers: {
@@ -234,11 +223,17 @@ async function clickSubmitViaCDP(userId: string, selector?: string): Promise<voi
   console.log(`[clickSubmitViaCDP] status=${res.status} response=${responseText.slice(0, 200)}`)
   if (!res.ok) throw new Error(`clickSubmitViaCDP failed: ${responseText}`)
 }
+
+
 async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
   const { cdpUrl, targetId, page } = await getBrowser(userId)
 
   try {
-    // CLEAR the field first (in case of retry/loop)
+    // 1. CLICK the input first to focus it
+    await page.locator('input, textarea, [contenteditable="true"]').first().click({ timeout: 2000 }).catch(() => {})
+    await new Promise(r => setTimeout(r, 150))
+    
+    // 2. NOW clear (Ctrl+A works because input is focused)
     await page.keyboard.press('Control+A')
     await page.keyboard.press('Backspace')
     await new Promise(r => setTimeout(r, 100))
@@ -262,7 +257,7 @@ async function typeInRef(userId: string, ref: string, text: string): Promise<voi
     console.log(`[typeInRef] playwright failed: ${err instanceof Error ? err.message.slice(0, 100) : err} — trying CDP`)
   }
 
-  // Fallback: type via CDP Input.insertText
+  // Fallback: type via CDP
   await typeViaCDP(userId, text)
   await new Promise(r => setTimeout(r, 300))
 }
