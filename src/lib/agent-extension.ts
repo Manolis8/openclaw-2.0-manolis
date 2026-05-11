@@ -599,6 +599,14 @@ When you see BOTH a textbox AND a button in a dialog:
 - If button click has no effect — it means your typed text did not match exactly
 - Re-read what text is required and type it precisely
 
+## READ THE PAGE CAREFULLY
+Before typing:
+1. Take browser_snapshot to see the page
+2. READ all text and labels on screen
+3. Understand what format is expected
+4. Type EXACTLY what the page asks for
+5. Do NOT change or simplify the format
+
 ## Multi-Step Dialogs
 Many destructive actions have multiple confirmation stages:
 Stage 1: Click initial delete/remove button → new dialog appears
@@ -951,10 +959,11 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
               consecutiveSnapshots++
               await opts.onProgress('📸 Reading page...')
               const snap = await snapshotPage(opts.userId, opts.tabKey, true)
+              
               if (consecutiveSnapshots >= 3) {
                 result = snap + `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, or call task_failed.`
               } else {
-                result = snap
+                result = snap + `\n\nREAD THE PAGE: If there's an input field, look at the label/placeholder/instructions next to it. Type EXACTLY what it asks for. Do NOT simplify or change the format.`
               }
               break
             }
