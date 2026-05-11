@@ -963,26 +963,24 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
               try {
                 const { page } = await getBrowser(opts.userId)
                 
-                // 1. CLICK the input first to focus it
-                const inputLocator = page.locator('input, textarea, [contenteditable="true"]').first()
-                await inputLocator.click({ timeout: 3000 }).catch(() => {})
-                await new Promise(r => setTimeout(r, 150))
-                
-                // 2. CLEAR existing text with keyboard (Ctrl+A + Backspace)
-                await page.keyboard.press('Control+A')
-                await page.keyboard.press('Backspace')
-                await new Promise(r => setTimeout(r, 200))
-                
-                // 3. NOW type fresh text slowly
-                await typeInRef(opts.userId, args.ref, args.text)
-                
-                if (args.submit) {
-                  await pressKey('Enter', opts.userId)
+                // Let typeInRef handle clicking the right element by ref
+                // But FIRST try to clear if there's existing text
+                try {
+                  // Try keyboard clear on focused element
+                  await page.keyboard.press('Control+A')
+                  await page.keyboard.press('Backspace')
+                  await new Promise(r => setTimeout(r, 100))
+                } catch {
+                  // If that fails, typeInRef will handle it
+                  console.log(`[browser_type] pre-clear skipped, typeInRef will handle`)
                 }
                 
+                // This finds the right element by ref AND focuses it
+                await typeInRef(opts.userId, args.ref, args.text)
+                
+                if (args.submit) await pressKey('Enter', opts.userId)
                 await new Promise(r => setTimeout(r, 800))
                 
-                // Auto-click submit button via CDP
                 try {
                   await clickSubmitViaCDP(opts.userId)
                   console.log(`[browser_type] auto-clicked submit after typing`)
@@ -992,7 +990,7 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
                 }
                 
                 const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-                result = `Cleared field, typed "${args.text}" slowly into the input, and clicked submit. Call browser_snapshot to verify the page changed.`
+                result = `Typed "${args.text}" into the input and clicked submit. Call browser_snapshot to verify.`
               } catch (err) {
                 result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
