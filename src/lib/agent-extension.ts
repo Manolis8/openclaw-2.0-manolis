@@ -221,11 +221,24 @@ async function clickSubmitViaCDP(userId: string, selector?: string): Promise<voi
   console.log(`[clickSubmitViaCDP] status=${res.status} response=${responseText.slice(0, 200)}`)
   if (!res.ok) throw new Error(`clickSubmitViaCDP failed: ${responseText}`)
 }
-
 async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
-  const { cdpUrl, targetId } = await getBrowser(userId)
+  const { cdpUrl, targetId, page } = await getBrowser(userId)
 
   try {
+    // Clear first using CDP/Playwright's internal focus
+    // Let typeViaPlaywright handle the focusing
+    await typeViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      ref,
+      text: '',  // ← Clear with empty string first
+      slowly: false,
+      timeoutMs: 5000
+    }).catch(() => {})  // Ignore if it fails
+    
+    await new Promise(r => setTimeout(r, 100))
+    
+    // NOW type the actual text
     await typeViaPlaywright({
       cdpUrl,
       targetId: targetId || undefined,
@@ -959,48 +972,20 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
             case 'browser_type': {
               consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
-              
+
+              await typeInRef(opts.userId, args.ref, args.text)
+              if (args.submit) await pressKey('Enter', opts.userId)
+              await new Promise(r => setTimeout(r, 800))
+              // Auto-click submit button via CDP after typing confirmation text
               try {
-                const { page } = await getBrowser(opts.userId)
-                
-                // ONLY clear if this is a RETRY (not first attempt)
-                // Check if there's already text in the field
-                const existingText = await page.evaluate(() => {
-                  const input = document.activeElement as HTMLInputElement | HTMLTextAreaElement
-                  return input?.value || ''
-                }).catch(() => '')
-                
-                if (existingText && existingText.length > 0) {
-                  // ONLY if field has existing text, clear it
-                  // 1. Click the input first to focus
-                  await page.locator('input, textarea, [contenteditable="true"]').first().click({ timeout: 2000 }).catch(() => {})
-                  await new Promise(r => setTimeout(r, 100))
-                  
-                  // 2. NOW clear with Ctrl+A + Backspace (input is focused)
-                  await page.keyboard.press('Control+A')
-                  await page.keyboard.press('Backspace')
-                  await new Promise(r => setTimeout(r, 100))
-                }
-                
-                // 3. Type the text (typeInRef handles focus if needed)
-                await typeInRef(opts.userId, args.ref, args.text)
-                
-                if (args.submit) await pressKey('Enter', opts.userId)
-                await new Promise(r => setTimeout(r, 800))
-                
-                try {
-                  await clickSubmitViaCDP(opts.userId)
-                  console.log(`[browser_type] auto-clicked submit after typing`)
-                  await new Promise(r => setTimeout(r, 1000))
-                } catch (err) {
-                  console.log(`[browser_type] auto-click submit failed: ${err}`)
-                }
-                
-                const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-                result = `Typed "${args.text}" into the input and automatically clicked the submit button. Call browser_snapshot to verify the page changed.`
+                await clickSubmitViaCDP(opts.userId)
+                console.log(`[browser_type] auto-clicked submit after typing`)
+                await new Promise(r => setTimeout(r, 1000))
               } catch (err) {
-                result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
+                console.log(`[browser_type] auto-click submit failed: ${err}`)
               }
+              const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
+              result = `Typed "${args.text}" into the input and automatically clicked the submit button. The action should be complete. Call browser_snapshot to verify the page changed — if the dialog closed the action succeeded. Do NOT click any more buttons.`
               break
             }
             case 'browser_key': {
