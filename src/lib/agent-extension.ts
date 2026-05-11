@@ -962,15 +962,23 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
               try {
                 const { page } = await getBrowser(opts.userId)
                 
-                // CLEAR the field first (select all + delete)
-                await page.locator(`[data-testid="react-select-input"]`).or(page.locator('input')).first().click()
-                await page.keyboard.press('Control+A')  // or Cmd+A on Mac
-                await page.keyboard.press('Backspace')
+                // Focus on the input field by clicking it first
+                await page.keyboard.press('Tab')  // Move focus
                 await new Promise(r => setTimeout(r, 100))
                 
-                // NOW type the text
+                // CLEAR any existing text before typing
+                await page.keyboard.press('Control+A')
+                await page.keyboard.press('Delete')
+                await new Promise(r => setTimeout(r, 200))
+                
+                // NOW type slowly into the cleared field
                 await typeInRef(opts.userId, args.ref, args.text)
-                if (args.submit) await pressKey('Enter', opts.userId)
+                
+                if (args.submit) {
+                  await new Promise(r => setTimeout(r, 300))
+                  await pressKey('Enter', opts.userId)
+                }
+                
                 await new Promise(r => setTimeout(r, 800))
                 
                 try {
@@ -980,7 +988,8 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
                 } catch (err) {
                   console.log(`[browser_type] auto-click submit failed: ${err}`)
                 }
-                result = `Cleared field, typed "${args.text}", and clicked submit. Call browser_snapshot to verify.`
+                
+                result = `Cleared field, typed "${args.text}" slowly into ${args.ref}. Call browser_snapshot to verify.`
               } catch (err) {
                 result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
