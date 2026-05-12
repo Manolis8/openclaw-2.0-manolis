@@ -224,44 +224,6 @@ async function clickSubmitViaCDP(userId: string, selector?: string): Promise<voi
   if (!res.ok) throw new Error(`clickSubmitViaCDP failed: ${responseText}`)
 }
 
-
-async function typeInRef(userId: string, ref: string, text: string): Promise<void> {
-  const { cdpUrl, targetId, page } = await getBrowser(userId)
-
-  try {
-    // 1. CLICK the input first to focus it
-    await page.locator('input, textarea, [contenteditable="true"]').first().click({ timeout: 2000 }).catch(() => {})
-    await new Promise(r => setTimeout(r, 150))
-    
-    // 2. NOW clear (Ctrl+A works because input is focused)
-    await page.keyboard.press('Control+A')
-    await page.keyboard.press('Backspace')
-    await new Promise(r => setTimeout(r, 100))
-  } catch (err) {
-    console.log(`[typeInRef] pre-clear skipped: ${err}`)
-  }
-
-  // Try OpenClaw's typeViaPlaywright first
-  try {
-    await typeViaPlaywright({
-      cdpUrl,
-      targetId: targetId || undefined,
-      ref,
-      text,
-      slowly: true,
-      timeoutMs: 5000
-    })
-    await new Promise(r => setTimeout(r, 300))
-    return
-  } catch (err) {
-    console.log(`[typeInRef] playwright failed: ${err instanceof Error ? err.message.slice(0, 100) : err} — trying CDP`)
-  }
-
-  // Fallback: type via CDP
-  await typeViaCDP(userId, text)
-  await new Promise(r => setTimeout(r, 300))
-}
-
 async function pressKey(key: string, userId: string): Promise<void> {
   const { page } = await getBrowser(userId)
   await page.keyboard.press(key)
@@ -725,35 +687,6 @@ Always explain what happened and what the user can do next.`
 
 // ─── Message trimming (keeps tool pairs intact) ───────────────────────────────
 
-function trimMessages(messages: any[]): any[] {
-  if (messages.length <= 20) return messages
-  const system = messages[0]
-  let rest = messages.slice(1).slice(-18)
-
-  // Find first complete pair — never start with a tool message
-  while (rest.length > 0 && rest[0].role === 'tool') rest = rest.slice(1)
-
-  // Never start with an assistant message that has tool_calls but no following tool message
-  while (
-    rest.length > 0 &&
-    rest[0].role === 'assistant' &&
-    Array.isArray(rest[0].tool_calls) &&
-    rest[0].tool_calls.length > 0
-  ) {
-    // Check if all tool_calls have responses immediately after
-    const toolCallIds = rest[0].tool_calls.map((tc: any) => tc.id)
-    const following = rest.slice(1)
-    const respondedIds = following
-      .filter((m: any) => m.role === 'tool')
-      .map((m: any) => m.tool_call_id)
-    const allResponded = toolCallIds.every((id: string) => respondedIds.includes(id))
-    if (allResponded) break
-    rest = rest.slice(1)
-  }
-
-  return [system, ...rest]
-}
-
 // Only pass last user message and last assistant summary — not agent steps
 function cleanContext(context?: string): string {
   if (!context) return ''
@@ -825,19 +758,13 @@ FINAL STEP: Call task_complete("[exact result]")`
 
 async function typeInRefSmart(userId: string, ref: string, fallbackText: string): Promise<void> {
   const { cdpUrl, targetId, page } = await getBrowser(userId)
-
-  let textToType = fallbackText  // ← DECLARE HERE first!
+  let textToType = fallbackText
 
   try {
-    // 1. CLICK
-    await page.locator('input, textarea, [contenteditable="true"]').first().click({ timeout: 2000 }).catch(() => {})
-    await new Promise(r => setTimeout(r, 150))
-    
-    // 2. READ THE LABEL
+    // 1. READ THE LABEL FIRST (before clicking anything)
     const labelText = await page.evaluate(() => {
       const labels = Array.from(document.querySelectorAll('label'))
       const instructionLabel = labels.find(l => l.innerText.includes('type') || l.innerText.includes('Type'))
-      
       if (instructionLabel) {
         const match = instructionLabel.innerText.match(/"([^"]+)"/)
         if (match) {
@@ -849,26 +776,21 @@ async function typeInRefSmart(userId: string, ref: string, fallbackText: string)
     
     // OVERRIDE if we found the label
     if (labelText) {
-      textToType = labelText  // ← UPDATE textToType
+      textToType = labelText
     }
     
     console.log(`[typeInRefSmart] label says: "${labelText}" | will type: "${textToType}"`)
-    
-    // 3. Clear
-    await page.keyboard.press('Control+A')
-    await page.keyboard.press('Backspace')
-    await new Promise(r => setTimeout(r, 100))
   } catch (err) {
-    console.log(`[typeInRefSmart] pre-clear skipped: ${err}`)
+    console.log(`[typeInRefSmart] label read skipped: ${err}`)
   }
 
-  // NOW textToType is available here
+  // NOW try to type with typeViaPlaywright (it handles focus)
   try {
     await typeViaPlaywright({
       cdpUrl,
       targetId: targetId || undefined,
       ref,
-      text: textToType,  // ← NOW this works!
+      text: textToType,
       slowly: true,
       timeoutMs: 5000
     })
@@ -878,8 +800,22 @@ async function typeInRefSmart(userId: string, ref: string, fallbackText: string)
     console.log(`[typeInRefSmart] playwright failed: ${err instanceof Error ? err.message.slice(0, 100) : err} — trying CDP`)
   }
 
-  // Fallback
-  await typeViaCDP(userId, textToType)  // ← THIS works too
+  // Fallback: click, clear, then CDP type
+  try {
+    const { page } = await getBrowser(userId)
+    await page.locator('input, textarea, [contenteditable="true"]').first().click({ timeout: 2000 }).catch(() => {})
+    await new Promise(r => setTimeout(r, 150))
+    
+    // NOW clear (input is focused)
+    await page.keyboard.press('Control+A')
+    await page.keyboard.press('Backspace')
+    await new Promise(r => setTimeout(r, 100))
+  } catch (err) {
+    console.log(`[typeInRefSmart] focus/clear failed: ${err}`)
+  }
+
+  // Type via CDP
+  await typeViaCDP(userId, textToType)
   await new Promise(r => setTimeout(r, 300))
 }
 
