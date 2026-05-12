@@ -960,25 +960,36 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
               await opts.onProgress('📸 Reading page...')
               const snap = await snapshotPage(opts.userId, opts.tabKey, true)
               
-              // Get field info from the page
+              // Check for input fields and extract their labels
               const { page } = await getBrowser(opts.userId)
-              const fieldInfo = await page.evaluate(() => {
-                const inputs = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'))
-                return inputs.map(inp => ({
-                  placeholder: (inp as any).placeholder || '',
-                  value: (inp as any).value || '',
-                  label: (inp as any).getAttribute('aria-label') || '',
-                  nearbyText: inp.parentElement?.innerText?.slice(0, 200) || ''
-                }))
-              }).catch(() => [])
+              let fieldInfo = ''
+              try {
+                const inputs = await page.evaluate(() => {
+                  return Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).map(inp => {
+                    const parent = inp.parentElement
+                    const label = parent?.querySelector('label')?.innerText || parent?.querySelector('strong')?.innerText || ''
+                    const placeholder = (inp as any).placeholder || ''
+                    const hint = parent?.innerText?.split('\n')[0] || ''
+                    
+                    return {
+                      placeholder: placeholder.slice(0, 80),
+                      label: label.slice(0, 80),
+                      hint: hint.slice(0, 80)
+                    }
+                  })
+                }).catch(() => [])
+                
+                if (inputs.length > 0 && inputs[0].label) {
+                  fieldInfo = `\n\nFIELD LABEL: "${inputs[0].label}"\nPlaceholder: "${inputs[0].placeholder}"\n\nType EXACTLY what this field asks for. Don't simplify.`
+                }
+              } catch (err) {
+                console.log(`[browser_snapshot] field info check failed:`, err)
+              }
               
-              if (fieldInfo.length > 0) {
-                console.log(`[browser_snapshot] found inputs:`, fieldInfo)
-                result = snap + `\n\nINPUT FIELDS ON PAGE:\n${fieldInfo.map((f, i) => `Field ${i}: placeholder="${f.placeholder}" label="${f.label}" nearby text="${f.nearbyText}"`).join('\n')}\n\nREAD THE NEARBY TEXT to understand what format to type.`
-              } else if (consecutiveSnapshots >= 3) {
+              if (consecutiveSnapshots >= 3) {
                 result = snap + `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, or call task_failed.`
               } else {
-                result = snap
+                result = snap + (fieldInfo || `\n\nREAD THE PAGE: If there's an input field, look at the label/placeholder next to it. Type EXACTLY what it asks for.`)
               }
               break
             }
