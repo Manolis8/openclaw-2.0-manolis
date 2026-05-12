@@ -733,25 +733,30 @@ async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 700,
+      max_tokens: 300,
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation planner. Create a clear step-by-step plan.
+          content: `You are a browser automation planner.
 
 RULES:
 1. Be SPECIFIC about what the user wants
 2. Clarify ambiguous terms:
    - "First" could mean oldest, newest, or top of list - clarify which
    - "Find X" - define what information to report about X
-3. DO NOT include steps
-4. Define SUCCESS before the plan - what exactly to report
-5. End with FINAL STEP showing exact result format
+3. Assess if this task is POSSIBLE
+4. DO NOT include steps
+5. Define SUCCESS - what exactly to report
 
 Format:
 
 ### OBJECTIVE
-[What user actually wants]
+[What user actually wants - clarified]
+
+### IS THIS POSSIBLE?
+YES/NO - [Brief explanation]
+
+If NO: Tell agent to call task_failed immediately
 
 ### SUCCESS CRITERIA
 Report exactly:
