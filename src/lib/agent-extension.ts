@@ -1,5 +1,5 @@
 //// agent-extension.ts
-
+import { createLoopDetector } from './loop-detection.js'
 import OpenAI from 'openai'
 import { chromium, type Browser, type Page } from 'playwright-core'
 import { supabase } from './supabase.js'
@@ -844,7 +844,7 @@ async function runAgentLoop(opts: {
     : opts.taskPrompt
 
 
-    
+    const loopDetector = createLoopDetector() 
   // Generate plan once using cheap model
   const plan = await planTask(opts.taskPrompt)
   const planContext = plan ? `\n\nEXECUTION PLAN (follow this order):\n${plan}` : ''
@@ -997,14 +997,26 @@ async function runAgentLoop(opts: {
             case 'browser_click': {
               consecutiveSnapshots = 0
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
+              
+              // Record the click attempt
+              loopDetector.recordToolCall('browser_click', args.ref)
+              
               try {
                 await clickRef(opts.userId, args.ref)
                 await new Promise(r => setTimeout(r, 800))
                 result = `Clicked ${args.ref} successfully. Call browser_snapshot to see updated page.`
+                loopDetector.recordToolOutcome('browser_click', args.ref, result)
               } catch (err) {
-                // Element not found - force agent to get fresh snapshot and try again
                 result = `Element ${args.ref} not found or not clickable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
+                loopDetector.recordToolOutcome('browser_click', args.ref, result)
               }
+              
+              // Check if stuck in loop AFTER outcome is recorded
+              const clickLoopCheck = loopDetector.checkForLoop('browser_click', args.ref)
+              if (clickLoopCheck.stuck) {
+                result = clickLoopCheck.warning || result
+              }
+              
               break
             }
             case 'browser_type': {
@@ -1261,12 +1273,25 @@ async function runAgentLoop(opts: {
             case 'browser_evaluate': {
               consecutiveSnapshots = 0
               await opts.onProgress(`⚙️ Running script...`)
+              
+              // Record the evaluation attempt
+              loopDetector.recordToolCall('browser_evaluate', args.fn)
+              
               try {
                 const evalResult = await evaluatePage(opts.userId, args.fn)
                 result = `Script result: ${JSON.stringify(evalResult, null, 2)}`
+                loopDetector.recordToolOutcome('browser_evaluate', args.fn, result)
               } catch (err) {
                 result = `Script error: ${err instanceof Error ? err.message : String(err)}`
+                loopDetector.recordToolOutcome('browser_evaluate', args.fn, result)
               }
+              
+              // Check if stuck in loop AFTER outcome is recorded
+              const evalLoopCheck = loopDetector.checkForLoop('browser_evaluate', args.fn)
+              if (evalLoopCheck.stuck) {
+                result = evalLoopCheck.warning || result
+              }
+              
               break
             }
             default:
