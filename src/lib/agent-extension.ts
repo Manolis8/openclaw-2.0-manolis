@@ -838,6 +838,8 @@ async function runAgentLoop(opts: {
     ? `Previous conversation:\n${cleanedContext}\n\nCurrent task: "${opts.taskPrompt}"`
     : opts.taskPrompt
 
+
+    
   // Generate plan once using cheap model
   const plan = await planTask(opts.taskPrompt)
   const planContext = plan ? `\n\nEXECUTION PLAN (follow this order):\n${plan}` : ''
@@ -863,42 +865,27 @@ async function runAgentLoop(opts: {
       iterations++
 
       let response: OpenAI.Chat.ChatCompletion | undefined
-for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
-
-  const compactedMessages = compactMessages(messages, 8000, 10)
-  logTokenUsage(compactedMessages, 'Compacted')
-  logTokenUsage(compactedMessages, 'Compacted')
-  
-  response = await grok.chat.completions.create({
-    model: 'grok-4-1-fast-non-reasoning',
-    messages: compactedMessages,
-    tools: browserTools,
-    tool_choice: 'auto',
-    max_tokens: 500,
-  })
-
-
-  try {
-    // Compact messages before sending
-    const compactedMessages = compactMessages(messages, 8000, 10)
-    logTokenUsage(compactedMessages, 'Compacted')  // ← CORRECT
-    
-    response = await grok.chat.completions.create({
-      model: 'grok-4-1-fast-non-reasoning',
-      messages: compactedMessages,  // ← Use compacted, not trimMessages
-      tools: browserTools,
-      tool_choice: 'auto',
-      max_tokens: 500,
-    })
-    break
-  } catch (err: any) {
-    if (err?.status === 429 && retryAttempt < 2) {
-      await new Promise(r => setTimeout(r, 3000))
-      continue
-    }
-    throw err
-  }
-}
+      for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
+        try {
+          const compactedMessages = compactMessages(messages, 8000, 10)
+          logTokenUsage(compactedMessages, 'Compacted')
+          
+          response = await grok.chat.completions.create({
+            model: 'grok-4-1-fast-non-reasoning',
+            messages: compactedMessages,
+            tools: browserTools,
+            tool_choice: 'auto',
+            max_tokens: 500,
+          })
+          break
+        } catch (err: any) {
+          if (err?.status === 429 && retryAttempt < 2) {
+            await new Promise(r => setTimeout(r, 3000))
+            continue
+          }
+          throw err
+        }
+      }
       
       if (!response) {
         throw new Error('No response after 3 retries')
@@ -907,8 +894,15 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
       console.log(`[tokens] model=${response.model} prompt=${response.usage?.prompt_tokens} completion=${response.usage?.completion_tokens} total=${response.usage?.total_tokens}`)
       if (!response) throw new Error('Failed after retries')
 
-      const msg = response.choices[0].message
-      messages.push(msg)
+
+        
+        const msg = response.choices[0].message
+        const toolCall = msg.tool_calls?.[0]
+        if (toolCall) {
+          console.log(`[agent-decision] tool: ${toolCall['function']?.name}`)
+          console.log(`[agent-thinking] ${msg.content || '(no text)'}`)
+        }
+        messages.push(msg)
       if (!msg.tool_calls?.length) {
         if (msg.content) {
           // Agent responded with text — continue loop
