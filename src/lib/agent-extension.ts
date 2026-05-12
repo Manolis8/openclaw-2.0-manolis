@@ -569,6 +569,11 @@ Before typing:
 4. Type EXACTLY what the page asks for
 5. Do NOT change or simplify the format
 
+IF YOU GET STUCK FINDING INFORMATION:
+- Do NOT start clicking random buttons
+- Do NOT go to Settings or Danger Zone
+- Call task_failed with: "Could not find [what you were looking for]"
+
 ## Multi-Step Dialogs
 Many destructive actions have multiple confirmation stages:
 Stage 1: Click initial delete/remove button → new dialog appears
