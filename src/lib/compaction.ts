@@ -25,27 +25,29 @@ function stripSnapshotDetails(messages: any[]): any[] {
 }
 
 function summarizeOldMessages(messages: any[]): string {
-  const actions: string[] = []
-  for (const msg of messages) {
+  // Find the task_complete message (what was shown to user)
+  let taskResult = ''
+  
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
     if (msg.role === 'assistant') {
       const content = typeof msg.content === 'string' ? msg.content : ''
-      if (content.includes('🖱️ Clicking')) {
-        const match = content.match(/Clicking (\w+)/)
-        actions.push(`Clicked ${match?.[1] || 'element'}`)
-      } else if (content.includes('⌨️ Typing')) {
-        actions.push(`Typed text into field`)
-      } else if (content.includes('🌐 Navigating')) {
-        const match = content.match(/Navigating to (.+?)\.\.\./)
-        actions.push(`Navigated to ${match?.[1] || 'page'}`)
-      } else if (content.includes('📸 Reading')) {
-        actions.push(`Read page content`)
-      } else if (content.includes('✅')) {
+      // Look for task_complete message (starts with ✅)
+      if (content.includes('✅')) {
         const match = content.match(/✅ (.+)/)
-        actions.push(`Completed: ${match?.[1] || 'action'}`)
+        taskResult = match?.[1] || 'Task completed'
+        break
       }
     }
   }
-  return `Prior actions: ${actions.slice(-10).join(' → ')}`
+  
+  // If we found a task result, return just that (what was shown to user)
+  if (taskResult) {
+    return `Previous task result: ✅ ${taskResult}`
+  }
+  
+  // If no task_complete found, return neutral message
+  return `Previous task context available`
 }
 
 export function compactMessages(
