@@ -722,7 +722,7 @@ RULES:
 2. Clarify ambiguous terms:
    - "First" could mean oldest, newest, or top of list - clarify which
    - "Find X" - define what information to report about X
-3. DO NOT include unnecessary steps
+3. DO NOT include steps
 4. Define SUCCESS before the plan - what exactly to report
 5. End with FINAL STEP showing exact result format
 
