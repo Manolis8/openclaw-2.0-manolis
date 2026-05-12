@@ -590,6 +590,23 @@ Each stage has different refs — never reuse refs across stages.
 - After typing — call browser_snapshot to confirm input received text
 - Then click the submit button ref from the SAME snapshot
 
+## IF YOU GET CONFUSED
+If you have:
+- Tried multiple approaches without finding what you need
+- Navigated to many different pages with no progress
+- Found yourself looking at Settings, Delete, or other unrelated pages
+- Spent many iterations trying to extract information
+
+IMMEDIATELY call task_failed with a clear message instead of continuing.
+
+Examples of when to call task_failed:
+- "I've tried 5 different pages but cannot find the creation date. The information doesn't appear to be available."
+- "I navigated to Settings but the task doesn't require that. I'm confused about how to proceed."
+- "I've attempted to extract this data multiple times with no result. Calling task_failed."
+
+NEVER try random buttons or actions. NEVER navigate to Settings unless explicitly asked.
+If unsure, call task_failed. It's better to fail cleanly than to do destructive actions.
+
 ## Preserve Case When Typing
 Always type text exactly as given. Never change case.
 Example: "Manolis8" stays "Manolis8", not "manolis8"
