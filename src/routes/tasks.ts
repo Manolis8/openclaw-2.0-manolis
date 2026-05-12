@@ -528,6 +528,42 @@ tasksRouter.post('/chat', async (req, res) => {
   }
 
   // Not destructive — create task and start browser agent immediately
+// Not destructive — create task and start browser agent immediately
+  
+  // CHECK IF THIS IS A RETRY
+  const isRetry = ['do it again', 'try again', 'redo', 'repeat', 'do the first'].some(kw => 
+    message.toLowerCase().includes(kw)
+  )
+  
+  let finalPrompt = message
+  
+  if (isRetry) {
+    // Load the previous task from this session
+    try {
+      const { data: prevTask } = await supabase
+        .from('tasks')
+        .select('prompt, output')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single()
+      
+      if (prevTask) {
+        // Extract last few lines of output
+        const prevOutput = prevTask.output?.split('\n').slice(-10).join('\n') || 'Unknown'
+        
+        finalPrompt = `Original task: "${prevTask.prompt}"
+
+Previous attempt result:
+${prevOutput}
+
+User request: Try again.`
+      }
+    } catch (err) {
+      console.log('[chat] Could not load previous task:', err)
+    }
+  }
+
   const { data, error } = await supabase
     .from('tasks')
     .insert({
@@ -541,7 +577,7 @@ tasksRouter.post('/chat', async (req, res) => {
   if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
 
   res.json({ taskId: data.id, usesBrowser: true })
-  runTaskInBackground(data.id, message, userId, false, keepTabOpen, context)
+  runTaskInBackground(data.id, finalPrompt, userId, false, keepTabOpen, context)
 })
 
 tasksRouter.post('/create-task', async (req, res) => {
