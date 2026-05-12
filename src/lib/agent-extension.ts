@@ -823,6 +823,66 @@ FINAL STEP: Call task_complete("[exact result]")`
 }
 
 
+async function typeInRefSmart(userId: string, ref: string, fallbackText: string): Promise<void> {
+  const { cdpUrl, targetId, page } = await getBrowser(userId)
+
+  let textToType = fallbackText  // ← DECLARE HERE first!
+
+  try {
+    // 1. CLICK
+    await page.locator('input, textarea, [contenteditable="true"]').first().click({ timeout: 2000 }).catch(() => {})
+    await new Promise(r => setTimeout(r, 150))
+    
+    // 2. READ THE LABEL
+    const labelText = await page.evaluate(() => {
+      const labels = Array.from(document.querySelectorAll('label'))
+      const instructionLabel = labels.find(l => l.innerText.includes('type') || l.innerText.includes('Type'))
+      
+      if (instructionLabel) {
+        const match = instructionLabel.innerText.match(/"([^"]+)"/)
+        if (match) {
+          return match[1]
+        }
+      }
+      return null
+    }).catch(() => null)
+    
+    // OVERRIDE if we found the label
+    if (labelText) {
+      textToType = labelText  // ← UPDATE textToType
+    }
+    
+    console.log(`[typeInRefSmart] label says: "${labelText}" | will type: "${textToType}"`)
+    
+    // 3. Clear
+    await page.keyboard.press('Control+A')
+    await page.keyboard.press('Backspace')
+    await new Promise(r => setTimeout(r, 100))
+  } catch (err) {
+    console.log(`[typeInRefSmart] pre-clear skipped: ${err}`)
+  }
+
+  // NOW textToType is available here
+  try {
+    await typeViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      ref,
+      text: textToType,  // ← NOW this works!
+      slowly: true,
+      timeoutMs: 5000
+    })
+    await new Promise(r => setTimeout(r, 300))
+    return
+  } catch (err) {
+    console.log(`[typeInRefSmart] playwright failed: ${err instanceof Error ? err.message.slice(0, 100) : err} — trying CDP`)
+  }
+
+  // Fallback
+  await typeViaCDP(userId, textToType)  // ← THIS works too
+  await new Promise(r => setTimeout(r, 300))
+}
+
 async function runAgentLoop(opts: {
   userId: string
   taskId: string
@@ -1015,20 +1075,27 @@ for (let retryAttempt = 0; retryAttempt < 3; retryAttempt++) {
             case 'browser_type': {
               consecutiveSnapshots = 0
               await opts.onProgress(`⌨️ Typing into ${args.ref}...`)
-
-              await typeInRef(opts.userId, args.ref, args.text)
-              if (args.submit) await pressKey('Enter', opts.userId)
-              await new Promise(r => setTimeout(r, 800))
-              // Auto-click submit button via CDP after typing confirmation text
+              
               try {
-                await clickSubmitViaCDP(opts.userId)
-                console.log(`[browser_type] auto-clicked submit after typing`)
-                await new Promise(r => setTimeout(r, 1000))
+                // Use SMART typing that reads the label
+                await typeInRefSmart(opts.userId, args.ref, args.text)
+                
+                if (args.submit) await pressKey('Enter', opts.userId)
+                await new Promise(r => setTimeout(r, 800))
+                
+                try {
+                  await clickSubmitViaCDP(opts.userId)
+                  console.log(`[browser_type] auto-clicked submit after typing`)
+                  await new Promise(r => setTimeout(r, 1000))
+                } catch (err) {
+                  console.log(`[browser_type] auto-click submit failed: ${err}`)
+                }
+                
+                const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
+                result = `Typed into the input and clicked submit. Call browser_snapshot to verify.`
               } catch (err) {
-                console.log(`[browser_type] auto-click submit failed: ${err}`)
+                result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
               }
-              const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
-              result = `Typed "${args.text}" into the input and automatically clicked the submit button. The action should be complete. Call browser_snapshot to verify the page changed — if the dialog closed the action succeeded. Do NOT click any more buttons.`
               break
             }
             case 'browser_key': {
