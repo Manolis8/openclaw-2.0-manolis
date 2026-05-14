@@ -1,5 +1,6 @@
 //// agent-extension.ts
 import { createLoopDetector } from './loop-detection.js'
+import { getMidActionPlan } from './mid-action-planner.js'
 import OpenAI from 'openai'
 import { chromium, type Browser, type Page } from 'playwright-core'
 import { supabase } from './supabase.js'
@@ -384,6 +385,38 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
       required: ['ref']
     }
   }},
+
+  {
+    type: 'function',
+    function: {
+      name: 'get_mid_action_plan',
+      description: 'When confused mid-task, call this to get a recovery plan. Tells you what to try next or if the task is impossible.',
+      parameters: {
+        type: 'object',
+        properties: {
+          lookingFor: {
+            type: 'string',
+            description: 'What information or element you are trying to find'
+          },
+          alreadyTried: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'List of things you already tried (e.g., ["clicked About page", "evaluated page content"])'
+          },
+          currentPage: {
+            type: 'string',
+            description: 'Current page URL'
+          },
+          whyStuck: {
+            type: 'string',
+            description: 'Explain why you are confused or stuck'
+          }
+        },
+        required: ['lookingFor', 'alreadyTried', 'currentPage', 'whyStuck']
+      }
+    }
+  },
+
   { type: 'function', function: {
     name: 'browser_page_scroll',
     description: 'Scroll the page up or down by pixels and get a fresh snapshot. Use when you need to see more of the page.',
@@ -584,6 +617,27 @@ Each stage has different refs — never reuse refs across stages.
 - Call browser_type with that exact ref and the required text
 - After typing — call browser_snapshot to confirm input received text
 - Then click the submit button ref from the SAME snapshot
+
+## AFTER EACH ACTION - BE HONEST ABOUT PROGRESS
+After you take any action (click, navigate, evaluate, read):
+
+Ask yourself: "Did that help me complete this task: [ORIGINAL TASK]?"
+
+Answer honestly:
+- YES → Continue to next action
+- MAYBE → Try the next approach
+- NO or CONFUSED → CALL getMidActionPlan()
+
+When to call getMidActionPlan():
+- You've tried 2-3 things with no visible progress
+- You don't know where to look next
+- You're unsure if you're on the right path
+- You clicked something and nothing useful happened
+- You see pages that seem unrelated to your task (Settings, Delete dialogs, etc)
+
+Do NOT keep clicking random things hoping something works.
+Be honest about confusion and ask for help via getMidActionPlan.
+
 
 ## IF YOU GET CONFUSED - CALL FOR MID-ACTION PLAN
 If you have:
@@ -1015,6 +1069,44 @@ async function runAgentLoop(opts: {
                 result = snap + `\n\nWARNING: ${consecutiveSnapshots} snapshots in a row. You MUST now act: click, scroll, navigate, or call task_failed.`
               } else {
                 result = snap + (fieldInfo || `\n\nREAD THE PAGE: If there's an input field, look at the label/placeholder next to it. Type EXACTLY what it asks for.`)
+              }
+              break
+            }
+            case 'get_mid_action_plan': {
+              await opts.onProgress(`Analyzing situation...`)
+              
+              try {
+                const plan = await getMidActionPlan({
+                  taskPrompt: opts.taskPrompt,
+                  lookingFor: args.lookingFor,
+                  alreadyTried: args.alreadyTried,
+                  currentPage: args.currentPage,
+                  whyStuck: args.whyStuck
+                })
+                
+                console.log(`[MID_ACTION_RESULT] recommendation=${plan.recommendation}`)
+                
+                // If impossible, agent should call task_failed
+                if (plan.recommendation === 'IMPOSSIBLE') {
+                  result = `🚫 IMPOSSIBLE: ${plan.suggestion}\n\n${plan.explanation}\n\nYou must call task_failed now with reason: "${plan.suggestion}"`
+                  break
+                }
+                
+                // If try different approach
+                if (plan.recommendation === 'TRY_DIFFERENT_APPROACH') {
+                  result = `💡 NEW APPROACH: ${plan.suggestion}\n\n${plan.explanation}\n\nNext action: ${plan.nextAction || 'Try this approach'}`
+                  break
+                }
+                
+                // If navigate to new page
+                if (plan.recommendation === 'NAVIGATE_NEW_PAGE') {
+                  result = `🗺️ TRY DIFFERENT PAGE: ${plan.suggestion}\n\n${plan.explanation}\n\nNavigate to: ${plan.nextAction || 'The suggested page'}`
+                  break
+                }
+                
+                result = `Plan: ${plan.suggestion}`
+              } catch (err) {
+                result = `Failed to generate plan: ${err instanceof Error ? err.message : String(err)}`
               }
               break
             }
