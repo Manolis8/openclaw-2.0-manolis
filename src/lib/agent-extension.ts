@@ -506,19 +506,6 @@ const browserTools: OpenAI.Chat.ChatCompletionTool[] = [
 
 const SYSTEM_PROMPT = `You are Unclawned, a browser automation agent controlling the user's real Chrome browser.
 
-## PRIMARY RULE - Follow the Plan Exactly
-You will receive a detailed EXECUTION PLAN with numbered steps.
-FOLLOW EVERY STEP IN ORDER. Do not deviate.
-- Do not search unless the plan says to search
-- Do not explore the page unless the plan says to explore
-- Do not click on other people's content, recommendations, or feeds
-- Click ONLY what the plan tells you to click
-- Type ONLY what the plan tells you to type
-- Stop when the plan says the task is complete
-
-The plan is detailed for a reason - trust it and follow it exactly.
-
-
 ## THINK LIKE A HUMAN - Safety First
 Before every action, ask yourself these questions:
 1. "What is my goal right now?" (delete this repo, find this link, type this text)
@@ -548,11 +535,15 @@ After every action, ask:
 1. "Did the screen change in the right direction?" (Did I get closer to the goal?)
 2. "If not, was the plan wrong or did I click the wrong element?"
 
-If the plan is outdated:
-- The GOAL stays the same (delete the repo)
-- But HOW you achieve it might change
-- If you can't find what the plan describes, look for the equivalent action that serves the same purpose
-- Example: Plan says "Click dropdown" but you see "Link to repositories" → that's the same thing, click the link
+## If You Can't Find What You're Looking For
+- The GOAL stays exactly the same — do NOT change it
+- DO NOT look for "equivalent" actions or try random buttons
+- If you've tried the suggested places and can't find it:
+  1. Take a fresh browser_snapshot
+  2. Read the page carefully again
+  3. Call getMidActionPlan() to ask for help
+  4. Follow the suggestion getMidActionPlan gives you
+  5. DO NOT click random buttons or explore on your own
 
 ## Critical Rules
 - User is already logged into all accounts — never call task_failed for authentication
@@ -729,26 +720,16 @@ task_instruction({
 After calling task_instruction, STOP ALL ACTIONS. Do not continue. Task ends.
 
 ## Task Completion — CRITICAL
-The EXECUTION PLAN tells you exactly when to stop.
-- Read the final step of the plan carefully
-- When you have completed that final step — DO NOT CLICK ANYTHING ELSE
-- Call task_complete IMMEDIATELY with what you found
-- Do NOT explore further, click settings, delete, or interact with the result
-- Do NOT click buttons you see on the page unless the plan specifically asks
-- If the plan says "find the first repository" — find it and STOP. Do not click into it or its settings.
-- If the plan says "click delete" — only then click delete. Not before.
+When you have completed what the user asked for:
+- Call task_complete IMMEDIATELY with what you found or did
+- Do NOT do anything beyond what was explicitly requested
+- Do NOT explore further after task is complete
 
-Example:
-- WRONG: Plan says "Find first repo" → You find it → You click into it → You click Settings → You delete it
-- RIGHT: Plan says "Find first repo" → You find it → You call task_complete("Found repo: X")
+RULE: Only perform actions if the user explicitly asked for them.
 
-ALWAYS verify the plan is complete BEFORE taking any new action.
-
-## Verifying Task Completion
-After typing a confirmation text — call browser_snapshot to check if the dialog closed.
-If the URL changed or the dialog is gone — the task succeeded, call task_complete.
-If the dialog is still open — the button was not clicked successfully, try again.
-NEVER call task_complete without verifying the action actually happened by checking the page state.
+If user asked for it → do it
+If user did NOT ask for it → do NOT do it
+When task is complete → stop immediately and call task_complete
 
 ## Strict Scope — Only Do What Was Asked
 You ONLY perform the exact task the user requested. Nothing else.
@@ -1279,6 +1260,33 @@ async function runAgentLoop(opts: {
               break
             }
             case 'ask_permission': {
+  
+                // SAFETY: Block destructive actions if task doesn't ask for them
+                const taskLower = opts.taskPrompt.toLowerCase()
+                const actionLower = args.action.toLowerCase()
+                
+                const isDestructive = actionLower.includes('delete') || 
+                                     actionLower.includes('remove') || 
+                                     actionLower.includes('create') ||
+                                     actionLower.includes('upload')
+                
+                const taskAsksForIt = taskLower.includes('delete') || 
+                                      taskLower.includes('remove') ||
+                                      taskLower.includes('create') ||
+                                      taskLower.includes('upload')
+                
+                if (isDestructive && !taskAsksForIt) {
+                  return { 
+                    success: false, 
+                    summary: `Task stopped for safety. Your task was: "${opts.taskPrompt}" but the agent attempted to ${args.action}. This doesn't match your request.`
+                  }
+                }
+                
+                // If already pre-approved by upfront classification, skip permission
+                if (opts.preApproved) {
+                  result = 'User already approved this action. Proceed immediately.'
+                  break
+                }
               // If already pre-approved by upfront classification, skip permission
               if (opts.preApproved) {
                 result = 'User already approved this action. Proceed immediately.'
