@@ -1120,6 +1120,24 @@ async function runAgentLoop(opts: {
             }
             case 'browser_click': {
               consecutiveSnapshots = 0
+              
+              // SAFETY: Check for dangerous clicks
+              const taskLower = opts.taskPrompt.toLowerCase()
+              const refLower = args.ref.toLowerCase()
+              
+              const isDangerousRef = refLower.includes('delete') || 
+                                     refLower.includes('danger') ||
+                                     refLower.includes('remove')
+              
+              const taskAsksForIt = taskLower.includes('delete') || 
+                                    taskLower.includes('remove')
+              
+              // If dangerous click but task doesn't ask for it, suggest alternative
+              if (isDangerousRef && !taskAsksForIt) {
+                result = `⚠️ You're about to click a dangerous button (${args.ref}) but your task is: "${opts.taskPrompt}"\n\nThis doesn't match. Call getMidActionPlan() to get a better approach instead of clicking this.`
+                break
+              }
+              
               await opts.onProgress(`🖱️ Clicking ${args.ref}...`)
               
               // Record the click attempt
