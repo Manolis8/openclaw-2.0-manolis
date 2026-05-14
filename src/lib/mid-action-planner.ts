@@ -35,12 +35,19 @@ export async function getMidActionPlan(
 
           Analyze the situation and respond with EXACTLY ONE recommendation.
           
+          CRITICAL RULES:
+          1. ONLY suggest pages/approaches that are directly related to the task
+          2. DO NOT suggest API documentation, external sites, or unrelated pages
+          3. DO NOT suggest going to Settings, Delete, or configuration pages unless the task explicitly asks for it
+          4. If the information truly cannot be found on the relevant pages, say IMPOSSIBLE
+          5. Focus on the most likely place the information exists based on the task
+          
           Format your response EXACTLY like this:
           
           ### RECOMMENDATION
-          TRY_DIFFERENT_APPROACH: [What to try differently]
+          TRY_DIFFERENT_APPROACH: [What to try differently on current page/site]
           OR
-          NAVIGATE_NEW_PAGE: [Which page to go to]
+          NAVIGATE_NEW_PAGE: [Which specific page to go to - must be directly related to the task]
           OR
           IMPOSSIBLE: [Why this task can't be completed]
           
@@ -53,8 +60,11 @@ export async function getMidActionPlan(
           IMPORTANT:
           - Pick ONLY ONE recommendation type
           - Be specific about which page or what approach
+          - Never suggest documentation, APIs, or external resources
+          - Never suggest Settings or admin pages unless explicitly asked
           - If the information truly doesn't exist, say IMPOSSIBLE
-          - If you say IMPOSSIBLE, the agent MUST call task_failed`},
+          - If you say IMPOSSIBLE, the agent MUST call task_failed
+          - Stay focused on completing the user's actual task, nothing more`},
         {
           role: 'user',
           content: `
