@@ -566,13 +566,8 @@ Before typing:
 1. Take browser_snapshot to see the page
 2. READ all text and labels on screen
 3. Understand what format is expected
-4. Type EXACTLY what the page asks for
+4. Type EXACTLY what the page asks forw
 5. Do NOT change or simplify the format
-
-IF YOU GET STUCK FINDING INFORMATION:
-- Do NOT start clicking random buttons
-- Do NOT go to Settings or Danger Zone
-- Call task_failed with: "Could not find [what you were looking for]"
 
 ## Multi-Step Dialogs
 Many destructive actions have multiple confirmation stages:
@@ -590,22 +585,40 @@ Each stage has different refs — never reuse refs across stages.
 - After typing — call browser_snapshot to confirm input received text
 - Then click the submit button ref from the SAME snapshot
 
-## IF YOU GET CONFUSED
+## IF YOU GET CONFUSED - CALL FOR MID-ACTION PLAN
 If you have:
 - Tried multiple approaches without finding what you need
 - Navigated to many different pages with no progress
 - Found yourself looking at Settings, Delete, or other unrelated pages
 - Spent many iterations trying to extract information
 
-IMMEDIATELY call task_failed with a clear message instead of continuing.
+DO NOT keep trying random things.
+Instead, CALL getMidActionPlan with:
+- lookingFor: What you're searching for
+- alreadyTried: List of things you've already attempted
+- currentPage: The current URL
+- whyStuck: Explain why you're confused
 
-Examples of when to call task_failed:
-- "I've tried 5 different pages but cannot find the creation date. The information doesn't appear to be available."
-- "I navigated to Settings but the task doesn't require that. I'm confused about how to proceed."
-- "I've attempted to extract this data multiple times with no result. Calling task_failed."
+getMidActionPlan will respond with ONE OF:
+1. TRY_DIFFERENT_APPROACH: "Try looking in X instead"
+   → Follow this new approach exactly
+2. NAVIGATE_NEW_PAGE: "Go to Y page instead"
+   → Navigate to that page and look there
+3. IMPOSSIBLE: "This information doesn't exist"
+   → Call task_failed immediately with the reason
 
-NEVER try random buttons or actions. NEVER navigate to Settings unless explicitly asked.
-If unsure, call task_failed. It's better to fail cleanly than to do destructive actions.
+ALWAYS follow the suggestion from getMidActionPlan.
+Do NOT ignore it and keep wandering.
+
+Examples:
+- "I've tried 5 different pages but cannot find the creation date after calling getMidActionPlan and it says IMPOSSIBLE"
+  → Call task_failed("Creation date not publicly available")
+  
+- getMidActionPlan suggests "Try the About section"
+  → Navigate there and look, don't try somewhere else
+
+If getMidActionPlan says IMPOSSIBLE → you MUST call task_failed immediately.
+NEVER try to find it yourself after that.
 
 ## Preserve Case When Typing
 Always type text exactly as given. Never change case.
@@ -733,30 +746,25 @@ async function planTask(prompt: string, url?: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 300,
+      max_tokens: 700,
       messages: [
         {
           role: 'system',
-          content: `You are a browser automation planner.
+          content: `You are a browser automation planner. Create a clear step-by-step plan.
 
 RULES:
 1. Be SPECIFIC about what the user wants
 2. Clarify ambiguous terms:
    - "First" could mean oldest, newest, or top of list - clarify which
    - "Find X" - define what information to report about X
-3. Assess if this task is POSSIBLE
-4. DO NOT include steps
-5. Define SUCCESS - what exactly to report
+3. DO NOT include steps
+4. Define SUCCESS before the plan - what exactly to report
+5. End with FINAL STEP showing exact result format
 
 Format:
 
 ### OBJECTIVE
-[What user actually wants - clarified]
-
-### IS THIS POSSIBLE?
-YES/NO - [Brief explanation]
-
-If NO: Tell agent to call task_failed immediately
+[What user actually wants]
 
 ### SUCCESS CRITERIA
 Report exactly:
