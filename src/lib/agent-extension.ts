@@ -924,6 +924,12 @@ async function runAgentLoop(opts: {
   const plan = await planTask(opts.taskPrompt)
   const planContext = plan ? `\n\nEXECUTION PLAN (follow this order):\n${plan}` : ''
 
+// Extract success criteria from plan
+const successMatch = plan.match(/### SUCCESS CRITERIA\n([\s\S]*?)(?=FINAL STEP|$)/)
+const successCriteria = successMatch?.[1]?.trim() || ''
+const finalStepMatch = plan.match(/FINAL STEP: Call task_complete\("(.+?)"\)/)
+const expectedFormat = finalStepMatch?.[1] || ''
+
   for (let attempt = 0; attempt < 2; attempt++) {
 
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
@@ -1220,6 +1226,21 @@ async function runAgentLoop(opts: {
             }
             case 'task_complete': {
               await opts.onProgress(`✅ ${args.summary}`)
+              
+              // Validate against success criteria from plan
+              if (successCriteria && expectedFormat) {
+                const summaryLower = args.summary.toLowerCase()
+                const expectedLower = expectedFormat.toLowerCase()
+                
+                // Check if summary matches expected format
+                if (!summaryLower.includes(expectedLower.slice(0, 20))) {
+                  return { 
+                    success: false, 
+                    summary: `The agent got confused and wasn't able to complete your task correctly. It tried to report something unrelated instead of what you asked for. Please try again or provide more specific details about what you're looking for.`
+                  }
+                }
+              }
+              
               return { success: true, summary: args.summary }
             }
             case 'task_failed': {
