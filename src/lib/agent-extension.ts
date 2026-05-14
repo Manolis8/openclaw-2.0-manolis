@@ -918,7 +918,7 @@ async function runAgentLoop(opts: {
     ? `Previous conversation:\n${cleanedContext}\n\nCurrent task: "${opts.taskPrompt}"`
     : opts.taskPrompt
 
-
+    let midActionPlanCallCount = 0  // ADD THIS
     const loopDetector = createLoopDetector() 
   // Generate plan once using cheap model
   const plan = await planTask(opts.taskPrompt)
@@ -1064,13 +1064,24 @@ async function runAgentLoop(opts: {
               break
             }
             case 'get_mid_action_plan': {
-              await opts.onProgress(`Analyzing situation...`)
+              consecutiveSnapshots = 0
+              midActionPlanCallCount++
+              
+              // If getMidActionPlan called twice, agent is still confused - give up
+              if (midActionPlanCallCount >= 2) {
+                return { 
+                  success: false, 
+                  summary: `Task failed. Agent attempted recovery twice but could not proceed. The requested information or action may not be available, or the task cannot be completed as specified. Please try again with different instructions or verify the information exists.`
+                }
+              }
+              
+              await opts.onProgress(`🤔 Analyzing situation...`)
               
               try {
                 const plan = await getMidActionPlan({
                   taskPrompt: opts.taskPrompt,
                   lookingFor: args.lookingFor,
-                  alreadyTried: args.alreadyTried,
+                  alreadyTried: args.alreadyTried || [],
                   currentPage: args.currentPage,
                   whyStuck: args.whyStuck
                 })
@@ -1454,7 +1465,12 @@ async function runAgentLoop(opts: {
       if (shouldRetry) break
     }
 
-    if (!shouldRetry) return { success: false, summary: 'Exceeded max iterations' }
+    if (!shouldRetry) {
+      return { 
+        success: false, 
+        summary: `Task could not be completed after ${iterations} attempts. The requested information or action could not be found or completed. Please try again with more specific instructions or verify the information exists.`
+      }
+    }
     if (attempt >= 1) return { success: false, summary: retryReason }
     await opts.onProgress('🔄 Retrying task...')
   }
