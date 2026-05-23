@@ -7,7 +7,7 @@ import { supabase } from './supabase.js'
 import { getRelayPortForUser } from '../index.js'
 import { detectLoop } from '../routes/tasks.js'
 import { compactMessages, logTokenUsage } from './compaction'
-
+import { createTaskLogger } from './task-logger.js'
 // Use OpenClaw's exact functions from src/browser/
 import { snapshotRoleViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
 import { typeViaPlaywright, clickViaPlaywright, hoverViaPlaywright, selectOptionViaPlaywright } from '../browser/pw-tools-core.interactions.js'
@@ -912,6 +912,7 @@ async function runAgentLoop(opts: {
   const MAX_ITERATIONS = 25
   const deadline = Date.now() + 300_000
   let consecutiveSnapshots = 0
+  
 
   const cleanedContext = cleanContext(opts.context)
   const finalPrompt = cleanedContext
@@ -929,6 +930,9 @@ const successMatch = plan.match(/### SUCCESS CRITERIA\n([\s\S]*?)(?=FINAL STEP|$
 const successCriteria = successMatch?.[1]?.trim() || ''
 const finalStepMatch = plan.match(/FINAL STEP: Call task_complete\("(.+?)"\)/)
 const expectedFormat = finalStepMatch?.[1] || ''
+
+  const taskLogger = createTaskLogger(opts.taskId, opts.userId, opts.taskPrompt)
+  if (plan) taskLogger.setPlan(plan)
 
   for (let attempt = 0; attempt < 2; attempt++) {
 
@@ -1029,6 +1033,16 @@ const expectedFormat = finalStepMatch?.[1] || ''
               // Return URL only — agent calls browser_snapshot or browser_read next
               const { page: p2 } = await getBrowser(opts.userId)
               result = `Navigated to ${args.url} (current URL: ${p2.url()}). Now call browser_snapshot to see interactive elements or browser_read to read page content.`
+
+              taskLogger.addBrowserStep(
+                iterations,
+                'browser_navigate',
+                undefined,
+                result,
+                95,
+                args.url
+              )
+
               break
             }
             case 'browser_snapshot': {
@@ -1067,6 +1081,16 @@ const expectedFormat = finalStepMatch?.[1] || ''
               } else {
                 result = snap + (fieldInfo || `\n\nREAD THE PAGE: If there's an input field, look at the label/placeholder next to it. Type EXACTLY what it asks for.`)
               }
+
+              taskLogger.addBrowserStep(
+                iterations,
+                'browser_snapshot',
+                undefined,
+                result.substring(0, 100),
+                90,
+                undefined
+              )
+
               break
             }
             case 'get_mid_action_plan': {
@@ -1141,6 +1165,16 @@ const expectedFormat = finalStepMatch?.[1] || ''
               // If dangerous click but task doesn't ask for it, suggest alternative
               if (isDangerousRef && !taskAsksForIt) {
                 result = `⚠️ You're about to click a dangerous button (${args.ref}) but your task is: "${opts.taskPrompt}"\n\nThis doesn't match. Call getMidActionPlan() to get a better approach instead of clicking this.`
+
+                taskLogger.addBrowserStep(
+                  iterations,
+                  'browser_click',
+                  args.ref,
+                  result,
+                  0,
+                  undefined
+                )
+
                 break
               }
               
@@ -1154,15 +1188,35 @@ const expectedFormat = finalStepMatch?.[1] || ''
                 await new Promise(r => setTimeout(r, 800))
                 result = `Clicked ${args.ref} successfully. Call browser_snapshot to see updated page.`
                 loopDetector.recordToolOutcome('browser_click', args.ref, result)
+
+                taskLogger.addBrowserStep(
+                  iterations,
+                  'browser_click',
+                  args.ref,
+                  result,
+                  88,
+                  undefined
+                )
               } catch (err) {
                 result = `Element ${args.ref} not found or not clickable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
                 loopDetector.recordToolOutcome('browser_click', args.ref, result)
+
+                taskLogger.addBrowserStep(
+                  iterations,
+                  'browser_click',
+                  args.ref,
+                  result,
+                  30,
+                  undefined
+                )
               }
               
               // Check if stuck in loop AFTER outcome is recorded
               const clickLoopCheck = loopDetector.checkForLoop('browser_click', args.ref)
               if (clickLoopCheck.stuck) {
                 result = clickLoopCheck.warning || result
+
+                taskLogger.updateLastStepConfidence(40)
               }
               
               break
@@ -1188,8 +1242,28 @@ const expectedFormat = finalStepMatch?.[1] || ''
                 
                 const postTypeSnap = await snapshotPage(opts.userId, opts.tabKey, true)
                 result = `Typed into the input and clicked submit. Call browser_snapshot to verify.`
+
+                taskLogger.addBrowserStep(
+                  iterations,
+                  'browser_type',
+                  args.ref,
+                  result,
+                  86,
+                  undefined,
+                  args.text
+                )
               } catch (err) {
                 result = `Element ${args.ref} not found or not typeable. Take a fresh browser_snapshot to see current page and find the correct element with new refs.`
+
+                taskLogger.addBrowserStep(
+                  iterations,
+                  'browser_type',
+                  args.ref,
+                  result,
+                  25,
+                  undefined,
+                  args.text
+                )
               }
               break
             }
@@ -1234,6 +1308,13 @@ const expectedFormat = finalStepMatch?.[1] || ''
                 
                 // Check if summary matches expected format
                 if (!summaryLower.includes(expectedLower.slice(0, 20))) {
+                  await taskLogger.finalize(
+                    'failed',
+                    iterations,
+                    0,
+                    'Task validation failed - response did not match expected format'
+                  )
+
                   return { 
                     success: false, 
                     summary: `The agent got confused and wasn't able to complete your task correctly. It tried to report something unrelated instead of what you asked for. Please try again or provide more specific details about what you're looking for.`
@@ -1241,6 +1322,16 @@ const expectedFormat = finalStepMatch?.[1] || ''
                 }
               }
               
+              await taskLogger.finalize(
+                'completed',
+                iterations,
+                92,
+                'Task completed successfully'
+              )
+
+              const formattedLog = taskLogger.getFormattedLog()
+              console.log(formattedLog)
+
               return { success: true, summary: args.summary }
             }
             case 'task_failed': {
@@ -1471,15 +1562,35 @@ const expectedFormat = finalStepMatch?.[1] || ''
                 const evalResult = await evaluatePage(opts.userId, args.fn)
                 result = `Script result: ${JSON.stringify(evalResult, null, 2)}`
                 loopDetector.recordToolOutcome('browser_evaluate', args.fn, result)
+
+                taskLogger.addBrowserStep(
+                  iterations,
+                  'browser_evaluate',
+                  undefined,
+                  result.substring(0, 100),
+                  82,
+                  undefined
+                )
               } catch (err) {
                 result = `Script error: ${err instanceof Error ? err.message : String(err)}`
                 loopDetector.recordToolOutcome('browser_evaluate', args.fn, result)
+
+                taskLogger.addBrowserStep(
+                  iterations,
+                  'browser_evaluate',
+                  undefined,
+                  result,
+                  30,
+                  undefined
+                )
               }
               
               // Check if stuck in loop AFTER outcome is recorded
               const evalLoopCheck = loopDetector.checkForLoop('browser_evaluate', args.fn)
               if (evalLoopCheck.stuck) {
                 result = evalLoopCheck.warning || result
+
+                taskLogger.updateLastStepConfidence(35)
               }
               
               break
@@ -1505,14 +1616,37 @@ const expectedFormat = finalStepMatch?.[1] || ''
     }
 
     if (!shouldRetry) {
+      await taskLogger.finalize(
+        'failed',
+        iterations,
+        50,
+        'Could not complete after max iterations'
+      )
+
       return { 
         success: false, 
         summary: `Task could not be completed after ${iterations} attempts. The requested information or action could not be found or completed. Please try again with more specific instructions or verify the information exists.`
       }
     }
-    if (attempt >= 1) return { success: false, summary: retryReason }
+    if (attempt >= 1) {
+      await taskLogger.finalize(
+        'failed',
+        iterations,
+        30,
+        `Failed after 2 attempts: ${retryReason}`
+      )
+
+      return { success: false, summary: retryReason }
+    }
     await opts.onProgress('🔄 Retrying task...')
   }
+
+  await taskLogger.finalize(
+    'failed',
+    MAX_ITERATIONS,
+    0,
+    'Exceeded max attempts'
+  )
 
   return { success: false, summary: 'Exceeded max attempts' }
 }
