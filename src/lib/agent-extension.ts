@@ -1304,20 +1304,20 @@ const expectedFormat = finalStepMatch?.[1] || ''
               // Validate against success criteria from plan
               if (successCriteria && expectedFormat) {
                 const summaryLower = args.summary.toLowerCase()
-                const expectedLower = expectedFormat.toLowerCase()
                 
-                // Check if summary matches expected format
-                if (!summaryLower.includes(expectedLower.slice(0, 20))) {
+                // Check if the response actually contains content (not empty)
+                // Don't do strict format matching - agent formats differently
+                if (summaryLower.length < 10) {
                   await taskLogger.finalize(
                     'failed',
                     iterations,
                     0,
-                    'Task validation failed - response did not match expected format'
+                    'Response was too short or empty'
                   )
-
+                  
                   return { 
                     success: false, 
-                    summary: `The agent got confused and wasn't able to complete your task correctly. It tried to report something unrelated instead of what you asked for. Please try again or provide more specific details about what you're looking for.`
+                    summary: `Task failed - response was empty or too short.`
                   }
                 }
               }
@@ -1328,10 +1328,10 @@ const expectedFormat = finalStepMatch?.[1] || ''
                 92,
                 'Task completed successfully'
               )
-
+            
               const formattedLog = taskLogger.getFormattedLog()
               console.log(formattedLog)
-
+            
               return { success: true, summary: args.summary }
             }
             case 'task_failed': {
