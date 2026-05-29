@@ -899,7 +899,7 @@ async function typeInRefSmart(userId: string, ref: string, fallbackText: string)
   await new Promise(r => setTimeout(r, 300))
 }
 
-async function runAgentLoop(opts: {
+export async function runAgentLoop(opts: {
   userId: string
   taskId: string
   taskPrompt: string
@@ -1653,18 +1653,14 @@ const expectedFormat = finalStepMatch?.[1] || ''
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-export async function runAgentWithExtension(
+export async function runWithExtensionTab(
   task: string,
   userId: string,
   onStep: (step: string) => Promise<void>,
-  taskId?: string,
-  keepTabOpen = false,
-  context?: string,
-  abortSignal?: AbortSignal,
-  preApproved = false
+  taskId: string | undefined,
+  keepTabOpen: boolean,
+  run: (tabKey: string) => Promise<string>
 ): Promise<string> {
-  if (abortSignal?.aborted) return 'Task stopped by user.'
-
   const taskKey = taskId || `${userId}:${task.slice(0, 50)}`
   if (runningTasks.has(taskKey)) throw new Error('Task already running')
   runningTasks.add(taskKey)
@@ -1685,25 +1681,12 @@ export async function runAgentWithExtension(
     await onStep('✅ Tab ready. Starting task...')
 
     const tabKey = `${userId}:${Date.now()}`
-    const result = await runAgentLoop({
-      userId,
-      taskId: taskId || taskKey,
-      taskPrompt: task,
-      tabKey,
-      onProgress: onStep,
-      context,
-      abortSignal,
-      preApproved
-    })
-
-    return result.summary
-
+    return await run(tabKey)
   } catch (err) {
     return err instanceof Error ? err.message : String(err)
   } finally {
     runningTasks.delete(taskKey)
-    
-    // Check user preference for auto-close
+
     let autoCloseTab = false
     try {
       const { data } = await supabase
@@ -1713,16 +1696,14 @@ export async function runAgentWithExtension(
         .single()
       autoCloseTab = data?.auto_close_tabs ?? false
     } catch {}
-  
+
     if (autoCloseTab && newTabId) {
-      // Auto-close after 5 seconds
       try {
         await new Promise(r => setTimeout(r, 5000))
         const { sendExtensionMessage } = await import('../index.js')
         await sendExtensionMessage(userId, 'closeTab', { tabId: newTabId })
       } catch {}
     } else if (!autoCloseTab && newTabId) {
-      // Keep tab open
       try {
         const { sendExtensionMessage } = await import('../index.js')
         await sendExtensionMessage(userId, 'detachTab', { tabId: newTabId })
@@ -1740,4 +1721,32 @@ export async function runAgentWithExtension(
       })
     } catch {}
   }
+}
+
+export async function runAgentWithExtension(
+  task: string,
+  userId: string,
+  onStep: (step: string) => Promise<void>,
+  taskId?: string,
+  keepTabOpen = false,
+  context?: string,
+  abortSignal?: AbortSignal,
+  preApproved = false
+): Promise<string> {
+  if (abortSignal?.aborted) return 'Task stopped by user.'
+
+  const { orchestrateTask } = await import('./agents/orchestrator.js')
+  const taskPrompt = context ? `${context}\n\n${task}` : task
+
+  return runWithExtensionTab(task, userId, onStep, taskId, keepTabOpen, async (tabKey) => {
+    const result = await orchestrateTask(
+      taskPrompt,
+      userId,
+      taskId || tabKey,
+      tabKey,
+      onStep,
+      { abortSignal, preApproved }
+    )
+    return result.browserResult ?? result.chatResponse
+  })
 }

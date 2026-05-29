@@ -1,7 +1,8 @@
 import { Router } from 'express'
 import { supabase } from '../lib/supabase.js'
 import { isExtensionConnected, extensionConnections } from '../index.js'
-import { runAgentWithExtension } from '../lib/agent-extension.js'
+import { runWithExtensionTab } from '../lib/agent-extension.js'
+import { orchestrateTask } from '../lib/agents/orchestrator.js'
 import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
 import OpenAI from 'openai'
 import { createHash } from 'node:crypto'
@@ -290,11 +291,32 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   // The agent-extension.ts uses aria-snapshot which is more reliable than CSS selectors
   await appendOutput(taskId, '☁️ Starting browser agent...\n')
   try {
-    const taskPromise = runAgentWithExtension(prompt, userId, async (msg) => {
+    const onProgress = async (msg: string) => {
       if (controller.signal.aborted) return
       console.log(`[${taskId}] ${msg}`)
       await appendOutput(taskId, msg + '\n')
-    }, taskId, keepTabOpen, context, controller.signal, preApproved)
+    }
+
+    const taskPrompt = context ? `${context}\n\n${prompt}` : prompt
+
+    const taskPromise = runWithExtensionTab(
+      prompt,
+      userId,
+      onProgress,
+      taskId,
+      keepTabOpen,
+      async (tabKey) => {
+        const result = await orchestrateTask(
+          taskPrompt,
+          userId,
+          taskId,
+          tabKey,
+          onProgress,
+          { abortSignal: controller.signal, preApproved }
+        )
+        return result.browserResult ?? result.chatResponse
+      }
+    )
 
     const timeoutPromise = new Promise<string>((_, reject) =>
       setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
