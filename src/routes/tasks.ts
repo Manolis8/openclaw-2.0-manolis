@@ -317,27 +317,29 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       browserResult: orchestrateResult.browserResult?.slice(0, 50)
     })
 
-    // STEP 2: Handle result
+    // STEP 2: Handle result - save FULL response
     const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
     const currentOutput = data?.output || ''
 
     let finalOutput = currentOutput
+    let fullResponse = ''
+
     if (orchestrateResult.chatResponse) {
       finalOutput += `Chat: ${orchestrateResult.chatResponse}\n`
+      fullResponse = orchestrateResult.chatResponse
     }
     if (orchestrateResult.browserResult) {
       finalOutput += `Browser: ${orchestrateResult.browserResult}\n`
+      fullResponse = orchestrateResult.browserResult
     }
-
-    const summary = orchestrateResult.browserResult
-      ? orchestrateResult.browserResult.slice(0, 500)
-      : orchestrateResult.chatResponse.slice(0, 500)
 
     await supabase.from('tasks').update({
       status: 'done',
-      output: finalOutput + `✅ Done: ${summary}\n`
+      output: finalOutput + `✅ Done\n`
     }).eq('id', taskId)
 
+    // Create summary for inbox
+    const summary = fullResponse.slice(0, 300)
     await createMessage(userId, taskId, `✅ Task complete: ${summary}`)
 
   } catch (err: any) {
