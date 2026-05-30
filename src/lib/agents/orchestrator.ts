@@ -7,26 +7,28 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 async function classifyTaskType(userMessage: string): Promise<'chat' | 'browser'> {
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
-    max_tokens: 10,
+    max_tokens: 1,
+    temperature: 0, // Deterministic
     messages: [
       {
         role: 'system',
-        content: `Classify if this REQUIRES browser access. Reply with ONLY "browser" or "chat".
+        content: `You are a task classifier. Your job is to decide if a user's request needs browser/web access or not.
 
-BROWSER task (must have browser):
-- Check/view/list repos, emails, messages, social media
-- Find something on a website
-- Do something on GitHub/email/social media/any website
-- Access user's personal accounts or data
-- "Check my X", "Find my X", "Get my X", "Show me my X"
-- "Search for", "Look up", "Browse", "Go to"
-- Any website interaction
+Output ONLY the number:
+1 = Browser task (needs web access, checking websites, accessing accounts, doing web actions)
+2 = Chat task (general question, advice, explanation, no web access needed)
 
-CHAT task (no browser needed):
-- General questions, advice, explanations
-- Questions about concepts, definitions
-- Personal thoughts or help with thinking through something
-- NOT asking to access websites or do web actions`
+Examples:
+"What's the weather?" → 2 (chat)
+"Check the weather in London" → 1 (browser - needs to access weather website)
+"How do I learn Python?" → 2 (chat)
+"Book me a flight to Paris" → 1 (browser - needs to access booking sites)
+"What are your thoughts on AI?" → 2 (chat)
+"Get my latest emails" → 1 (browser - needs Gmail access)
+"Help me think through this problem" → 2 (chat)
+"Find me a restaurant nearby" → 1 (browser - needs web search)
+
+When in doubt, lean towards browser (1) if there's ANY hint of accessing external data/websites.`
       },
       {
         role: 'user',
@@ -35,8 +37,8 @@ CHAT task (no browser needed):
     ]
   })
 
-  const classification = response.choices[0].message.content?.trim().toLowerCase() || 'chat'
-  return classification.includes('browser') ? 'browser' : 'chat'
+  const result = response.choices[0].message.content?.trim() || '2'
+  return result === '1' ? 'browser' : 'chat'
 }
 
 export async function orchestrateTask(
@@ -47,11 +49,10 @@ export async function orchestrateTask(
   onProgress: (msg: string) => Promise<void>,
   opts?: { abortSignal?: AbortSignal; preApproved?: boolean }
 ) {
-  // Orchestrator decides: chat or browser?
+  // Orchestrator uses AI to decide
   const taskType = await classifyTaskType(userMessage)
 
   if (taskType === 'chat') {
-    // Chat only
     const chatResult = await chatAgent(userMessage)
     await onProgress(`Agent: ${chatResult.response}`)
 
@@ -63,31 +64,22 @@ export async function orchestrateTask(
   }
 
   // Browser task
-  if (taskType === 'browser') {
-    // Let user know agent is opening browser
-    await onProgress(`Agent: I'll check that for you right now...\n🌐 Opening browser...`)
+  await onProgress(`Agent: I'll check that for you right now...\n🌐 Opening browser...`)
 
-    const browserResult = await runAgentLoop({
-      userId,
-      taskId,
-      taskPrompt: userMessage,
-      tabKey,
-      onProgress,
-      context: userMessage,
-      abortSignal: opts?.abortSignal,
-      preApproved: opts?.preApproved,
-    })
-
-    return {
-      success: browserResult.success,
-      chatResponse: 'Checking your request...',
-      browserResult: browserResult.summary,
-    }
-  }
+  const browserResult = await runAgentLoop({
+    userId,
+    taskId,
+    taskPrompt: userMessage,
+    tabKey,
+    onProgress,
+    context: userMessage,
+    abortSignal: opts?.abortSignal,
+    preApproved: opts?.preApproved,
+  })
 
   return {
-    success: false,
-    chatResponse: 'Unable to process request',
-    browserResult: null,
+    success: browserResult.success,
+    chatResponse: 'Checking your request...',
+    browserResult: browserResult.summary,
   }
 }
