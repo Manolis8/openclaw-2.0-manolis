@@ -335,7 +335,7 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
 
     await supabase.from('tasks').update({
       status: 'done',
-      output: finalOutput + `✅ Done\n`
+      output: finalOutput + `✅ Done: ${fullResponse}\n`
     }).eq('id', taskId)
 
     // Create summary for inbox
