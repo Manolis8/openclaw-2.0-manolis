@@ -11,10 +11,22 @@ async function classifyTaskType(userMessage: string): Promise<'chat' | 'browser'
     messages: [
       {
         role: 'system',
-        content: `Classify if this is a chat-only task or requires browser access. Reply with ONLY "chat" or "browser", nothing else.
+        content: `Classify if this REQUIRES browser access. Reply with ONLY "browser" or "chat".
 
-Browser task: user wants you to check/find/access something on a website, do something on a website, or interact with web services.
-Chat task: general question, advice, explanation, or something that doesn't need website access.`
+BROWSER task (must have browser):
+- Check/view/list repos, emails, messages, social media
+- Find something on a website
+- Do something on GitHub/email/social media/any website
+- Access user's personal accounts or data
+- "Check my X", "Find my X", "Get my X", "Show me my X"
+- "Search for", "Look up", "Browse", "Go to"
+- Any website interaction
+
+CHAT task (no browser needed):
+- General questions, advice, explanations
+- Questions about concepts, definitions
+- Personal thoughts or help with thinking through something
+- NOT asking to access websites or do web actions`
       },
       {
         role: 'user',
@@ -24,7 +36,7 @@ Chat task: general question, advice, explanation, or something that doesn't need
   })
 
   const classification = response.choices[0].message.content?.trim().toLowerCase() || 'chat'
-  return classification === 'browser' ? 'browser' : 'chat'
+  return classification.includes('browser') ? 'browser' : 'chat'
 }
 
 export async function orchestrateTask(
