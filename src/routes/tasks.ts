@@ -329,15 +329,14 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       finalOutput += `Browser: ${orchestrateResult.browserResult}\n`
     }
 
+    const summary = orchestrateResult.browserResult
+      ? orchestrateResult.browserResult.slice(0, 500)
+      : orchestrateResult.chatResponse.slice(0, 500)
+
     await supabase.from('tasks').update({
       status: 'done',
-      output: finalOutput + `✅ Done\n`
+      output: finalOutput + `✅ Done: ${summary}\n`
     }).eq('id', taskId)
-
-    // Create summary message
-    const summary = orchestrateResult.browserResult
-      ? orchestrateResult.browserResult.slice(0, 300)
-      : orchestrateResult.chatResponse.slice(0, 300)
 
     await createMessage(userId, taskId, `✅ Task complete: ${summary}`)
 
