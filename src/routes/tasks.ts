@@ -1,7 +1,6 @@
 import { Router } from 'express'
 import { supabase } from '../lib/supabase.js'
 import { isExtensionConnected, extensionConnections } from '../index.js'
-import { runWithExtensionTab } from '../lib/agent-extension.js'
 import { orchestrateTask } from '../lib/agents/orchestrator.js'
 import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
 import OpenAI from 'openai'
@@ -287,9 +286,6 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
   const controller = new AbortController()
   taskAbortControllers.set(taskId, controller)
 
-  // Always use cloud browser (agent-extension.ts) for reliability
-  // The agent-extension.ts uses aria-snapshot which is more reliable than CSS selectors
-  await appendOutput(taskId, '☁️ Starting browser agent...\n')
   try {
     const onProgress = async (msg: string) => {
       if (controller.signal.aborted) return
@@ -299,37 +295,52 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
 
     const taskPrompt = context ? `${context}\n\n${prompt}` : prompt
 
-    const taskPromise = runWithExtensionTab(
-      prompt,
-      userId,
-      onProgress,
-      taskId,
-      keepTabOpen,
-      async (tabKey) => {
-        const result = await orchestrateTask(
-          taskPrompt,
-          userId,
-          taskId,
-          tabKey,
-          onProgress,
-          { abortSignal: controller.signal, preApproved }
-        )
-        return result.browserResult ?? result.chatResponse
-      }
-    )
+    // STEP 1: Call orchestrateTask FIRST (no browser yet)
+    console.log(`[${taskId}] Calling orchestrateTask first to decide if browser needed`)
 
-    const timeoutPromise = new Promise<string>((_, reject) =>
-      setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
-    )
+    const orchestrateResult = await Promise.race([
+      orchestrateTask(
+        taskPrompt,
+        userId,
+        taskId,
+        undefined, // No tabKey yet - orchestrator will decide
+        onProgress,
+        { abortSignal: controller.signal, preApproved }
+      ),
+      new Promise<any>((_, reject) =>
+        setTimeout(() => reject(new Error('Task timed out after 2 minutes')), TASK_TIMEOUT_MS)
+      )
+    ])
 
-    const result = await Promise.race([taskPromise, timeoutPromise])
+    console.log(`[${taskId}] orchestrateTask result:`, {
+      chatResponse: orchestrateResult.chatResponse?.slice(0, 50),
+      browserResult: orchestrateResult.browserResult?.slice(0, 50)
+    })
+
+    // STEP 2: Handle result
     const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
+    const currentOutput = data?.output || ''
+
+    let finalOutput = currentOutput
+    if (orchestrateResult.chatResponse) {
+      finalOutput += `Chat: ${orchestrateResult.chatResponse}\n`
+    }
+    if (orchestrateResult.browserResult) {
+      finalOutput += `Browser: ${orchestrateResult.browserResult}\n`
+    }
+
     await supabase.from('tasks').update({
       status: 'done',
-      output: (data?.output || '') + `✅ Done: ${result}\n`
+      output: finalOutput + `✅ Done\n`
     }).eq('id', taskId)
 
-    await createMessage(userId, taskId, `✅ Task complete: ${result.slice(0, 300)}`)
+    // Create summary message
+    const summary = orchestrateResult.browserResult
+      ? orchestrateResult.browserResult.slice(0, 300)
+      : orchestrateResult.chatResponse.slice(0, 300)
+
+    await createMessage(userId, taskId, `✅ Task complete: ${summary}`)
+
   } catch (err: any) {
     if (err?.status === 429 || err?.message?.includes('Rate limit')) {
       const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
@@ -340,7 +351,10 @@ export async function runTaskInBackground(taskId: string, prompt: string, userId
       await createMessage(userId, taskId, '✅ Task complete: Unclawned is a bit busy right now. Please try again in a moment!')
       return
     }
+
     const realErrorMessage = String(err)
+    console.error(`[${taskId}] Error:`, realErrorMessage)
+
     const { data } = await supabase.from('tasks').select('output').eq('id', taskId).single()
     await supabase.from('tasks').update({
       status: 'error',
