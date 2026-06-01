@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { supabase } from '../lib/supabase.js'
 import { isExtensionConnected, extensionConnections } from '../index.js'
 import { runAgentWithExtension } from '../lib/agent-extension.js'
+import { orchestrateTask } from '../lib/agents/orchestrator.js'
 import { createMessage, parseSchedule, scheduleTask, computeNextRun } from '../lib/scheduler.js'
 import OpenAI from 'openai'
 import { createHash } from 'node:crypto'
@@ -340,12 +341,18 @@ Be concise and friendly. Never write more than needed.`
 
 tasksRouter.post('/chat', async (req, res) => {
   console.log('[chat] received request')
-  const { message: rawMessage, userId: rawUserId, sessionId: rawSessionId, keepTabOpen = false } = req.body
+  const {
+    message: rawMessage,
+    userId: rawUserId,
+    sessionId: rawSessionId,
+    clarificationAnswers,
+    keepTabOpen = false
+  } = req.body
+
   const message = sanitizeString(rawMessage, 2000)
   const userId = sanitizeString(rawUserId, 100)
   const sessionId = sanitizeString(rawSessionId, 100)
 
-  // Verify userId exists in our database — prevents unauthorized access
   const { data: userExists } = await supabase
     .from('api_keys')
     .select('user_id')
@@ -356,7 +363,6 @@ tasksRouter.post('/chat', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' })
   }
 
-  // Check if user already has a running task
   if (runningTasksPerUser.get(userId)) {
     return res.status(429).json({
       error: 'You already have a task running. Please wait for it to finish.',
@@ -367,20 +373,19 @@ tasksRouter.post('/chat', async (req, res) => {
   if (!message || !userId || !sessionId) {
     return res.status(400).json({ error: 'Missing required fields' })
   }
-  console.log('[chat] sanitized, checking limit')
 
-   // Check daily limit
-   const today = new Date().toISOString().split('T')[0]
-   const { count } = await supabase
-     .from('tasks')
-     .select('*', { count: 'exact', head: true })
-     .eq('user_id', userId)
-       .gte('created_at', `${today}T00:00:00.000Z`)
-  console.log('[chat] limit checked:', count)
+  const today = new Date().toISOString().split('T')[0]
+  const { count } = await supabase
+    .from('tasks')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .gte('created_at', `${today}T00:00:00.000Z`)
+
   const DAILY_LIMIT = 10
+  if ((count || 0) >= DAILY_LIMIT) {
+    return res.status(429).json({ error: 'Daily limit reached', limitReached: true })
+  }
 
-  // Load real conversation history from Supabase (most recent last for emphasis)
-  console.log('[chat] loading history')
   let context = ''
   let historyRows: any[] = []
   if (sessionId) {
@@ -391,11 +396,10 @@ tasksRouter.post('/chat', async (req, res) => {
         .eq('chat_id', sessionId)
         .order('created_at', { ascending: false })
         .limit(6)
+
       historyRows = data || []
       if (historyRows.length > 0) {
         const reversed = historyRows.reverse()
-        const lastAssistant = reversed.filter((m: any) => m.role === 'assistant').pop()
-        const lastUser = reversed.filter((m: any) => m.role === 'user').pop()
         const historyText = reversed
           .filter((m: any) => m.content?.trim())
           .map((m: any) => {
@@ -404,13 +408,7 @@ tasksRouter.post('/chat', async (req, res) => {
           })
           .join('\n')
 
-        const lastTopic = lastAssistant?.content?.slice(0, 200) || 'none'
-        const lastRequest = lastUser?.content || message
-
-        context = 'CONVERSATION HISTORY:\n' + historyText +
-          '\n\nLAST TOPIC DISCUSSED: ' + lastTopic +
-          '\nUSERS FOLLOW-UP REQUEST: ' + lastRequest +
-          '\n\nIF THE USER IS ASKING FOR MORE OR DETAILS OR AGAIN: Search for the LAST TOPIC using a more specific query. Extract the main subject from LAST TOPIC DISCUSSED and search for that with more detail.'
+        context = 'CONVERSATION HISTORY:\n' + historyText
       }
     } catch {}
   }
@@ -419,162 +417,147 @@ tasksRouter.post('/chat', async (req, res) => {
     .filter((m: any) => m.content && m.content.trim())
     .map((m: any) => ({ role: m.role as string, content: m.content as string }))
 
-  // Compact if too long
-  const compactedHistory = await compactHistory(history, 8)
+  await compactHistory(history, 8)
 
-  console.log('[chat] classifying message')
-  const needsBrowser = await classifyMessage(message)
-  console.log('[chat] classifyMessage result:', needsBrowser)
+  console.log('[chat] orchestrating task')
+  const decision = await orchestrateTask(message, userId, clarificationAnswers)
 
-  if (!needsBrowser) {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: CHAT_SYSTEM_PROMPT + context },
-        ...compactedHistory.map(m => ({
-          role: m.role as 'user' | 'assistant' | 'system',
-          content: m.content
-        })),
-        { role: 'user', content: message }
-      ],
-      max_tokens: 400
+  if (decision.type === 'clarify') {
+    console.log('[chat] Decision: CLARIFY with', decision.questions.length, 'questions')
+
+    void supabase.from('chat_messages').insert({
+      chat_id: sessionId,
+      user_id: userId,
+      role: 'user',
+      content: message
     })
-    const reply = response.choices[0].message.content || 'I am not sure how to help with that.'
-    return res.json({ reply, usesBrowser: false })
+
+    void supabase.from('chat_messages').insert({
+      chat_id: sessionId,
+      user_id: userId,
+      role: 'assistant',
+      content: decision.message + '\n\n' + decision.questions.map((q, i) => `${i + 1}. ${q}`).join('\n')
+    })
+
+    return res.json({
+      type: 'clarify',
+      message: decision.message,
+      questions: decision.questions,
+      taskId: null,
+      usesBrowser: false
+    })
   }
 
-  if ((count || 0) >= DAILY_LIMIT) {
-    return res.status(429).json({ error: 'Daily limit reached', limitReached: true })
+  if (decision.type === 'chat') {
+    console.log('[chat] Decision: CHAT')
+
+    void supabase.from('chat_messages').insert({
+      chat_id: sessionId,
+      user_id: userId,
+      role: 'user',
+      content: message
+    })
+
+    void supabase.from('chat_messages').insert({
+      chat_id: sessionId,
+      user_id: userId,
+      role: 'assistant',
+      content: decision.response
+    })
+
+    return res.json({
+      type: 'chat',
+      message: decision.response,
+      usesBrowser: false
+    })
   }
 
-  // Step 1: classify if destructive BEFORE creating task or opening browser
-  console.log('[chat] classifying destructive')
-  const destructiveCheck = await classifyDestructive(message)
-  console.log('[chat] destructive result:', destructiveCheck)
+  if (decision.type === 'browser') {
+    console.log('[chat] Decision: BROWSER')
 
-  if (destructiveCheck.isDestructive) {
-    // Create task in waiting_permission state — browser does NOT open yet
+    const destructiveCheck = await classifyDestructive(message)
+
+    if (destructiveCheck.isDestructive) {
+      const { data, error } = await supabase
+        .from('tasks')
+        .insert({
+          user_id: userId,
+          prompt: message,
+          output: '🔐 Waiting for your confirmation...\n',
+          status: 'waiting_permission'
+        })
+        .select().single()
+
+      if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
+
+      await supabase.from('task_permissions').insert({
+        task_id: data.id,
+        user_id: userId,
+        action: destructiveCheck.action,
+        details: destructiveCheck.details,
+        platform: '',
+        status: 'pending'
+      })
+
+      res.json({
+        taskId: data.id,
+        usesBrowser: true,
+        waitingPermission: true,
+        action: destructiveCheck.action,
+        details: destructiveCheck.details
+      })
+
+      ;(async () => {
+        for (let i = 0; i < 300; i++) {
+          await new Promise(r => setTimeout(r, 800))
+          const { data: perm } = await supabase
+            .from('task_permissions')
+            .select('status')
+            .eq('task_id', data.id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .single()
+
+          if (perm?.status === 'approved') {
+            await supabase.from('tasks').update({ status: 'running' }).eq('id', data.id)
+            runTaskInBackground(data.id, message, userId, false, keepTabOpen, decision.context, true)
+            return
+          }
+
+          if (perm?.status === 'denied') {
+            await supabase.from('tasks').update({
+              status: 'done',
+              output: '⏹️ Action cancelled by user.'
+            }).eq('id', data.id)
+            return
+          }
+        }
+
+        await supabase.from('tasks').update({
+          status: 'done',
+          output: '⏹️ Permission request timed out.'
+        }).eq('id', data.id)
+      })()
+
+      return
+    }
+
     const { data, error } = await supabase
       .from('tasks')
       .insert({
         user_id: userId,
         prompt: message,
-        output: '🔐 Waiting for your confirmation...\n',
-        status: 'waiting_permission'
+        output: '',
+        status: 'running'
       })
       .select().single()
 
     if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
 
-    // Insert permission record
-    await supabase.from('task_permissions').insert({
-      task_id: data.id,
-      user_id: userId,
-      action: destructiveCheck.action,
-      details: destructiveCheck.details,
-      platform: '',
-      status: 'pending'
-    })
+    res.json({ taskId: data.id, usesBrowser: true })
 
-    // Respond immediately — frontend will poll and see waiting_permission
-    res.json({
-      taskId: data.id,
-      usesBrowser: true,
-      waitingPermission: true,
-      action: destructiveCheck.action,
-      details: destructiveCheck.details
-    })
-
-    // Background: wait for user to confirm or deny — agent does NOT start until confirmed
-    ;(async () => {
-      for (let i = 0; i < 300; i++) {
-        await new Promise(r => setTimeout(r, 800))
-
-        const { data: perm } = await supabase
-          .from('task_permissions')
-          .select('status')
-          .eq('task_id', data.id)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .single()
-
-        if (perm?.status === 'approved') {
-          // User confirmed — NOW start the browser agent
-          await supabase.from('tasks').update({ status: 'running' }).eq('id', data.id)
-          runTaskInBackground(data.id, message, userId, false, keepTabOpen, context, true)
-          return
-        }
-
-        if (perm?.status === 'denied') {
-          await supabase.from('tasks').update({
-            status: 'done',
-            output: '⏹️ Action cancelled by user.'
-          }).eq('id', data.id)
-          return
-        }
-      }
-
-      // 10 min timeout
-      await supabase.from('tasks').update({
-        status: 'done',
-        output: '⏹️ Permission request timed out.'
-      }).eq('id', data.id)
-    })()
-
-    return
+    runTaskInBackground(data.id, message, userId, false, keepTabOpen, decision.context)
   }
-
-  // Not destructive — create task and start browser agent immediately
-// Not destructive — create task and start browser agent immediately
-  
-  // CHECK IF THIS IS A RETRY
-  const isRetry = ['do it again', 'try again', 'redo', 'repeat', 'do the first'].some(kw => 
-    message.toLowerCase().includes(kw)
-  )
-  
-  let finalPrompt = message
-  
-  if (isRetry) {
-    // Load the previous task from this session
-    try {
-      const { data: prevTask } = await supabase
-        .from('tasks')
-        .select('prompt, output')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single()
-      
-      if (prevTask) {
-        // Extract last few lines of output
-        const prevOutput = prevTask.output?.split('\n').slice(-10).join('\n') || 'Unknown'
-        
-        finalPrompt = `Original task: "${prevTask.prompt}"
-
-Previous attempt result:
-${prevOutput}
-
-User request: Try again.`
-      }
-    } catch (err) {
-      console.log('[chat] Could not load previous task:', err)
-    }
-  }
-
-  const { data, error } = await supabase
-    .from('tasks')
-    .insert({
-      user_id: userId,
-      prompt: message,
-      output: '',
-      status: 'running'
-    })
-    .select().single()
-
-  if (error || !data) return res.status(500).json({ error: 'Failed to create task' })
-
-  res.json({ taskId: data.id, usesBrowser: true })
-  runTaskInBackground(data.id, finalPrompt, userId, false, keepTabOpen, context)
 })
 
 tasksRouter.post('/create-task', async (req, res) => {

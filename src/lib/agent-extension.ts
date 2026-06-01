@@ -1735,18 +1735,19 @@ export async function runAgentWithExtension(
 ): Promise<string> {
   if (abortSignal?.aborted) return 'Task stopped by user.'
 
-  const { orchestrateTask } = await import('./agents/orchestrator.js')
   const taskPrompt = context ? `${context}\n\n${task}` : task
 
   return runWithExtensionTab(task, userId, onStep, taskId, keepTabOpen, async (tabKey) => {
-    const result = await orchestrateTask(
-      taskPrompt,
+    const browserResult = await runAgentLoop({
       userId,
-      taskId || tabKey,
+      taskId: taskId || tabKey,
+      taskPrompt: task,
       tabKey,
-      onStep,
-      { abortSignal, preApproved }
-    )
-    return result.browserResult ?? result.chatResponse
+      onProgress: onStep,
+      context: taskPrompt,
+      abortSignal,
+      preApproved,
+    })
+    return browserResult.summary
   })
 }
