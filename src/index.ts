@@ -9,6 +9,7 @@ import rateLimit from 'express-rate-limit'
 import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { oauthRouter } from './routes/oauth.js'
+import { teachingRouter } from './routes/teaching.js'
 import { ensureChromeExtensionRelayServer } from './browser/extension-relay.js'
 
 process.on('uncaughtException', (err) => {
@@ -163,6 +164,7 @@ app.get('/api/extension-status/:userId', (req, res) => {
 app.use('/api', tasksRouter)
 app.use('/api', messagesRouter)
 app.use('/api', oauthRouter)
+app.use('/api', teachingRouter)
 
 const server = createServer(app)
 const wss = new WebSocketServer({ noServer: true })
