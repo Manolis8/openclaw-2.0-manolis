@@ -130,7 +130,7 @@ const INTERACTIVE_SNAPSHOT_MAX_CHARS = 8000
 
 
 
-async function snapshotPage(userId: string, tabKey: string, interactiveOnly = false): Promise<string> {
+export async function snapshotPage(userId: string, tabKey: string, interactiveOnly = false): Promise<string> {
   const { page, cdpUrl, targetId } = await getBrowser(userId)
   const url = page.url()
 
@@ -159,7 +159,7 @@ async function snapshotPage(userId: string, tabKey: string, interactiveOnly = fa
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
 
-async function navigateTo(url: string, userId: string): Promise<void> {
+export async function navigateTo(url: string, userId: string): Promise<void> {
   const { page } = await getBrowser(userId)
   await page.goto(url, { timeout: 30000, waitUntil: 'domcontentloaded' })
   const isGoogle = url.includes('google.com')
@@ -167,7 +167,7 @@ async function navigateTo(url: string, userId: string): Promise<void> {
 
 }
 
-async function clickRef(userId: string, ref: string): Promise<void> {
+export async function clickRef(userId: string, ref: string): Promise<void> {
   const { page, cdpUrl, targetId } = await getBrowser(userId)
 
   try {
@@ -225,7 +225,7 @@ async function clickSubmitViaCDP(userId: string, selector?: string): Promise<voi
   if (!res.ok) throw new Error(`clickSubmitViaCDP failed: ${responseText}`)
 }
 
-async function pressKey(key: string, userId: string): Promise<void> {
+export async function pressKey(key: string, userId: string): Promise<void> {
   const { page } = await getBrowser(userId)
   await page.keyboard.press(key)
 }
@@ -274,7 +274,7 @@ async function evaluatePage(userId: string, fn: string): Promise<unknown> {
 }
 
 // From OpenClaw selectOptionViaPlaywright
-async function selectOption(userId: string, ref: string, values: string[]): Promise<void> {
+export async function selectOption(userId: string, ref: string, values: string[]): Promise<void> {
   const { cdpUrl, targetId } = await getBrowser(userId)
   await selectOptionViaPlaywright({
     cdpUrl,
@@ -286,7 +286,7 @@ async function selectOption(userId: string, ref: string, values: string[]): Prom
 }
 
 // From OpenClaw hoverViaPlaywright
-async function hoverRef(userId: string, ref: string): Promise<void> {
+export async function hoverRef(userId: string, ref: string): Promise<void> {
   const { cdpUrl, targetId } = await getBrowser(userId)
   await hoverViaPlaywright({
     cdpUrl,
@@ -836,7 +836,7 @@ FINAL STEP: Call task_complete("[exact result]")`
 }
 
 
-async function typeInRefSmart(userId: string, ref: string, fallbackText: string): Promise<void> {
+export async function typeInRefSmart(userId: string, ref: string, fallbackText: string): Promise<void> {
   const { cdpUrl, targetId, page } = await getBrowser(userId)
   let textToType = fallbackText
 

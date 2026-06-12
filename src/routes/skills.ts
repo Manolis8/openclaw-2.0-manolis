@@ -11,7 +11,7 @@ import {
   saveInputVariable
 } from '../db/queries.js'
 import { Skill, SkillExecution } from '../lib/types.js'
-import { PlaywrightExecutor } from '../lib/playwright-executor.js'
+import { RelayExecutor } from '../lib/relay-executor.js'
 
 const router = Router()
 
@@ -290,12 +290,13 @@ async function executeSkillAsync(
   skill: Skill
 ): Promise<void> {
   try {
-    const executor = new PlaywrightExecutor()
+    const executor = new RelayExecutor()
 
     const result = await executor.execute(
       skill.execution_plan,
+      execution.user_id,
       execution.input_values,
-      (update: any) => {
+      (update) => {
         console.log(`[Skills Executor] Step ${update.stepNumber}: ${update.status}`)
       }
     )
