@@ -16,6 +16,14 @@ async function deriveRelayToken(gatewayToken: string, port: number): Promise<str
 }
 
 /**
+ * Clear the cached targetId for a user so the next getRelayPage() call
+ * re-fetches it. Call this after creating a new tab.
+ */
+export function invalidateTargetCache(userId: string): void {
+  targetIds.delete(userId)
+}
+
+/**
  * Returns the active page + relay connection info for a user.
  * Mirrors the getBrowser() logic in agent-extension.ts but is fully independent —
  * agent-extension.ts is not imported or modified.

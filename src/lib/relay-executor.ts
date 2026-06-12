@@ -1,11 +1,12 @@
 import { ExecutionPlan, ExecutionStep, ExecutionResult, StepUpdate } from './types.js'
-import { getRelayPage } from './relay-browser.js'
+import { getRelayPage, invalidateTargetCache } from './relay-browser.js'
 import { snapshotRoleViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
 import {
   clickViaPlaywright,
   typeViaPlaywright,
 } from '../browser/pw-tools-core.interactions.js'
 import type { RoleRefMap } from '../browser/pw-role-snapshot.js'
+import { sendExtensionMessage, isExtensionConnected } from '../index.js'
 
 export class RelayExecutor {
   async execute(
@@ -17,8 +18,30 @@ export class RelayExecutor {
     const startTime = Date.now()
     const log: StepUpdate[] = []
 
+    if (!isExtensionConnected(userId)) {
+      return {
+        success: false,
+        log,
+        errorMessage: 'Extension not connected. Open the Unclawned extension in Chrome first.',
+        durationMs: 0,
+      }
+    }
+
+    let tabId: number | null = null
+
     try {
-      console.log(`[RelayExecutor] Starting execution for user: ${userId}`)
+      console.log(`[RelayExecutor] Creating tab for user: ${userId}`)
+      const tabResult = await sendExtensionMessage(userId, 'createAndAttachTab', { url: 'about:blank' }, 60000)
+      tabId = tabResult?.tabId ?? null
+      if (!tabId) throw new Error('Extension did not return a tab ID.')
+
+      // Give the tab a moment to settle and the relay to register it
+      await new Promise(r => setTimeout(r, 2000))
+
+      // Invalidate cached targetId so we pick up the new tab's target
+      invalidateTargetCache(userId)
+
+      console.log(`[RelayExecutor] Tab ${tabId} ready. Starting execution for user: ${userId}`)
 
       for (const step of plan.steps) {
         const stepStartTime = Date.now()
@@ -79,7 +102,7 @@ export class RelayExecutor {
             throw error
           }
 
-          // 'retry' — already exhausted inside executeStepWithRetry, continue to next step
+          // 'retry' — retries already exhausted inside executeStepWithRetry, continue
         }
       }
 
@@ -90,6 +113,16 @@ export class RelayExecutor {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error'
       console.error('[RelayExecutor] Execution failed:', errorMsg)
       return { success: false, log, errorMessage: errorMsg, durationMs: Date.now() - startTime }
+
+    } finally {
+      if (tabId) {
+        try {
+          await sendExtensionMessage(userId, 'detachTab', { tabId })
+          console.log(`[RelayExecutor] Detached tab ${tabId}`)
+        } catch {
+          // Best-effort cleanup
+        }
+      }
     }
   }
 
@@ -182,7 +215,7 @@ export class RelayExecutor {
 
     const ref = this.resolveRef(refs, allSelectors, description)
     if (!ref) {
-      throw new Error(`Could not find element for ${action}. Tried selectors: ${allSelectors.join(', ')}`)
+      throw new Error(`Could not find element for ${action}. Tried: ${allSelectors.join(', ')}`)
     }
 
     console.log(`[RelayExecutor] Resolved to ref: ${ref}`)
@@ -212,13 +245,12 @@ export class RelayExecutor {
 
   /**
    * Match CSS selectors to an ARIA ref using the role+name map from the snapshot.
-   * Uses the RoleRefMap (ref → {role, name}) rather than text-parsing the snapshot string.
+   * Operates on RoleRefMap (ref → {role, name}) rather than parsing snapshot text.
    */
   private resolveRef(refs: RoleRefMap, selectors: string[], description: string): string | null {
     for (const selector of selectors) {
       const hint = this.extractNameHint(selector)
       if (!hint) continue
-
       const roleHint = this.extractRoleHint(selector)
 
       for (const [ref, info] of Object.entries(refs)) {
@@ -226,13 +258,13 @@ export class RelayExecutor {
         const nameMatch = info.name.toLowerCase().includes(hint.toLowerCase())
         const roleMatch = !roleHint || info.role === roleHint
         if (nameMatch && roleMatch) {
-          console.log(`[RelayExecutor] Matched ref ${ref} (${info.role} "${info.name}") via selector "${selector}"`)
+          console.log(`[RelayExecutor] Matched ref ${ref} (${info.role} "${info.name}") via "${selector}"`)
           return ref
         }
       }
     }
 
-    // Fallback: search by description keywords against accessible names
+    // Fallback: match description keywords against accessible names
     const keywords = description
       .replace(/[^a-zA-Z0-9 ]/g, ' ')
       .split(' ')
@@ -241,7 +273,7 @@ export class RelayExecutor {
     for (const word of keywords) {
       for (const [ref, info] of Object.entries(refs)) {
         if (info.name?.toLowerCase().includes(word.toLowerCase())) {
-          console.log(`[RelayExecutor] Matched ref ${ref} (${info.role} "${info.name}") via description keyword "${word}"`)
+          console.log(`[RelayExecutor] Matched ref ${ref} (${info.role} "${info.name}") via keyword "${word}"`)
           return ref
         }
       }
@@ -251,10 +283,6 @@ export class RelayExecutor {
     return null
   }
 
-  /**
-   * Extract the semantic text hint from a CSS selector.
-   * Handles: :contains("x"), [aria-label*="x"], [placeholder="x"], [name="x"], [id="x"]
-   */
   private extractNameHint(selector: string): string | null {
     const patterns = [
       /:contains\(["']([^"']+)["']\)/,
@@ -272,9 +300,6 @@ export class RelayExecutor {
     return null
   }
 
-  /**
-   * Map element-type prefixes in a selector to ARIA roles.
-   */
   private extractRoleHint(selector: string): string | null {
     if (selector.startsWith('button')) return 'button'
     if (selector.startsWith('a[') || selector.startsWith('a ') || selector === 'a') return 'link'
