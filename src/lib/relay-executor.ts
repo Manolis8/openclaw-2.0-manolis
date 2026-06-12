@@ -1,12 +1,11 @@
 import { ExecutionPlan, ExecutionStep, ExecutionResult, StepUpdate } from './types.js'
+import { getRelayPage } from './relay-browser.js'
+import { snapshotRoleViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
 import {
-  navigateTo,
-  clickRef,
-  typeInRefSmart,
-  snapshotPage,
-  selectOption,
-  pressKey,
-} from './browser-primitives.js'
+  clickViaPlaywright,
+  typeViaPlaywright,
+} from '../browser/pw-tools-core.interactions.js'
+import type { RoleRefMap } from '../browser/pw-role-snapshot.js'
 
 export class RelayExecutor {
   async execute(
@@ -59,7 +58,6 @@ export class RelayExecutor {
             }
             log[log.length - 1] = pausedUpdate
             onStepUpdate?.(pausedUpdate)
-
             return {
               success: false,
               log,
@@ -81,7 +79,7 @@ export class RelayExecutor {
             throw error
           }
 
-          // 'retry' — step already exhausted retries inside executeStepWithRetry, continue to next
+          // 'retry' — already exhausted inside executeStepWithRetry, continue to next step
         }
       }
 
@@ -102,7 +100,6 @@ export class RelayExecutor {
     maxRetries: number
   ): Promise<void> {
     let lastError: Error | null = null
-
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         await this.executeStep(step, userId, inputValues)
@@ -110,12 +107,9 @@ export class RelayExecutor {
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
         console.log(`[RelayExecutor] Step ${step.number} attempt ${attempt + 1} failed:`, lastError.message)
-        if (attempt < maxRetries) {
-          await new Promise(resolve => setTimeout(resolve, 1000))
-        }
+        if (attempt < maxRetries) await new Promise(r => setTimeout(r, 1000))
       }
     }
-
     throw lastError || new Error('Step execution failed')
   }
 
@@ -124,31 +118,30 @@ export class RelayExecutor {
     userId: string,
     inputValues: Record<string, string>
   ): Promise<void> {
-    const timeout = (step.timeout || 10) * 1000
+    const timeoutMs = (step.timeout || 10) * 1000
 
     switch (step.action) {
       case 'navigate':
-        await this.runNavigate(step.url!, userId, timeout)
+        await this.runNavigate(step.url!, userId, timeoutMs)
         break
 
       case 'click':
-        await this.runClick(step.selectors, step.fallbackSelectors, step.description, userId, timeout)
+        await this.runInteract('click', step.selectors, step.fallbackSelectors, step.description, undefined, userId, timeoutMs)
         break
 
       case 'type': {
         const value = this.replaceVariables(step.value || '', inputValues)
-        await this.runType(step.selectors, step.fallbackSelectors, step.description, value, userId, timeout)
+        await this.runInteract('type', step.selectors, step.fallbackSelectors, step.description, value, userId, timeoutMs)
         break
       }
 
       case 'verify':
-        // Snapshot and check for expected text in page
-        if (step.expected) await this.runVerify(step.expected, userId, timeout)
+        if (step.expected) await this.runVerify(step.expected, userId, timeoutMs)
         break
 
       case 'wait': {
         const waitMs = (Number(step.value) || 1) * 1000
-        await new Promise(resolve => setTimeout(resolve, waitMs))
+        await new Promise(r => setTimeout(r, waitMs))
         break
       }
 
@@ -157,174 +150,138 @@ export class RelayExecutor {
     }
   }
 
-  private async runNavigate(url: string, userId: string, timeout: number): Promise<void> {
+  private async runNavigate(url: string, userId: string, timeoutMs: number): Promise<void> {
     console.log(`[RelayExecutor] Navigating to: ${url}`)
-    await Promise.race([
-      navigateTo(url, userId),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Navigation timeout')), timeout)
-      ),
-    ])
+    const { page } = await getRelayPage(userId)
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs })
+    await new Promise(r => setTimeout(r, url.includes('google.com') ? 2000 : 1000))
   }
 
-  private async runClick(
+  private async runInteract(
+    action: 'click' | 'type',
     selectors: string[] | undefined,
     fallbackSelectors: string[] | undefined,
     description: string,
+    value: string | undefined,
     userId: string,
-    timeout: number
+    timeoutMs: number
   ): Promise<void> {
     const allSelectors = [...(selectors || []), ...(fallbackSelectors || [])]
-    if (allSelectors.length === 0) throw new Error('No selectors provided for click')
+    if (allSelectors.length === 0) throw new Error(`No selectors provided for ${action}`)
 
-    console.log(`[RelayExecutor] Clicking: ${description}`)
+    console.log(`[RelayExecutor] ${action}: ${description}`)
 
-    const snapshot = await Promise.race([
-      snapshotPage(userId, '', true),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Snapshot timeout')), timeout)
-      ),
-    ])
+    const { cdpUrl, targetId } = await getRelayPage(userId)
 
-    const ref = this.resolveRefFromSnapshot(snapshot, allSelectors, description)
+    const { refs } = await snapshotRoleViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      refsMode: 'role',
+      options: { interactive: true, compact: true },
+    })
+
+    const ref = this.resolveRef(refs, allSelectors, description)
     if (!ref) {
-      throw new Error(`Could not resolve element for click. Tried: ${allSelectors.join(', ')}`)
+      throw new Error(`Could not find element for ${action}. Tried selectors: ${allSelectors.join(', ')}`)
     }
 
-    console.log(`[RelayExecutor] Clicking ref: ${ref}`)
-    await clickRef(userId, ref)
-  }
+    console.log(`[RelayExecutor] Resolved to ref: ${ref}`)
 
-  private async runType(
-    selectors: string[] | undefined,
-    fallbackSelectors: string[] | undefined,
-    description: string,
-    value: string,
-    userId: string,
-    timeout: number
-  ): Promise<void> {
-    const allSelectors = [...(selectors || []), ...(fallbackSelectors || [])]
-    if (allSelectors.length === 0) throw new Error('No selectors provided for type')
-
-    console.log(`[RelayExecutor] Typing into: ${description}`)
-
-    const snapshot = await Promise.race([
-      snapshotPage(userId, '', true),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Snapshot timeout')), timeout)
-      ),
-    ])
-
-    const ref = this.resolveRefFromSnapshot(snapshot, allSelectors, description)
-    if (!ref) {
-      throw new Error(`Could not resolve element for type. Tried: ${allSelectors.join(', ')}`)
+    if (action === 'click') {
+      await clickViaPlaywright({ cdpUrl, targetId: targetId || undefined, ref, timeoutMs })
+      await new Promise(r => setTimeout(r, 800))
+    } else {
+      await typeViaPlaywright({ cdpUrl, targetId: targetId || undefined, ref, text: value!, slowly: true, timeoutMs })
+      await new Promise(r => setTimeout(r, 400))
     }
-
-    console.log(`[RelayExecutor] Typing into ref: ${ref}`)
-    await typeInRefSmart(userId, ref, value)
   }
 
-  private async runVerify(expected: string, userId: string, timeout: number): Promise<void> {
+  private async runVerify(expected: string, userId: string, timeoutMs: number): Promise<void> {
     console.log(`[RelayExecutor] Verifying: "${expected}"`)
-
-    const snapshot = await Promise.race([
-      snapshotPage(userId, '', false),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Snapshot timeout')), timeout)
-      ),
-    ])
-
+    const { cdpUrl, targetId } = await getRelayPage(userId)
+    const { snapshot } = await snapshotRoleViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      refsMode: 'role',
+      options: { interactive: false, compact: false },
+    })
     if (!snapshot.includes(expected)) {
       throw new Error(`Verification failed: expected to find "${expected}" on page`)
     }
   }
 
   /**
-   * Resolve a CSS selector to an ARIA ref by searching the snapshot text.
-   *
-   * Tries each selector in order using pattern-specific heuristics:
-   *   1. :contains("text")  — match by visible text
-   *   2. [aria-label*="x"]  — match by aria-label
-   *   3. [name="x"]         — match by name attribute / label proximity
-   *   4. button / input etc — match by role keyword if only one role appears
-   * Falls back to description keyword search if no selector matched.
+   * Match CSS selectors to an ARIA ref using the role+name map from the snapshot.
+   * Uses the RoleRefMap (ref → {role, name}) rather than text-parsing the snapshot string.
    */
-  private resolveRefFromSnapshot(
-    snapshot: string,
-    selectors: string[],
-    description: string
-  ): string | null {
-    // Build map: ref → surrounding context (200 chars before, 100 after)
-    const refPattern = /\[ref=(e\d+)\]/g
-    const refs = new Map<string, string>()
-    let m: RegExpExecArray | null
-    while ((m = refPattern.exec(snapshot)) !== null) {
-      refs.set(m[1], snapshot.substring(Math.max(0, m.index - 200), m.index + 100))
-    }
-
-    if (refs.size === 0) return null
-
+  private resolveRef(refs: RoleRefMap, selectors: string[], description: string): string | null {
     for (const selector of selectors) {
-      // :contains("text")
-      const containsMatch = selector.match(/:contains\(["']([^"']+)["']\)/)
-      if (containsMatch) {
-        const found = this.findRefByText(refs, containsMatch[1])
-        if (found) return found
-      }
+      const hint = this.extractNameHint(selector)
+      if (!hint) continue
 
-      // [aria-label="x"] or [aria-label*="x"] or [aria-label^="x"]
-      const ariaMatch = selector.match(/\[aria-label[*^]?=["']([^"']+)["']\]/)
-      if (ariaMatch) {
-        const found = this.findRefByText(refs, ariaMatch[1])
-        if (found) return found
-      }
+      const roleHint = this.extractRoleHint(selector)
 
-      // [placeholder="x"]
-      const placeholderMatch = selector.match(/\[placeholder[*^]?=["']([^"']+)["']\]/)
-      if (placeholderMatch) {
-        const found = this.findRefByText(refs, placeholderMatch[1])
-        if (found) return found
-      }
-
-      // [name="x"] or [id="x"] — match against label text or nearby text
-      const nameMatch = selector.match(/\[(?:name|id)[*^]?=["']([^"']+)["']\]/)
-      if (nameMatch) {
-        const found = this.findRefByText(refs, nameMatch[1])
-        if (found) return found
-      }
-
-      // button[type="submit"] or input[type="submit"] → look for button/submit text
-      if (selector.includes('[type="submit"]') || selector.includes('[type=submit]')) {
-        const found = this.findRefByText(refs, 'submit') || this.findRefByText(refs, 'Submit')
-        if (found) return found
+      for (const [ref, info] of Object.entries(refs)) {
+        if (!info.name) continue
+        const nameMatch = info.name.toLowerCase().includes(hint.toLowerCase())
+        const roleMatch = !roleHint || info.role === roleHint
+        if (nameMatch && roleMatch) {
+          console.log(`[RelayExecutor] Matched ref ${ref} (${info.role} "${info.name}") via selector "${selector}"`)
+          return ref
+        }
       }
     }
 
-    // Last resort: try keywords from the step description
-    const descWords = description
+    // Fallback: search by description keywords against accessible names
+    const keywords = description
       .replace(/[^a-zA-Z0-9 ]/g, ' ')
       .split(' ')
       .filter(w => w.length > 3)
-    for (const word of descWords) {
-      const found = this.findRefByText(refs, word)
-      if (found) {
-        console.log(`[RelayExecutor] Resolved via description keyword "${word}"`)
-        return found
+
+    for (const word of keywords) {
+      for (const [ref, info] of Object.entries(refs)) {
+        if (info.name?.toLowerCase().includes(word.toLowerCase())) {
+          console.log(`[RelayExecutor] Matched ref ${ref} (${info.role} "${info.name}") via description keyword "${word}"`)
+          return ref
+        }
       }
     }
 
-    console.warn(`[RelayExecutor] Could not resolve selectors: ${selectors.join(', ')}`)
+    console.warn(`[RelayExecutor] Could not resolve: ${selectors.join(', ')}`)
     return null
   }
 
-  private findRefByText(refs: Map<string, string>, text: string): string | null {
-    const lower = text.toLowerCase()
-    for (const [ref, context] of refs) {
-      if (context.toLowerCase().includes(lower)) {
-        console.log(`[RelayExecutor] Resolved ref ${ref} via text match "${text}"`)
-        return ref
-      }
+  /**
+   * Extract the semantic text hint from a CSS selector.
+   * Handles: :contains("x"), [aria-label*="x"], [placeholder="x"], [name="x"], [id="x"]
+   */
+  private extractNameHint(selector: string): string | null {
+    const patterns = [
+      /:contains\(["']([^"']+)["']\)/,
+      /\[aria-label[*^$]?=["']([^"']+)["']\]/,
+      /\[placeholder[*^$]?=["']([^"']+)["']\]/,
+      /\[name[*^$]?=["']([^"']+)["']\]/,
+      /\[id[*^$]?=["']([^"']+)["']\]/,
+      /\[value[*^$]?=["']([^"']+)["']\]/,
+      /\[title[*^$]?=["']([^"']+)["']\]/,
+    ]
+    for (const p of patterns) {
+      const m = selector.match(p)
+      if (m) return m[1]
     }
+    return null
+  }
+
+  /**
+   * Map element-type prefixes in a selector to ARIA roles.
+   */
+  private extractRoleHint(selector: string): string | null {
+    if (selector.startsWith('button')) return 'button'
+    if (selector.startsWith('a[') || selector.startsWith('a ') || selector === 'a') return 'link'
+    if (selector.startsWith('input[type="checkbox"]')) return 'checkbox'
+    if (selector.startsWith('input[type="radio"]')) return 'radio'
+    if (selector.startsWith('select')) return 'combobox'
+    if (selector.startsWith('input') || selector.startsWith('textarea')) return 'textbox'
     return null
   }
 
