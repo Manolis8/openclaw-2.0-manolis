@@ -10,6 +10,7 @@ import { tasksRouter } from './routes/tasks.js'
 import { messagesRouter } from './routes/messages.js'
 import { oauthRouter } from './routes/oauth.js'
 import { teachingRouter } from './routes/teaching.js'
+import skillsRouter from './routes/skills.js'
 import { ensureChromeExtensionRelayServer } from './browser/extension-relay.js'
 
 process.on('uncaughtException', (err) => {
@@ -165,6 +166,7 @@ app.use('/api', tasksRouter)
 app.use('/api', messagesRouter)
 app.use('/api', oauthRouter)
 app.use('/api', teachingRouter)
+app.use('/api/skills', skillsRouter)
 
 const server = createServer(app)
 const wss = new WebSocketServer({ noServer: true })
