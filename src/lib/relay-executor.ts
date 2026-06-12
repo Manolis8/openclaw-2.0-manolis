@@ -224,7 +224,9 @@ export class RelayExecutor {
       await clickViaPlaywright({ cdpUrl, targetId: targetId || undefined, ref, timeoutMs })
       await new Promise(r => setTimeout(r, 800))
     } else {
-      await typeViaPlaywright({ cdpUrl, targetId: targetId || undefined, ref, text: value!, slowly: true, timeoutMs })
+      // Use fill (slowly: false) so it clears the field first — prevents text
+      // accumulation across retries. Also floor timeout at 10s for relay latency.
+      await typeViaPlaywright({ cdpUrl, targetId: targetId || undefined, ref, text: value!, slowly: false, timeoutMs: Math.max(timeoutMs, 10000) })
       await new Promise(r => setTimeout(r, 400))
     }
   }
