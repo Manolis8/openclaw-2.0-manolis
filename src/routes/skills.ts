@@ -11,7 +11,8 @@ import {
   saveInputVariable
 } from '../db/queries.js'
 import { Skill, SkillExecution } from '../lib/types.js'
-import { runAgentWithExtension } from '../lib/agent-extension.js'
+import { runAgentLoop } from '../lib/agent-extension.js'
+import { sendExtensionMessage, isExtensionConnected } from '../index.js'
 
 const router = Router()
 
@@ -289,49 +290,85 @@ async function executeSkillAsync(
   execution: SkillExecution,
   skill: Skill
 ): Promise<void> {
-  try {
-    const prompt = convertPlanToPrompt(skill, execution.input_values)
+  const startTime = Date.now()
+  let tabId: number | null = null
 
-    const summary = await runAgentWithExtension(
-      prompt,
-      execution.user_id,
-      async (step) => console.log(`[Skills] ${step}`),
-      execution.id,
-      false,
-      undefined,
-      undefined,
-      true
-    )
+  try {
+    if (!isExtensionConnected(execution.user_id)) {
+      throw new Error('Extension not connected. Open Unclawned in Chrome first.')
+    }
+
+    const prompt = convertPlanToPrompt(skill, execution.input_values)
+    console.log(`[Skills] Converting plan to prompt:\n${prompt}`)
+
+    // Create tab (mirrors runWithExtensionTab — runAgentLoop needs a page to exist)
+    const tabResult = await sendExtensionMessage(execution.user_id, 'createAndAttachTab', { url: 'about:blank' }, 60000) as any
+    tabId = tabResult?.tabId ?? null
+    if (!tabId) throw new Error('Extension did not return a tab ID.')
+    await new Promise(r => setTimeout(r, 2000))
+
+    const result = await runAgentLoop({
+      userId: execution.user_id,
+      taskId: execution.id,
+      taskPrompt: prompt,
+      tabKey: `skill-${execution.id}`,
+      onProgress: async (msg) => console.log(`[Skills Agent] ${msg}`),
+      preApproved: true,
+    })
 
     await updateExecution(execution.id, {
-      status: 'success',
+      status: result.success ? 'success' : 'error',
+      execution_log: [{
+        stepNumber: 1,
+        action: 'agent_loop',
+        status: result.success ? 'success' : 'error',
+        duration: Date.now() - startTime,
+        timestamp: new Date().toISOString(),
+      }],
       final_url: '',
-      error_message: '',
-      completed_at: new Date().toISOString()
+      error_message: result.success ? '' : result.summary,
+      completed_at: new Date().toISOString(),
+      duration_seconds: Math.round((Date.now() - startTime) / 1000),
     })
+
+    console.log(`[Skills] Execution ${execution.id}: ${result.success ? 'SUCCESS' : 'FAILED'}`)
+    console.log(`[Skills] Summary: ${result.summary}`)
+
   } catch (error) {
-    console.error('[Skills Executor] Fatal error:', error)
+    console.error('[Skills] Execution failed:', error)
+    await updateExecution(execution.id, {
+      status: 'error',
+      error_message: error instanceof Error ? error.message : 'Unknown error',
+      completed_at: new Date().toISOString(),
+    }).catch(e => console.error('Failed to update execution:', e))
     throw error
+
+  } finally {
+    if (tabId) {
+      await sendExtensionMessage(execution.user_id, 'detachTab', { tabId }).catch(() => {})
+    }
   }
 }
 
 function convertPlanToPrompt(skill: Skill, inputValues: Record<string, string>): string {
   const steps = skill.execution_plan.steps
-    .map(s => {
-      const desc = s.description.replace(
-        /\{\{(\w+)\}\}/g,
-        (_: string, key: string) => inputValues[key] || `{{${key}}}`
-      )
-      return `${s.number}. ${desc}`
+    .map((s, idx) => {
+      let desc = s.description
+      for (const [key, value] of Object.entries(inputValues)) {
+        desc = desc.replace(new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'g'), value)
+      }
+      return `${idx + 1}. ${desc}`
     })
     .join('\n')
 
   return `Execute the following skill: "${skill.skill_name}"
 
-Steps:
+Description: ${skill.skill_description}
+
+Steps to complete:
 ${steps}
 
-Complete all steps in order. If you encounter any issues, recover and continue.`
+Complete all steps in order. Use the browser agent tools to navigate, click, type, and interact with the page. If you encounter any issues, use your error recovery to find alternative approaches. Complete the task fully before calling task_complete.`
 }
 
 export default router
