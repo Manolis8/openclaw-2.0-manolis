@@ -1,9 +1,10 @@
 import { ExecutionPlan, ExecutionStep, ExecutionResult, StepUpdate } from './types.js'
 import { getRelayPage, invalidateTargetCache } from './relay-browser.js'
-import { snapshotRoleViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
+import { snapshotRoleViaPlaywright, navigateViaPlaywright } from '../browser/pw-tools-core.snapshot.js'
 import {
   clickViaPlaywright,
   typeViaPlaywright,
+  waitForViaPlaywright,
 } from '../browser/pw-tools-core.interactions.js'
 import type { RoleRefMap } from '../browser/pw-role-snapshot.js'
 import { sendExtensionMessage, isExtensionConnected } from '../index.js'
@@ -185,9 +186,14 @@ export class RelayExecutor {
 
   private async runNavigate(url: string, userId: string, timeoutMs: number): Promise<void> {
     console.log(`[RelayExecutor] Navigating to: ${url}`)
-    const { page } = await getRelayPage(userId)
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs })
-    await new Promise(r => setTimeout(r, url.includes('google.com') ? 2000 : 1000))
+    const { cdpUrl, targetId } = await getRelayPage(userId)
+    await navigateViaPlaywright({ cdpUrl, targetId: targetId || undefined, url, timeoutMs })
+    await waitForViaPlaywright({
+      cdpUrl,
+      targetId: targetId || undefined,
+      loadState: 'domcontentloaded',
+      timeoutMs: 5000,
+    }).catch(() => {})
   }
 
   private async runInteract(
