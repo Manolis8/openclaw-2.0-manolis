@@ -354,20 +354,38 @@ function convertPlanToPrompt(skill: Skill, inputValues: Record<string, string>):
   const steps = skill.execution_plan.steps
     .map((s, idx) => {
       let desc = s.description
+      let valueInfo = ''
+
       for (const [key, value] of Object.entries(inputValues)) {
-        desc = desc.replace(new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'g'), value)
+        const placeholder = `{{ ${key} }}`
+        if (desc.includes(placeholder)) {
+          desc = desc.replace(new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'g'), value)
+          valueInfo += ` Use "${value}".`
+        }
+        if (s.value?.includes?.(placeholder)) {
+          valueInfo += ` Enter "${value}".`
+        }
       }
-      return `${idx + 1}. ${desc}`
+
+      return `${idx + 1}. ${desc}${valueInfo}`
     })
+    .join('\n')
+
+  const varSummary = Object.entries(inputValues)
+    .map(([k, v]) => `- ${k}: "${v}"`)
     .join('\n')
 
   return `Execute the following skill: "${skill.skill_name}"
 
 Description: ${skill.skill_description}
 
+INPUT VALUES TO USE:
+${varSummary}
+
 Steps to complete:
 ${steps}
 
+IMPORTANT: Use the exact input values provided above. Do not make up or improvise values.
 Complete all steps in order. Use the browser agent tools to navigate, click, type, and interact with the page. If you encounter any issues, use your error recovery to find alternative approaches. Complete the task fully before calling task_complete.`
 }
 
