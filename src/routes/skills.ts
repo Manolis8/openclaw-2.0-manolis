@@ -11,7 +11,7 @@ import {
   saveInputVariable
 } from '../db/queries.js'
 import { Skill, SkillExecution } from '../lib/types.js'
-import { RelayExecutor } from '../lib/relay-executor.js'
+import { runAgentWithExtension } from '../lib/agent-extension.js'
 
 const router = Router()
 
@@ -290,29 +290,48 @@ async function executeSkillAsync(
   skill: Skill
 ): Promise<void> {
   try {
-    const executor = new RelayExecutor()
+    const prompt = convertPlanToPrompt(skill, execution.input_values)
 
-    const result = await executor.execute(
-      skill.execution_plan,
+    const summary = await runAgentWithExtension(
+      prompt,
       execution.user_id,
-      execution.input_values,
-      (update) => {
-        console.log(`[Skills Executor] Step ${update.stepNumber}: ${update.status}`)
-      }
+      async (step) => console.log(`[Skills] ${step}`),
+      execution.id,
+      false,
+      undefined,
+      undefined,
+      true
     )
 
     await updateExecution(execution.id, {
-      status: result.success ? 'success' : 'error',
-      execution_log: result.log,
-      final_url: result.finalUrl,
-      error_message: result.errorMessage,
-      completed_at: new Date().toISOString(),
-      duration_seconds: result.durationMs
+      status: 'success',
+      final_url: '',
+      error_message: '',
+      completed_at: new Date().toISOString()
     })
   } catch (error) {
     console.error('[Skills Executor] Fatal error:', error)
     throw error
   }
+}
+
+function convertPlanToPrompt(skill: Skill, inputValues: Record<string, string>): string {
+  const steps = skill.execution_plan.steps
+    .map(s => {
+      const desc = s.description.replace(
+        /\{\{(\w+)\}\}/g,
+        (_: string, key: string) => inputValues[key] || `{{${key}}}`
+      )
+      return `${s.number}. ${desc}`
+    })
+    .join('\n')
+
+  return `Execute the following skill: "${skill.skill_name}"
+
+Steps:
+${steps}
+
+Complete all steps in order. If you encounter any issues, recover and continue.`
 }
 
 export default router
